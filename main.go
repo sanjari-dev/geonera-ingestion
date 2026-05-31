@@ -72,6 +72,11 @@ func main() {
 	// ── DAL: enforces split-connection strategy ───────────────────────────────
 	appDAL := dal.New(lockDB, poolClient)
 
+	// ── Database: ensure schema is initialized ────────────────────────────────
+	if err := database.EnsureSchema(ctx); err != nil {
+		log.Fatalf("database migrate: %v", err)
+	}
+
 	// ── Seed: timeframes ──────────────────────────────────────────────────────
 	if err := seed.Timeframes(ctx, dbClient); err != nil {
 		log.Fatalf("seed timeframes: %v", err)

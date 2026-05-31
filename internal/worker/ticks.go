@@ -72,9 +72,20 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 		go runT1Phase(lockCtx, d, &wg)
 		go runT2Phase(lockCtx, d, &wg)
 	case "BACKFILL":
-		wg.Add(3)
+		// Phase 1 — Reset runs first and must complete before Ingestion starts.
+		// Because LockIDTick is held, any PROCESSED/FAILED/BROKEN rows that exist
+		// right now are guaranteed to be zombies from previously crashed runs.
+		// Running Reset concurrently with Ingestion would cause Reset to clobber
+		// rows that Ingestion just promoted from PENDING→PROCESSED, corrupting state.
+		var resetWg sync.WaitGroup
+		resetWg.Add(1)
+		go runBackfillResetGroup(lockCtx, d, &resetWg)
+		resetWg.Wait()
+
+		// Phase 2 — Ingestion and Validation are safe to run in parallel now:
+		// no PROCESSED/FAILED/BROKEN rows remain for Reset to interfere with.
+		wg.Add(2)
 		go runBackfillIngestionGroup(lockCtx, d, &wg)
-		go runBackfillResetGroup(lockCtx, d, &wg)
 		go runBackfillValidationGroup(lockCtx, d, &wg)
 	default:
 		log.Printf("ticks: unknown mode %q", mode)
