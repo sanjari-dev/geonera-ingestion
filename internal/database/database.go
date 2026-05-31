@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
@@ -55,24 +56,43 @@ func NewLockDB(ctx context.Context) (*sql.DB, error) {
 	return db, nil
 }
 
-// NewPoolClient opens an ent.Client using DATABASE_POOL_URL (the PgBouncer address).
-// All ETL worker goroutines must use this client for short-lived transactions.
+// NewPoolClient opens an ent.Client for ETL worker goroutines.
+//
+// Resolution order:
+//  1. DATABASE_POOL_URL (PgBouncer) — preferred in production.
+//  2. DATABASE_DIRECT_URL — fallback when PgBouncer is absent or unreachable
+//     (acceptable in local development; logs a warning).
+//
 // The caller is responsible for closing the client when done.
 func NewPoolClient(ctx context.Context) (*ent.Client, error) {
-	dsn := os.Getenv("DATABASE_POOL_URL")
-	if dsn == "" {
-		return nil, fmt.Errorf("DATABASE_POOL_URL is not set")
+	poolDSN := os.Getenv("DATABASE_POOL_URL")
+	if poolDSN != "" {
+		if err := ping(ctx, poolDSN); err == nil {
+			return openEnt(poolDSN)
+		}
+		log.Printf("database: DATABASE_POOL_URL unreachable (%s), falling back to DATABASE_DIRECT_URL (dev mode)", os.Getenv("DATABASE_POOL_URL"))
+	} else {
+		log.Println("database: DATABASE_POOL_URL not set, falling back to DATABASE_DIRECT_URL (dev mode)")
 	}
 
-	if err := ping(ctx, dsn); err != nil {
-		return nil, err
+	directDSN := os.Getenv("DATABASE_DIRECT_URL")
+	if directDSN == "" {
+		return nil, fmt.Errorf("neither DATABASE_POOL_URL nor DATABASE_DIRECT_URL is set")
 	}
 
+	if err := ping(ctx, directDSN); err != nil {
+		return nil, fmt.Errorf("pool fallback: %w", err)
+	}
+
+	return openEnt(directDSN)
+}
+
+// openEnt opens an ent.Client for the given DSN without pinging (caller already pinged).
+func openEnt(dsn string) (*ent.Client, error) {
 	client, err := ent.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pool ent client: %w", err)
 	}
-
 	return client, nil
 }
 
