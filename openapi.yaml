@@ -1,0 +1,22 @@
+openapi: 3.0.3
+info:
+  title: Geonera Ingestion API
+  description: REST API for Geonera Ingestion Service
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+paths:
+  /:
+    get:
+      summary: Health check
+      description: Returns a simple Hello World response to confirm the server is running.
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Server is running
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: Hello World

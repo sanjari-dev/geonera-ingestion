@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path \"C:\\\\dev\\\\geonera\\\\ingestion\\\\repo\\\\geonera-ingestion\" -ErrorAction SilentlyContinue; if \\(-not \\(Test-Path \"C:\\\\dev\\\\geonera\\\\ingestion\\\\repo\\\\geonera-ingestion\"\\)\\) { Write-Host \"Directory does not exist\" } else { Write-Host \"Directory exists\" })"
+    ]
+  }
+}
