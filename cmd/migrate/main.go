@@ -30,7 +30,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Printf("db close: %v", err)
+		}
+	}()
 
 	if err := db.PingContext(context.Background()); err != nil {
 		log.Fatalf("ping: %v", err)

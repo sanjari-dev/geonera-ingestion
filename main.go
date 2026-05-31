@@ -109,5 +109,7 @@ func main() {
 	}
 
 	log.Printf("server starting on :%s", port)
-	log.Fatal(app.Listen(":" + port))
+	if err := app.Listen(":" + port); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
 }
