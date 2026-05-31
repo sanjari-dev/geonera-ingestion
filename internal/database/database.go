@@ -7,14 +7,17 @@ import (
 	"log"
 	"os"
 
-	"github.com/sanjari-dev/geonera-ingestion/ent"
-
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	"github.com/XSAM/otelsql"
 	_ "github.com/lib/pq"
+	"github.com/sanjari-dev/geonera-ingestion/ent"
+	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
 )
 
 // NewEntClient opens a PostgreSQL connection using DATABASE_DIRECT_URL from the
-// environment, verifies connectivity with Ping, then returns an Ent client.
-// The caller is responsible for closing the client when done.
+// environment, verifies connectivity with Ping, then returns an OTel-instrumented
+// Ent client. The caller is responsible for closing the client when done.
 func NewEntClient(ctx context.Context) (*ent.Client, error) {
 	dsn := os.Getenv("DATABASE_DIRECT_URL")
 	if dsn == "" {
@@ -25,12 +28,7 @@ func NewEntClient(ctx context.Context) (*ent.Client, error) {
 		return nil, err
 	}
 
-	client, err := ent.Open("postgres", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open ent client: %w", err)
-	}
-
-	return client, nil
+	return openEnt(dsn)
 }
 
 // NewLockDB opens a raw *sql.DB on the direct Postgres connection (DATABASE_DIRECT_URL).
@@ -43,7 +41,13 @@ func NewLockDB(ctx context.Context) (*sql.DB, error) {
 		return nil, fmt.Errorf("DATABASE_DIRECT_URL is not set")
 	}
 
-	db, err := sql.Open("postgres", dsn)
+	db, err := otelsql.Open("postgres", dsn,
+		otelsql.WithAttributes(semconv.DBSystemNamePostgreSQL),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{
+			OmitConnResetSession: true, // avoid noise from connection resets
+			OmitRows:             true, // skip row-level spans (too verbose)
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open lock db: %w", err)
 	}
@@ -56,7 +60,7 @@ func NewLockDB(ctx context.Context) (*sql.DB, error) {
 	return db, nil
 }
 
-// NewPoolClient opens an ent.Client for ETL worker goroutines.
+// NewPoolClient opens an OTel-instrumented ent.Client for ETL worker goroutines.
 //
 // Resolution order:
 //  1. DATABASE_POOL_URL (PgBouncer) — preferred in production.
@@ -87,16 +91,27 @@ func NewPoolClient(ctx context.Context) (*ent.Client, error) {
 	return openEnt(directDSN)
 }
 
-// openEnt opens an ent.Client for the given DSN without pinging (caller already pinged).
+// openEnt opens an OTel-instrumented ent.Client for the given DSN without
+// pinging (caller already pinged).
 func openEnt(dsn string) (*ent.Client, error) {
-	client, err := ent.Open("postgres", dsn)
+	db, err := otelsql.Open("postgres", dsn,
+		otelsql.WithAttributes(semconv.DBSystemNamePostgreSQL),
+		otelsql.WithSpanOptions(otelsql.SpanOptions{
+			OmitConnResetSession: true, // avoid noise from connection resets
+			OmitRows:             true, // skip row-level spans (too verbose)
+		}),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open pool ent client: %w", err)
+		return nil, fmt.Errorf("open otelsql db: %w", err)
 	}
+
+	drv := entsql.OpenDB(dialect.Postgres, db)
+	client := ent.NewClient(ent.Driver(drv))
 	return client, nil
 }
 
 // ping opens a temporary sql.DB, runs PingContext, and closes the connection.
+// It uses plain sql.Open (no OTel) since it is a one-shot connectivity probe.
 // It returns an error if the database is unreachable.
 func ping(ctx context.Context, dsn string) error {
 	db, err := sql.Open("postgres", dsn)

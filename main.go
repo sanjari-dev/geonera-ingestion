@@ -12,9 +12,12 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/api"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/database"
+	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
 	"github.com/sanjari-dev/geonera-ingestion/internal/mq"
+	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/seed"
 	"github.com/sanjari-dev/geonera-ingestion/internal/telemetry"
+	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
 )
 
 func main() {
@@ -71,6 +74,23 @@ func main() {
 
 	// ── DAL: enforces split-connection strategy ───────────────────────────────
 	appDAL := dal.New(lockDB, poolClient)
+
+	// ── Cloudflare R2 client ──────────────────────────────────────────────────
+	r2Client, err := r2.New(r2.Config{
+		Endpoint:        os.Getenv("R2_ENDPOINT"),
+		Bucket:          os.Getenv("R2_BUCKET"),
+		AccessKeyID:     os.Getenv("R2_ACCESS_KEY_ID"),
+		SecretAccessKey: os.Getenv("R2_SECRET_ACCESS_KEY"),
+	})
+	if err != nil {
+		log.Fatalf("r2 client: %v", err)
+	}
+
+	// ── Dukascopy HTTP client ─────────────────────────────────────────────────
+	dukClient := dukascopy.NewClient()
+
+	// ── Wire external clients into worker package ─────────────────────────────
+	worker.InitClients(r2Client, dukClient)
 
 	// ── Database: ensure schema is initialized ────────────────────────────────
 	if err := database.EnsureSchema(ctx); err != nil {

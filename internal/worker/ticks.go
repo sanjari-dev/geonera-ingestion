@@ -2,18 +2,47 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"entgo.io/ent/dialect/sql"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/sanjari-dev/geonera-ingestion/ent"
+	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
+	"github.com/sanjari-dev/geonera-ingestion/ent/predicate"
+	"github.com/sanjari-dev/geonera-ingestion/ent/state"
+	"github.com/sanjari-dev/geonera-ingestion/ent/synctask"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
+	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
+	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
+	"github.com/sanjari-dev/geonera-ingestion/internal/tickparquet"
 )
 
 var tickTracer = otel.Tracer("worker/ticks")
+
+const (
+	// notFoundThreshold is the consecutive-404 count that triggers a Zero-Row Parquet commit.
+	notFoundThreshold = 3
+	// maxRetryCount is the ceiling for RetryCount before a row is ABANDONED.
+	maxRetryCount = 5
+)
+
+// tickDownloadSem limits concurrent BI5 HTTP downloads (and API re-checks)
+// to Dukascopy at 12 goroutines to prevent HTTP 429 rate-limit errors.
+// Shared across all tick phases (T-0, T-1, T-2, Backfill).
+var tickDownloadSem = make(chan struct{}, 12)
+
+// tickProcessSem limits concurrent Parquet convert+upload goroutines to 50
+// to prevent OOM spikes on high-volume instruments like EURUSD.
+// Shared across all tick phases.
+var tickProcessSem = make(chan struct{}, 50)
 
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
 // It acquires LockIDTick via the direct connection so that Regular and Backfill
@@ -97,36 +126,40 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 
 func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer recoverGoroutine(ctx, "runT0Phase")
+	defer recoverGoroutine(ctx, "ticks/T0")
 
-	// TODO: claim PENDING tick rows for the current hour, download BI5 from
-	// Dukascopy (bounded semaphore ≤ 12 goroutines), convert to Parquet,
-	// upload to R2, update status → COMPLETED / FAILED / NOT_FOUND.
-	log.Println("T-0: not yet implemented")
+	ctx, span := tickTracer.Start(ctx, "ticks/T0")
+	defer span.End()
+
+	target := time.Now().UTC().Truncate(time.Hour)
+	runIngestionLoop(ctx, d, span, &target)
 }
 
 // ── T-1: previous hour recovery ───────────────────────────────────────────────
 
 func runT1Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer recoverGoroutine(ctx, "runT1Phase")
+	defer recoverGoroutine(ctx, "ticks/T1")
 
-	// TODO: claim PENDING / PROCESSED / FAILED / NOT_FOUND rows for T-1,
-	// reset PROCESSED → PENDING, retry FAILED (increment RetryCount → ABANDONED
-	// at ≥ 5), handle NOT_FOUND streak logic and Zero-Row Parquet upload.
-	log.Println("T-1: not yet implemented")
+	ctx, span := tickTracer.Start(ctx, "ticks/T1")
+	defer span.End()
+
+	target := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	runRecoveryLoop(ctx, d, span, target)
 }
 
 // ── T-2: two-hours-ago physical validation ────────────────────────────────────
 
 func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer recoverGoroutine(ctx, "runT2Phase")
+	defer recoverGoroutine(ctx, "ticks/T2")
 
-	// TODO: claim COMPLETED rows for T-2, read Parquet from R2, run physical
-	// validation (magic number, schema match, boundary check), promote to
-	// CONFIRMED or demote to BROKEN, insert SyncTask transactionally.
-	log.Println("T-2: not yet implemented")
+	ctx, span := tickTracer.Start(ctx, "ticks/T2")
+	defer span.End()
+
+	target := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	// T-2 Regular: only IsActive filter — paused instruments still get validated.
+	runValidationLoop(ctx, d, span, &target, false)
 }
 
 // ── Backfill groups ───────────────────────────────────────────────────────────
@@ -135,25 +168,1038 @@ func runBackfillIngestionGroup(ctx context.Context, d *dal.DAL, wg *sync.WaitGro
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runBackfillIngestionGroup")
 
-	// TODO: claim historical PENDING rows, run standard ETL cycle.
-	log.Println("backfill ingestion: not yet implemented")
+	ctx, span := tickTracer.Start(ctx, "runBackfillIngestionGroup")
+	defer span.End()
+
+	// nil timestamp = no timestamp filter (all historical PENDING rows).
+	runIngestionLoop(ctx, d, span, nil)
 }
 
 func runBackfillResetGroup(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runBackfillResetGroup")
 
-	// TODO: claim PROCESSED / FAILED / BROKEN rows, reset or ABANDON at retry ≥ 5.
-	log.Println("backfill reset: not yet implemented")
+	ctx, span := tickTracer.Start(ctx, "runBackfillResetGroup")
+	defer span.End()
+
+	runResetLoop(ctx, d, span)
 }
 
 func runBackfillValidationGroup(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runBackfillValidationGroup")
 
-	// TODO: validate COMPLETED rows and re-check NOT_FOUND rows via API
-	// (bounded semaphore ≤ 12), promote or demote accordingly.
-	log.Println("backfill validation: not yet implemented")
+	ctx, span := tickTracer.Start(ctx, "runBackfillValidationGroup")
+	defer span.End()
+
+	// Backfill: validate COMPLETED rows, skipping paused instruments.
+	runValidationLoop(ctx, d, span, nil, true)
+	// Re-check all NOT_FOUND rows; if data is found, validate and confirm directly.
+	runNotFoundRecheckLoop(ctx, d, span)
+}
+
+// ── Loop implementations ──────────────────────────────────────────────────────
+
+// runIngestionLoop claims PENDING TICK rows one at a time and processes each
+// via the ETL pipeline in a goroutine bounded by tickDownloadSem / tickProcessSem.
+//
+// If the timestamp is non-nil, only rows for that exact hour are claimed (T-0 mode).
+// A nil timestamp processes all historical PENDING rows (Backfill mode).
+//
+// Correctness note: FOR UPDATE SKIP LOCKED is not used here because
+// (a) LockIDTick prevents any concurrent tick worker process, and
+// (b) the serial claim loop means no two goroutines within this process
+// ever compete for the same row.
+func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time) {
+	var loopWg sync.WaitGroup
+	for ctx.Err() == nil {
+		var claimed *ent.State
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			q := tx.State.Query().
+				Where(
+					state.JobTypeEQ(state.JobTypeTICK),
+					state.StatusEQ(state.StatusPENDING),
+					state.HasInstrumentWith(
+						instrument.IsPauseEQ(false),
+						instrument.IsActiveEQ(true),
+					),
+					state.IsDeletedEQ(false),
+				).
+				WithInstrument(). // needed by downloadBI5 / convertBI5ToParquet / uploadToR2
+				Order(state.ByTimestamp())
+			if timestamp != nil {
+				q = q.Where(state.TimestampEQ(*timestamp))
+			}
+
+			row, err := q.First(ctx)
+			if err != nil {
+				return err
+			}
+			claimed, err = tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatus(row.Status)).
+				SetStatus(state.StatusPROCESSED).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			if err != nil {
+				return err
+			}
+			// UpdateOneID does not return edges; preserve the eagerly-loaded
+			// Instrument so ETL functions can access name and divider.
+			claimed.Edges = row.Edges
+			return nil
+		})
+		if err != nil {
+			if ent.IsNotFound(err) {
+				break
+			}
+			span.RecordError(err)
+			log.Printf("ingestion claim: %v", err)
+			break
+		}
+
+		loopWg.Add(1)
+		go func(r *ent.State) {
+			defer loopWg.Done()
+			executeIngestionETL(ctx, d, r)
+		}(claimed)
+	}
+	loopWg.Wait()
+}
+
+// runRecoveryLoop claims PENDING/PROCESSED/FAILED/NOT_FOUND rows for the given
+// timestamp and applies the T-1 recovery rules to each.
+func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target time.Time) {
+	var loopWg sync.WaitGroup
+	for ctx.Err() == nil {
+		var claimed *ent.State
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			row, err := tx.State.Query().
+				Where(
+					state.JobTypeEQ(state.JobTypeTICK),
+					state.StatusIn(
+						state.StatusPENDING,
+						state.StatusPROCESSED,
+						state.StatusFAILED,
+						state.StatusNOT_FOUND,
+					),
+					state.TimestampEQ(target),
+					state.HasInstrumentWith(
+						instrument.IsPauseEQ(false),
+						instrument.IsActiveEQ(true),
+					),
+					state.IsDeletedEQ(false),
+				).
+				Order(
+					// Process stuck PROCESSED first, then FAILED, then PENDING/NOT_FOUND.
+					func(s *sql.Selector) {
+						s.OrderExprFunc(func(b *sql.Builder) {
+							b.WriteString(`CASE status ` +
+								`WHEN 'PROCESSED' THEN 1 ` +
+								`WHEN 'FAILED'    THEN 2 ` +
+								`WHEN 'NOT_FOUND' THEN 3 ` +
+								`WHEN 'PENDING'   THEN 4 ` +
+								`ELSE 5 END`)
+						})
+					},
+					state.ByTimestamp(),
+				).
+				First(ctx)
+			if err != nil {
+				return err
+			}
+			claimed, err = tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatus(row.Status)).
+				SetStatus(state.StatusPROCESSED).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			return err
+		})
+		if err != nil {
+			if ent.IsNotFound(err) {
+				break
+			}
+			span.RecordError(err)
+			log.Printf("recovery claim (target %s): %v", target, err)
+			break
+		}
+
+		prevStatus := claimed.PreviousStatus
+		loopWg.Add(1)
+		go func(r *ent.State, prev *state.PreviousStatus) {
+			defer loopWg.Done()
+			executeRecoveryAction(ctx, d, r, prev)
+		}(claimed, prevStatus)
+	}
+	loopWg.Wait()
+}
+
+// runValidationLoop claims COMPLETED rows (optionally for a specific timestamp)
+// and validates their Parquet files. Stray PROCESSED rows in the window are
+// reset to PENDING without ETL.
+//
+// timestamp==nil processes all historical COMPLETED rows (Backfill mode).
+//
+// respectPause controls whether instruments with IsPause=true are skipped:
+//   - false: T-2 Regular — only IsActive=true (paused instruments still get
+//     their already-completed files validated, per architecture §D.3).
+//   - true: Backfill Validation — requires IsActive=true AND IsPause=false,
+//     per architecture §E.3.
+func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time, respectPause bool) {
+	var loopWg sync.WaitGroup
+	for ctx.Err() == nil {
+		var claimed *ent.State
+		// preclaimPrev is the row's PreviousStatus column value BEFORE the claim
+		// update overwrites it. It is used by executeValidation to detect a genuine
+		// demotion: a row whose last recorded history was CONFIRMED (i.e., it was
+		// confirmed in a prior cycle) that is now found to be BROKEN.
+		var preclaimPrev *state.PreviousStatus
+
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			instrPreds := []predicate.Instrument{instrument.IsActiveEQ(true)}
+			if respectPause {
+				instrPreds = append(instrPreds, instrument.IsPauseEQ(false))
+			}
+			q := tx.State.Query().
+				Where(
+					state.JobTypeEQ(state.JobTypeTICK),
+					state.StatusIn(state.StatusCOMPLETED, state.StatusPROCESSED),
+					state.HasInstrumentWith(instrPreds...),
+					state.IsDeletedEQ(false),
+				).
+				WithInstrument(). // needed by readFromR2 / validateParquetFile
+				Order(state.ByTimestamp())
+			if timestamp != nil {
+				q = q.Where(state.TimestampEQ(*timestamp))
+			}
+
+			row, err := q.First(ctx)
+			if err != nil {
+				return err
+			}
+
+			// Save the DB's PreviousStatus before the claim overwrites it.
+			preclaimPrev = row.PreviousStatus
+
+			originalStatus := row.Status
+			newStatus := state.StatusPROCESSED
+			if originalStatus == state.StatusPROCESSED {
+				// Stray PROCESSED: reset to PENDING immediately, no ETL.
+				newStatus = state.StatusPENDING
+			}
+			claimed, err = tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatus(originalStatus)).
+				SetStatus(newStatus).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			if err != nil {
+				return err
+			}
+			// Preserve eagerly-loaded Instrument edge for readFromR2 / validateParquetFile.
+			claimed.Edges = row.Edges
+			return nil
+		})
+		if err != nil {
+			if ent.IsNotFound(err) {
+				break
+			}
+			span.RecordError(err)
+			log.Printf("validation claim: %v", err)
+			break
+		}
+
+		if claimed.Status == state.StatusPENDING {
+			// Was a stray PROCESSED, now reset — skip validation.
+			continue
+		}
+
+		loopWg.Add(1)
+		go func(r *ent.State, prev *state.PreviousStatus) {
+			defer loopWg.Done()
+			executeValidation(ctx, d, r, prev)
+		}(claimed, preclaimPrev)
+	}
+	loopWg.Wait()
+}
+
+// runResetLoop is used by Backfill Reset. It claims PROCESSED/FAILED/BROKEN rows
+// and resets them: PROCESSED → PENDING, FAILED/BROKEN → PENDING (retry) or ABANDONED.
+// Processing is sequential (no goroutines) since these are fast DB-only operations.
+func runResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
+	for ctx.Err() == nil {
+		var claimed *ent.State
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			row, err := tx.State.Query().
+				Where(
+					state.JobTypeEQ(state.JobTypeTICK),
+					state.StatusIn(
+						state.StatusPROCESSED,
+						state.StatusFAILED,
+						state.StatusBROKEN,
+					),
+					state.HasInstrumentWith(
+						instrument.IsPauseEQ(false),
+						instrument.IsActiveEQ(true),
+					),
+					state.IsDeletedEQ(false),
+				).
+				Order(
+					func(s *sql.Selector) {
+						s.OrderExprFunc(func(b *sql.Builder) {
+							b.WriteString(`CASE status ` +
+								`WHEN 'PROCESSED' THEN 1 ` +
+								`WHEN 'FAILED'    THEN 2 ` +
+								`WHEN 'BROKEN'    THEN 3 ` +
+								`ELSE 4 END`)
+						})
+					},
+					state.ByTimestamp(),
+				).
+				First(ctx)
+			if err != nil {
+				return err
+			}
+			claimed, err = tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatus(row.Status)).
+				SetStatus(state.StatusPROCESSED).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			return err
+		})
+		if err != nil {
+			if ent.IsNotFound(err) {
+				break
+			}
+			span.RecordError(err)
+			log.Printf("backfill reset claim: %v", err)
+			break
+		}
+
+		executeResetAction(ctx, d, claimed)
+	}
+}
+
+// runNotFoundRecheckLoop (Backfill Validation only) claims every NOT_FOUND row
+// regardless of its streak and re-checks the API.
+// Unlike T-1 recovery (which leaves a found row at COMPLETED for T-2 to validate
+// later), Backfill goes all the way to CONFIRMED in a single pass per §E.3:
+// download → convert → upload → validate → CONFIRMED + SyncTask.
+func runNotFoundRecheckLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
+	var loopWg sync.WaitGroup
+	for ctx.Err() == nil {
+		var claimed *ent.State
+		var preclaimPrev *state.PreviousStatus // DB value before our claim overwrites it
+
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			row, err := tx.State.Query().
+				Where(
+					state.JobTypeEQ(state.JobTypeTICK),
+					state.StatusEQ(state.StatusNOT_FOUND),
+					state.HasInstrumentWith(
+						instrument.IsPauseEQ(false),
+						instrument.IsActiveEQ(true),
+					),
+					state.IsDeletedEQ(false),
+				).
+				WithInstrument(). // needed by downloadBI5 / ETL chain
+				Order(state.ByTimestamp()).
+				First(ctx)
+			if err != nil {
+				return err
+			}
+			// Preserve PreviousStatus before claim overwrites it (demotion guard).
+			preclaimPrev = row.PreviousStatus
+			claimed, err = tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatusNOT_FOUND).
+				SetStatus(state.StatusPROCESSED).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			if err != nil {
+				return err
+			}
+			// Preserve eagerly-loaded Instrument edge.
+			claimed.Edges = row.Edges
+			return nil
+		})
+		if err != nil {
+			if ent.IsNotFound(err) {
+				break
+			}
+			span.RecordError(err)
+			log.Printf("NOT_FOUND recheck claim: %v", err)
+			break
+		}
+
+		loopWg.Add(1)
+		go func(r *ent.State, prev *state.PreviousStatus) {
+			defer loopWg.Done()
+			executeNotFoundRecheckFull(ctx, d, r, prev)
+		}(claimed, preclaimPrev)
+	}
+	loopWg.Wait()
+}
+
+// ── ETL execution ─────────────────────────────────────────────────────────────
+
+// executeIngestionETL runs the download → convert → upload pipeline for a row
+// that has already been claimed (status = PROCESSED). Updates the row's status
+// to COMPLETED, FAILED, or NOT_FOUND (with Zero-Row flow when streak ≥ 3).
+func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ctx, span := tickTracer.Start(ctx, "ticks/etl", tickSpanAttrs(row))
+	defer span.End()
+
+	// Phase 1: Download BI5 (≤12 concurrent to respect Dukascopy rate limits).
+	tickDownloadSem <- struct{}{}
+	data, err := downloadBI5(ctx, row)
+	<-tickDownloadSem
+
+	if err != nil {
+		if isNotFoundError(err) {
+			handleNotFoundStreak(ctx, d, row)
+		} else {
+			span.RecordError(err)
+			updateStateFailed(ctx, d, row)
+		}
+		return
+	}
+
+	// Data was found: reset NotFoundStreak to 0 if it was previously non-zero.
+	if row.NotFoundStreak > 0 {
+		if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			_, e := tx.State.UpdateOneID(row.ID).
+				SetNotFoundStreak(0).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			return e
+		}); e != nil {
+			span.RecordError(e)
+			log.Printf("reset streak for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), e)
+		}
+	}
+
+	// Phase 2: Convert + Upload (≤50 concurrent to prevent OOM).
+	executeConvertUpload(ctx, d, row, data)
+}
+
+// executeRecoveryAction applies the T-1 recovery rule for a claimed row based
+// on the status it held before being claimed.
+func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev *state.PreviousStatus) {
+	if prev == nil {
+		return
+	}
+	switch *prev {
+	case state.PreviousStatusPROCESSED, state.PreviousStatusPENDING:
+		// Stuck PROCESSED or stale PENDING → reset to PENDING for the next T-0 run.
+		resetStateToPending(ctx, d, row)
+
+	case state.PreviousStatusFAILED:
+		// Increment retry count atomically; ABANDONED at ≥ 5, else PENDING.
+		handleRetryReset(ctx, d, row)
+
+	case state.PreviousStatusNOT_FOUND:
+		// Re-check the API; if data is available, run ETL, otherwise increment streak.
+		executeNotFoundRecheck(ctx, d, row)
+	}
+}
+
+// executeNotFoundRecheck re-checks the Dukascopy API for a claimed NOT_FOUND row.
+// Used both by T-1 recovery and the Backfill NOT_FOUND recheck loop.
+func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck", tickSpanAttrs(row))
+	defer span.End()
+
+	tickDownloadSem <- struct{}{}
+	data, err := downloadBI5(ctx, row)
+	<-tickDownloadSem
+
+	if err != nil {
+		if isNotFoundError(err) {
+			// Still 404: increment streak (may trigger Zero-Row flow).
+			handleNotFoundStreak(ctx, d, row)
+		} else {
+			// System / network error: leave row as NOT_FOUND for the next cycle.
+			span.RecordError(err)
+			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+			if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+				_, e := tx.State.UpdateOneID(row.ID).
+					SetPreviousStatus(state.PreviousStatusPROCESSED).
+					SetStatus(state.StatusNOT_FOUND).
+					SetUpdatedAt(time.Now().UTC()).
+					Save(ctx)
+				return e
+			}); e != nil {
+				span.RecordError(e)
+				log.Printf("NOT_FOUND revert for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), e)
+			}
+		}
+		return
+	}
+
+	// Data found: reset streak to 0 and run ETL.
+	if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		_, e := tx.State.UpdateOneID(row.ID).
+			SetNotFoundStreak(0).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		return e
+	}); e != nil {
+		span.RecordError(e)
+		log.Printf("reset streak on recovery for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), e)
+	}
+
+	executeConvertUpload(ctx, d, row, data)
+}
+
+// executeNotFoundRecheckFull is the Backfill-Validation variant of the NOT_FOUND
+// recheck. Unlike the T-1 variant (executeNotFoundRecheck) which stops at COMPLETED
+// and lets T-2 validate later, this function performs the full pipeline in one pass:
+// download → streak-reset → convert → upload → validate → CONFIRMED + SyncTask.
+//
+// Per architecture §E.3: "mengunduh, konversi, unggah ke R2, memvalidasinya,
+// mereset NotFoundStreak menjadi 0, dan merubah status ke CONFIRMED (beserta SyncTask)."
+//
+// preclaimPrev is the row's PreviousStatus before the current claim, forwarded to
+// executeValidation so a genuine demotion from CONFIRMED can trigger a SyncTask.
+func executeNotFoundRecheckFull(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
+	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck-full", tickSpanAttrs(row))
+	defer span.End()
+
+	// Step 1: Download (rate-limited — same pool as BI5 downloads per §E.3).
+	tickDownloadSem <- struct{}{}
+	data, err := downloadBI5(ctx, row)
+	<-tickDownloadSem
+
+	if err != nil {
+		if isNotFoundError(err) {
+			// Still 404: increment streak; may trigger Zero-Row flow.
+			handleNotFoundStreak(ctx, d, row)
+		} else {
+			// System / network error: leave row as NOT_FOUND for the next cycle.
+			span.RecordError(err)
+			log.Printf("backfill NOT_FOUND recheck for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+			updateSimpleStatus(ctx, d, row,
+				state.PreviousStatusPROCESSED, state.StatusNOT_FOUND, "revert to NOT_FOUND")
+		}
+		return
+	}
+
+	// Data found: atomically reset NotFoundStreak to 0 before processing.
+	if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		_, e := tx.State.UpdateOneID(row.ID).
+			SetNotFoundStreak(0).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		return e
+	}); e != nil {
+		span.RecordError(e)
+		log.Printf("reset streak for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), e)
+	}
+
+	// Step 2: Convert + Upload (rate-limited). Do NOT set status to COMPLETED here;
+	// executeValidation (Step 3) will write the final CONFIRMED or BROKEN status.
+	var uploadErr error
+	func() {
+		tickProcessSem <- struct{}{}
+		defer func() { <-tickProcessSem }()
+
+		parquet, convErr := convertBI5ToParquet(data, row)
+		if convErr != nil {
+			span.RecordError(convErr)
+			uploadErr = convErr
+			return
+		}
+		if upErr := uploadToR2(ctx, row, parquet); upErr != nil {
+			span.RecordError(upErr)
+			uploadErr = upErr
+		}
+	}()
+
+	if uploadErr != nil {
+		updateStateFailed(ctx, d, row)
+		return
+	}
+
+	// Step 3: Validate the just-uploaded file and promote directly to CONFIRMED.
+	// The row is still in PROCESSED state; executeValidation finalizes it.
+	executeValidation(ctx, d, row, preclaimPrev)
+}
+
+// executeValidation reads the Parquet file from R2 and validates it physically.
+// On success the row is promoted to CONFIRMED with a SyncTask event.
+// On failure the row is set to BROKEN; a SyncTask is inserted only when
+// preclaimPrev == CONFIRMED, which indicates a genuine demotion: the row had
+// already been confirmed in a previous cycle and is now found to be BROKEN.
+func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
+	ctx, span := tickTracer.Start(ctx, "ticks/validate", tickSpanAttrs(row))
+	defer span.End()
+
+	fileBytes, err := readFromR2(ctx, row)
+	if err != nil {
+		span.RecordError(err)
+		log.Printf("read from R2 for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		// Unable to read the file — treat as BROKEN so Backfill can retry.
+		updateStateBroken(ctx, d, row)
+		return
+	}
+
+	validationErr := validateParquetFile(ctx, row, fileBytes)
+
+	err = d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		if validationErr == nil {
+			saved, e := tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatusPROCESSED).
+				SetStatus(state.StatusCONFIRMED).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			if e != nil {
+				return e
+			}
+			return upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
+		}
+
+		// Validation failed → BROKEN.
+		broken, e := tx.State.UpdateOneID(row.ID).
+			SetPreviousStatus(state.PreviousStatusPROCESSED).
+			SetStatus(state.StatusBROKEN).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		if e != nil {
+			return e
+		}
+		// Insert SyncTask only on genuine demotion: the row's PreviousStatus
+		// BEFORE this validation cycle was CONFIRMED, meaning it was previously
+		// a confirmed terminal row that has now been found to be BROKEN.
+		if preclaimPrev != nil && *preclaimPrev == state.PreviousStatusCONFIRMED {
+			return upsertSyncTaskInTx(ctx, tx, broken.InstrumentID, broken.Timestamp)
+		}
+		return nil
+	})
+	if err != nil {
+		span.RecordError(err)
+		log.Printf("validation status update for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+	}
+}
+
+// executeResetAction applies the Backfill Reset rule for a claimed row:
+//   - PROCESSED → PENDING (stuck worker recovery)
+//   - FAILED / BROKEN → PENDING with AddRetryCount(+1), or ABANDONED if ≥ 5
+func executeResetAction(ctx context.Context, d *dal.DAL, row *ent.State) {
+	if row.PreviousStatus == nil {
+		return
+	}
+	switch *row.PreviousStatus {
+	case state.PreviousStatusPROCESSED:
+		resetStateToPending(ctx, d, row)
+	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
+		handleRetryReset(ctx, d, row)
+	}
+}
+
+// ── State transition helpers ──────────────────────────────────────────────────
+
+// handleNotFoundStreak atomically increments NotFoundStreak.
+// If the new value reaches notFoundThreshold (3), it triggers the Zero-Row
+// Parquet commit flow. Otherwise, the row is set to NOT_FOUND.
+func handleNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State) {
+	span := trace.SpanFromContext(ctx)
+
+	var updated *ent.State
+	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		var e error
+		// Atomically increment and read the new streak value.
+		updated, e = tx.State.UpdateOneID(row.ID).
+			AddNotFoundStreak(1).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		if e != nil {
+			return e
+		}
+		if updated.NotFoundStreak < notFoundThreshold {
+			// Simple NOT_FOUND: streak below threshold.
+			updated, e = tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatusPROCESSED).
+				SetStatus(state.StatusNOT_FOUND).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+		}
+		// else: row stays PROCESSED; commitZeroRowAndConfirm will finalize it.
+		return e
+	})
+	if err != nil {
+		span.RecordError(err)
+		log.Printf("streak increment for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		return
+	}
+
+	if updated.NotFoundStreak >= notFoundThreshold {
+		commitZeroRowAndConfirm(ctx, d, updated)
+	}
+}
+
+// commitZeroRowAndConfirm implements the Zero-Row Parquet commit protocol:
+//  1. Build a zero-row Parquet (in memory).
+//  2. Set IsHoliday=true in DB atomically — must happen BEFORE the R2 upload.
+//  3. Upload the file to R2 only after the DB commit.
+//  4. Read back and physically validate.
+//  5. Promote to CONFIRMED + SyncTask (or BROKEN on validation failure).
+func commitZeroRowAndConfirm(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ctx, span := tickTracer.Start(ctx, "ticks/commit-zero-row", tickSpanAttrs(row))
+	defer span.End()
+
+	// 1. Build zero-row Parquet in memory.
+	zeroRowData := buildZeroRowParquet()
+
+	// 2. Set IsHoliday=true before uploading.
+	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		_, e := tx.State.UpdateOneID(row.ID).
+			SetIsHoliday(true).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		return e
+	}); err != nil {
+		span.RecordError(fmt.Errorf("set IsHoliday for %s: %w", row.ID, err))
+		log.Printf("set IsHoliday for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		return
+	}
+
+	// Build a local copy with IsHoliday=true so the R2 path helpers and
+	// validator see the correct state without an extra DB round-trip.
+	rowWithHoliday := *row
+	rowWithHoliday.IsHoliday = true
+
+	// 3. Upload to R2 — only because the DB commit above succeeded.
+	if err := uploadToR2(ctx, &rowWithHoliday, zeroRowData); err != nil {
+		span.RecordError(fmt.Errorf("upload zero-row for %s: %w", row.ID, err))
+		log.Printf("upload zero-row for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		return
+	}
+
+	// 4. Read back and validate.
+	fileBytes, err := readFromR2(ctx, &rowWithHoliday)
+	if err != nil {
+		span.RecordError(fmt.Errorf("read zero-row from R2 for %s: %w", row.ID, err))
+		log.Printf("read zero-row from R2 for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		return
+	}
+	validationErr := validateParquetFile(ctx, &rowWithHoliday, fileBytes)
+
+	// 5. Finalize status.
+	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		if validationErr == nil {
+			saved, e := tx.State.UpdateOneID(row.ID).
+				SetPreviousStatus(state.PreviousStatusPROCESSED).
+				SetStatus(state.StatusCONFIRMED).
+				SetUpdatedAt(time.Now().UTC()).
+				Save(ctx)
+			if e != nil {
+				return e
+			}
+			return upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
+		}
+		_, e := tx.State.UpdateOneID(row.ID).
+			SetPreviousStatus(state.PreviousStatusPROCESSED).
+			SetStatus(state.StatusBROKEN).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		return e
+	}); err != nil {
+		span.RecordError(err)
+		log.Printf("confirm/break zero-row for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+	}
+}
+
+// handleRetryReset increments RetryCount atomically and either resets the row
+// to PENDING (for another attempt) or transitions it to ABANDONED (≥ maxRetryCount).
+func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
+	span := trace.SpanFromContext(ctx)
+	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		// First update: only increment the counter — no status transition, so
+		// PreviousStatus must NOT be touched here (architecture rule: update
+		// PreviousStatus only together with a status change).
+		updated, e := tx.State.UpdateOneID(row.ID).
+			AddRetryCount(1).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		if e != nil {
+			return e
+		}
+		newStatus := state.StatusPENDING
+		if updated.RetryCount >= maxRetryCount {
+			newStatus = state.StatusABANDONED
+		}
+		// Second update: actual status transition — PreviousStatus is set here.
+		_, e = tx.State.UpdateOneID(row.ID).
+			SetPreviousStatus(state.PreviousStatusPROCESSED).
+			SetStatus(newStatus).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		return e
+	})
+	if err != nil {
+		span.RecordError(err)
+		log.Printf("retry reset for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+	}
+}
+
+func resetStateToPending(ctx context.Context, d *dal.DAL, row *ent.State) {
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusPENDING, "reset to PENDING")
+}
+
+func updateStateCompleted(ctx context.Context, d *dal.DAL, row *ent.State) {
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusCOMPLETED, "set COMPLETED")
+}
+
+func updateStateFailed(ctx context.Context, d *dal.DAL, row *ent.State) {
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "set FAILED")
+}
+
+func updateStateBroken(ctx context.Context, d *dal.DAL, row *ent.State) {
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusBROKEN, "set BROKEN")
+}
+
+// upsertSyncTaskInTx inserts a PENDING SyncTask for the given instrument+day,
+// or resets an existing one back to PENDING to trigger a ResolvedTickCount
+// recomputed. Must be called inside an ExecuteInPool transaction.
+func upsertSyncTaskInTx(ctx context.Context, tx *ent.Tx, instrumentID uuid.UUID, tickTimestamp time.Time) error {
+	targetDate := tickTimestamp.Truncate(24 * time.Hour)
+
+	existing, err := tx.SyncTask.Query().
+		Where(
+			synctask.InstrumentIDEQ(instrumentID),
+			synctask.TargetDateEQ(targetDate),
+		).
+		First(ctx)
+	if err != nil && !ent.IsNotFound(err) {
+		return fmt.Errorf("upsert SyncTask query: %w", err)
+	}
+	if existing != nil {
+		_, err = tx.SyncTask.UpdateOneID(existing.ID).
+			SetStatus(synctask.StatusPENDING).
+			Save(ctx)
+		return err
+	}
+	return tx.SyncTask.Create().
+		SetInstrumentID(instrumentID).
+		SetTargetDate(targetDate).
+		SetStatus(synctask.StatusPENDING).
+		Exec(ctx)
+}
+
+// ── Shared sub-pipeline ───────────────────────────────────────────────────────
+
+// executeConvertUpload acquires tickProcessSem, converts raw BI5 bytes to
+// Parquet, uploads to R2, then updates the row to COMPLETED or FAILED.
+// Extracted to avoid duplicating the same block in executeIngestionETL and
+// executeNotFoundRecheck.
+func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data []byte) {
+	ctx, span := tickTracer.Start(ctx, "ticks/convert-upload", tickSpanAttrs(row))
+	defer span.End()
+
+	tickProcessSem <- struct{}{}
+	defer func() { <-tickProcessSem }()
+
+	parquet, err := convertBI5ToParquet(data, row)
+	if err != nil {
+		span.RecordError(err)
+		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "convert failed")
+		return
+	}
+	if err := uploadToR2(ctx, row, parquet); err != nil {
+		span.RecordError(err)
+		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload failed")
+		return
+	}
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusCOMPLETED, "set COMPLETED")
+}
+
+// updateSimpleStatus writes a single status transition to the DB.
+// prev is recorded in previous_status; next becomes the new status.
+// Extracted to avoid duplicating the same ExecuteInPool pattern across
+// updateStateCompleted / updateStateFailed / updateStateBroken / resetStateToPending.
+func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev state.PreviousStatus, next state.Status, errMsg string) {
+	span := trace.SpanFromContext(ctx)
+	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		_, e := tx.State.UpdateOneID(row.ID).
+			SetPreviousStatus(prev).
+			SetStatus(next).
+			SetUpdatedAt(time.Now().UTC()).
+			Save(ctx)
+		return e
+	}); err != nil {
+		span.RecordError(err)
+		log.Printf("%s for %s (traceID=%s): %v", errMsg, row.ID, span.SpanContext().TraceID(), err)
+	}
+}
+
+// ── External operations ───────────────────────────────────────────────────────
+// All functions below require row.Edges.Instrument to be non-nil.
+// The claim loops in this file use WithInstrument() to satisfy that contract.
+
+// tickSpanAttrs returns OTel span start options with instrument+timestamp attributes.
+// Safe to call even when row.Edges.Instrument is nil.
+func tickSpanAttrs(row *ent.State) trace.SpanStartOption {
+	attrs := []attribute.KeyValue{
+		attribute.String("state.id", row.ID.String()),
+		attribute.String("tick.timestamp", row.Timestamp.UTC().Format(time.RFC3339)),
+		attribute.String("job.type", string(row.JobType)),
+	}
+	if row.Edges.Instrument != nil {
+		attrs = append(attrs, attribute.String("instrument.name", row.Edges.Instrument.Name))
+	}
+	return trace.WithAttributes(attrs...)
+}
+
+// errNotFound is returned by downloadBI5 when Dukascopy responds with HTTP 404.
+var errNotFound = errors.New("tick source: 404 not found")
+
+func isNotFoundError(err error) bool { return errors.Is(err, errNotFound) }
+
+// downloadBI5 downloads the LZMA-compressed BI5 tick file from Dukascopy for
+// the instrument and UTC hour represented by row.  Returns errNotFound on 404.
+//
+// Uses tickDownloadSem (bounded ≤ 12) — must be called while holding a semaphore slot.
+func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
+	ctx, span := tickTracer.Start(ctx, "ticks/download-bi5", tickSpanAttrs(row))
+	defer span.End()
+
+	if dukClient == nil {
+		err := errClientsNotInitialized
+		span.RecordError(err)
+		return nil, err
+	}
+	if row.Edges.Instrument == nil {
+		err := fmt.Errorf("downloadBI5: instrument edge not loaded for state %s", row.ID)
+		span.RecordError(err)
+		return nil, err
+	}
+	data, err := dukClient.FetchBI5(ctx, row.Edges.Instrument.Name, row.Timestamp)
+	if errors.Is(err, dukascopy.ErrNotFound) {
+		span.AddEvent("404: no data for this hour")
+		return nil, errNotFound
+	}
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return data, nil
+}
+
+// convertBI5ToParquet decompresses the raw BI5 bytes, converts each tick to the
+// canonical Parquet schema (timestamp/instrument/bid/ask/bid_volume/ask_volume),
+// and returns the in-memory Parquet file bytes.
+//
+// The instrument's Divider field is used to convert integer prices to actual
+// decimal prices (e.g. divider=100 000 for EURUSD, 1 000 for XAUUSD).
+func convertBI5ToParquet(raw []byte, row *ent.State) ([]byte, error) {
+	if row.Edges.Instrument == nil {
+		return nil, fmt.Errorf("convertBI5ToParquet: instrument edge not loaded for state %s", row.ID)
+	}
+	inst := row.Edges.Instrument
+
+	divider := 100_000 // default for 5-decimal FX pairs
+	if inst.Divider != nil && *inst.Divider > 0 {
+		divider = *inst.Divider
+	}
+
+	ticks, err := dukascopy.ParseBI5(raw, row.Timestamp, divider)
+	if err != nil {
+		return nil, fmt.Errorf("convertBI5ToParquet: parse BI5: %w", err)
+	}
+
+	rows := make([]tickparquet.Row, len(ticks))
+	for i, t := range ticks {
+		rows[i] = tickparquet.Row{
+			Timestamp:  t.Timestamp.UnixMicro(),
+			Instrument: inst.Name,
+			Bid:        t.Bid,
+			Ask:        t.Ask,
+			BidVolume:  int64(t.BidVolume),
+			AskVolume:  int64(t.AskVolume),
+		}
+	}
+	return tickparquet.Write(rows)
+}
+
+// uploadToR2 puts the Parquet bytes at the canonical R2 object path for this row.
+//
+// Path: ingestion/dukascopy/ticks/{instrument}/{YYYY}/{MM}/ticks-{instrument}-{YYYY-MM-DD}-{HH}.parquet
+//
+// This implements the Overwrite Policy (§6.2): calling on an existing key
+// replaces the old file, which is the correct behaviour on FAILED/BROKEN retries.
+func uploadToR2(ctx context.Context, row *ent.State, data []byte) error {
+	ctx, span := tickTracer.Start(ctx, "ticks/upload-r2", tickSpanAttrs(row))
+	defer span.End()
+
+	if r2Client == nil {
+		err := errClientsNotInitialized
+		span.RecordError(err)
+		return err
+	}
+	if row.Edges.Instrument == nil {
+		err := fmt.Errorf("uploadToR2: instrument edge not loaded for state %s", row.ID)
+		span.RecordError(err)
+		return err
+	}
+	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	if err := r2Client.PutObject(ctx, key, data); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	return nil
+}
+
+// readFromR2 downloads the Parquet file for this row from R2 so it can be
+// validated.  Returns r2.ErrNotFound when the object is absent.
+func readFromR2(ctx context.Context, row *ent.State) ([]byte, error) {
+	ctx, span := tickTracer.Start(ctx, "ticks/read-r2", tickSpanAttrs(row))
+	defer span.End()
+
+	if r2Client == nil {
+		err := errClientsNotInitialized
+		span.RecordError(err)
+		return nil, err
+	}
+	if row.Edges.Instrument == nil {
+		err := fmt.Errorf("readFromR2: instrument edge not loaded for state %s", row.ID)
+		span.RecordError(err)
+		return nil, err
+	}
+	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	data, err := r2Client.GetObject(ctx, key)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return data, nil
+}
+
+// validateParquetFile runs the four-step physical validation from §6.3:
+//  1. File size > 0 and PAR1 magic bytes.
+//  2. Parquet footer integrity (parsed by parquet-go).
+//  3. Schema matching (6 columns in expected order).
+//  4. Timestamp boundary check within the expected 1-hour window.
+//
+// Zero-row files are accepted only when row.IsHoliday == true (step 4 skipped).
+func validateParquetFile(ctx context.Context, row *ent.State, data []byte) error {
+	_, span := tickTracer.Start(ctx, "ticks/validate-parquet", tickSpanAttrs(row))
+	defer span.End()
+
+	err := tickparquet.Validate(data, row.IsHoliday, row.Timestamp.UTC())
+	if err != nil {
+		span.RecordError(err)
+	}
+	return err
+}
+
+// buildZeroRowParquet returns a valid Parquet file with the Tick schema but
+// zero data rows.  Used when committing a confirmed market-holiday hour.
+func buildZeroRowParquet() []byte {
+	data, err := tickparquet.WriteZeroRow()
+	if err != nil {
+		// WriteZeroRow only fails if the in-memory buffer errors, which should
+		// never happen in practice.
+		return nil
+	}
+	return data
 }
 
 // recoverGoroutine catches any panic, records it on the active OTel span,
