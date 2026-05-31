@@ -9,6 +9,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/joho/godotenv"
+	"github.com/sanjari-dev/geonera-ingestion/internal/api"
+	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/database"
 	"github.com/sanjari-dev/geonera-ingestion/internal/mq"
 	"github.com/sanjari-dev/geonera-ingestion/internal/seed"
@@ -34,7 +36,7 @@ func main() {
 		}
 	}()
 
-	// ── Database (PostgreSQL via Ent) ─────────────────────────────────────────
+	// ── Database: direct ent client (for seeding / migrations) ───────────────
 	dbClient, err := database.NewEntClient(ctx)
 	if err != nil {
 		log.Fatalf("database: %v", err)
@@ -45,46 +47,69 @@ func main() {
 		}
 	}()
 
+	// ── Database: raw direct connection (for advisory locks) ─────────────────
+	lockDB, err := database.NewLockDB(ctx)
+	if err != nil {
+		log.Fatalf("lock db: %v", err)
+	}
+	defer func() {
+		if err := lockDB.Close(); err != nil {
+			log.Printf("lock db close: %v", err)
+		}
+	}()
+
+	// ── Database: PgBouncer pool ent client (for ETL workers) ────────────────
+	poolClient, err := database.NewPoolClient(ctx)
+	if err != nil {
+		log.Fatalf("pool client: %v", err)
+	}
+	defer func() {
+		if err := poolClient.Close(); err != nil {
+			log.Printf("pool client close: %v", err)
+		}
+	}()
+
+	// ── DAL: enforces split-connection strategy ───────────────────────────────
+	appDAL := dal.New(lockDB, poolClient)
+
 	// ── Seed: timeframes ──────────────────────────────────────────────────────
-	// Inserts the 19 standard timeframes if they do not exist yet.
 	if err := seed.Timeframes(ctx, dbClient); err != nil {
 		log.Fatalf("seed timeframes: %v", err)
 	}
 	log.Print("timeframe seed complete")
 
 	// ── RabbitMQ ──────────────────────────────────────────────────────────────
-	mqConn, err := mq.NewRabbitMQConn()
+	mqClient, err := mq.NewClient()
 	if err != nil {
 		log.Fatalf("rabbitmq: %v", err)
 	}
 	defer func() {
-		if err := mqConn.Close(); err != nil {
+		if err := mqClient.Close(); err != nil {
 			log.Printf("rabbitmq close: %v", err)
 		}
 	}()
 
+	if err := mq.SetupConsumers(mqClient, appDAL); err != nil {
+		log.Fatalf("mq consumers: %v", err)
+	}
+
 	// ── Fiber ─────────────────────────────────────────────────────────────────
 	app := fiber.New()
 
-	// CORS: allow Scalar (loaded from CDN) to fetch this API from the browser.
-	// AllowOrigins "*" is acceptable for development; restrict to specific domains in production.
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
 	}))
 
-	// OTel middleware: automatically injects a trace span into every incoming HTTP request.
 	app.Use(otelfiber.Middleware())
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello World")
 	})
 
-	// Serve the OpenAPI specification as a static file.
 	app.Static("/openapi.yaml", "./openapi.yaml")
 
-	// Interactive Scalar API documentation page.
 	app.Get("/docs", func(c *fiber.Ctx) error {
 		c.Set(fiber.HeaderContentType, fiber.MIMETextHTMLCharsetUTF8)
 		return c.SendString(`<!doctype html>
@@ -102,6 +127,8 @@ func main() {
   </body>
 </html>`)
 	})
+
+	api.RegisterRoutes(app, appDAL)
 
 	port := os.Getenv("APP_PORT")
 	if port == "" {

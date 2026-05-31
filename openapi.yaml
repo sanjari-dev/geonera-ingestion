@@ -1,11 +1,20 @@
 openapi: 3.0.3
 info:
   title: Geonera Ingestion API
-  description: REST API for Geonera Ingestion Service
+  description: |
+    REST API for Geonera Ingestion Service.
+
+    All trigger endpoints (`POST /api/v1/*`) accept an HTTP request, fire the
+    corresponding background worker goroutine, and return **202 Accepted**
+    immediately. The actual ETL work runs asynchronously.
+
+    The primary dispatch mechanism is RabbitMQ; these HTTP endpoints act as
+    an alternative / fallback trigger (e.g. for manual invocation or testing).
   version: 1.0.0
 servers:
-  - url: http://localhost:8080
+  - url: http://localhost:3000
     description: Local development server
+
 paths:
   /:
     get:
@@ -20,3 +29,128 @@ paths:
               schema:
                 type: string
                 example: Hello World
+
+  /api/v1/maintenance:
+    post:
+      summary: Trigger Auto-Seeder & Pruning
+      description: |
+        Starts the maintenance cycle in the background:
+        - **Forward seeding** — books future PENDING rows up to 30 days ahead per instrument.
+        - **Historical gap fill** — back-fills missing rows between `start_date` and the
+          earliest CONFIRMED tick; activates `IsPause` if persistent failures are detected.
+        - **Pruning (Mark & Sweep)** — soft-deletes rows older than `start_date`, removes
+          their Parquet files from R2, then hard-deletes the database records.
+
+        Uses advisory lock `LockIDMaintenance (1003)`.
+      operationId: triggerMaintenance
+      responses:
+        "202":
+          $ref: "#/components/responses/Triggered"
+
+  /api/v1/ticks/regular:
+    post:
+      summary: Trigger Regular Tick Ingestion (T-0 / T-1 / T-2)
+      description: |
+        Starts the regular hourly tick-ingestion pipeline in the background.
+        Three offset phases run concurrently under a single advisory lock
+        `LockIDTick (1001)`:
+
+        - **T-0** — download & convert the current hour's BI5 data from Dukascopy,
+          upload to R2, update status to COMPLETED / FAILED / NOT_FOUND.
+        - **T-1** — recovery pass for the previous hour: reset stuck PROCESSED rows,
+          retry FAILED rows (abandon at retry ≥ 5), handle NOT_FOUND streak logic.
+        - **T-2** — physical Parquet validation for two-hours-ago COMPLETED rows;
+          promote to CONFIRMED or demote to BROKEN; insert SyncTask transactionally.
+
+        Expected trigger time: **minute :05 of each hour** (e.g. 10:05 UTC).
+      operationId: triggerTicksRegular
+      responses:
+        "202":
+          $ref: "#/components/responses/Triggered"
+
+  /api/v1/ticks/backfill:
+    post:
+      summary: Trigger Backfill Tick Ingestion (Sweeper)
+      description: |
+        Starts the backfill sweeper for historical tick data under advisory lock
+        `LockIDTick (1001)`. Three groups run concurrently:
+
+        - **Ingestion group** — processes historical PENDING rows (full ETL cycle).
+        - **Reset group** — resets PROCESSED / FAILED / BROKEN rows; abandons at retry ≥ 5.
+        - **Validation group** — validates COMPLETED rows and re-checks NOT_FOUND rows
+          via Dukascopy API (rate-limited to ≤ 12 concurrent HTTP calls).
+
+        Expected trigger interval: **every 10 minutes**.
+      operationId: triggerTicksBackfill
+      responses:
+        "202":
+          $ref: "#/components/responses/Triggered"
+
+  /api/v1/candles/regular:
+    post:
+      summary: Trigger Regular Candle Aggregation
+      description: |
+        Starts the daily candle aggregation pipeline under advisory lock
+        `LockIDCandle (1002)`.
+
+        - Seeds today's CANDLE row (PENDING, ResolvedTickCount = 0) via upsert.
+        - Claims PENDING CANDLE rows where `ResolvedTickCount = 24` (all 24 hourly
+          TICK rows are CONFIRMED) and aggregates them using stream-based processing
+          (O(1) memory) into a single daily Parquet file covering all 19 timeframes.
+        - Uploads the result to R2 and promotes status to CONFIRMED.
+
+        Expected trigger times: **00:00 UTC** (seed) and **05:08 UTC** (aggregation).
+      operationId: triggerCandlesRegular
+      responses:
+        "202":
+          $ref: "#/components/responses/Triggered"
+
+  /api/v1/candles/backfill:
+    post:
+      summary: Trigger Backfill Candle Aggregation (Sweeper)
+      description: |
+        Starts the candle backfill sweeper under advisory lock `LockIDCandle (1002)`.
+
+        - Resets FAILED / BROKEN / PROCESSED CANDLE rows back to PENDING
+          (RetryCount +1 atomically; abandoned at retry ≥ 5).
+        - Processes historical PENDING rows where `ResolvedTickCount = 24`
+          using the same stream-aggregation pipeline as the regular run.
+
+        Expected trigger interval: **every 20 minutes** (at :04, :24, :44).
+      operationId: triggerCandlesBackfill
+      responses:
+        "202":
+          $ref: "#/components/responses/Triggered"
+
+  /api/v1/sync:
+    post:
+      summary: Trigger Outbox Worker (SyncTask Consumer)
+      description: |
+        Drains all PENDING SyncTask (Outbox) events under advisory lock
+        `LockIDSync (1004)`.
+
+        For each event the worker idempotently recomputes `ResolvedTickCount`
+        on the corresponding CANDLE row by counting CONFIRMED TICK states for
+        that instrument-day. If the count drops below 24 (e.g. due to a BROKEN
+        demotion), the CANDLE row is reset to PENDING. The SyncTask record is
+        deleted only after the recompute succeeds, preventing lost updates on
+        concurrent writes.
+      operationId: triggerSync
+      responses:
+        "202":
+          $ref: "#/components/responses/Triggered"
+
+components:
+  responses:
+    Triggered:
+      description: |
+        The background worker was successfully dispatched.
+        Processing happens asynchronously — use OpenTelemetry traces to observe progress.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              status:
+                type: string
+                example: triggered_via_http
