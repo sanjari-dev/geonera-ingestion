@@ -103,6 +103,30 @@ func Validate(data []byte, isHoliday bool, hourStart time.Time) error {
 	return checkBoundary(f, hourStart)
 }
 
+// ReadAll reads and returns all tick rows from the given Parquet bytes.
+// Returns nil for zero-row (holiday) files.
+func ReadAll(data []byte) ([]Row, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	f, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("tickparquet read: open file: %w", err)
+	}
+	n := f.NumRows()
+	if n == 0 {
+		return nil, nil
+	}
+	rows := make([]Row, n)
+	r := parquet.NewGenericReader[Row](f)
+	defer r.Close()
+	got, err := r.Read(rows)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("tickparquet read rows: %w", err)
+	}
+	return rows[:got], nil
+}
+
 // checkSchema verifies that the file's top-level columns match expectedCols.
 func checkSchema(s *parquet.Schema) error {
 	fields := s.Fields()

@@ -28,10 +28,37 @@ var errR2NotFound = r2.ErrNotFound
 
 func isR2NotFound(err error) bool { return errors.Is(err, r2.ErrNotFound) }
 
-// deleteTickParquetFromR2 deletes the R2 object for this tick state row.
-func deleteTickParquetFromR2(_ context.Context, _ *ent.State) error {
-	// TODO: implement R2 DeleteObject
-	return fmt.Errorf("deleteTickParquetFromR2: %w", errNotImplemented)
+// deleteTickParquetFromR2 removes the hourly Tick Parquet file for this state
+// row from Cloudflare R2.
+//
+// Path: ingestion/dukascopy/ticks/{instrument}/{YYYY}/{MM}/ticks-{instrument}-{YYYY-MM-DD}-{HH}.parquet
+//
+// Returns r2.ErrNotFound when the object is already absent — the sweep treats
+// that as "done" and proceeds to hard-delete the DB row.
+func deleteTickParquetFromR2(ctx context.Context, row *ent.State) error {
+	if r2Client == nil {
+		return errClientsNotInitialized
+	}
+	if row.Edges.Instrument == nil {
+		return fmt.Errorf("deleteTickParquetFromR2: instrument edge not loaded for state %s", row.ID)
+	}
+	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	return r2Client.DeleteObject(ctx, key)
+}
+
+// deleteCandleParquetFromR2 removes the daily Candle Parquet file for this
+// state row from Cloudflare R2.
+//
+// Path: ingestion/dukascopy/candles/{instrument}/{YYYY}/candles-{instrument}-{YYYY-MM-DD}.parquet
+func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
+	if r2Client == nil {
+		return errClientsNotInitialized
+	}
+	if row.Edges.Instrument == nil {
+		return fmt.Errorf("deleteCandleParquetFromR2: instrument edge not loaded for state %s", row.ID)
+	}
+	key := r2.CandleObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	return r2Client.DeleteObject(ctx, key)
 }
 
 // ── RunMaintenanceHandler ─────────────────────────────────────────────────────
@@ -568,9 +595,12 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL) {
 }
 
 // runPruningPhase2Sweep hard-deletes is_deleted=true rows in batches of 50.
-// For each row it calls deleteTickParquetFromR2; only on success or NoSuchKey
-// does it hard-delete from the DB. On any other R2 error the row is left with
-// is_deleted=true for idempotent retry in the next cycle.
+//
+// For each row the corresponding R2 object is deleted first (using the correct
+// path for the row's job_type: TICK → TickObjectKey, CANDLE → CandleObjectKey).
+// Only on R2 success or NoSuchKey does the sweep proceed to hard-delete the
+// DB row.  On any other R2 error the row is left with is_deleted=true for
+// idempotent retry in the next maintenance cycle.
 func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL) {
 	_, span := maintenanceTracer.Start(ctx, "maintenance/pruning/phase2-sweep")
 	defer span.End()
@@ -579,8 +609,12 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL) {
 		var batch []*ent.State
 		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 			var e error
+			// WithInstrument is required: deleteTickParquetFromR2 and
+			// deleteCandleParquetFromR2 both need row.Edges.Instrument.Name
+			// to compute the canonical R2 object key.
 			batch, e = tx.State.Query().
 				Where(state.IsDeletedEQ(true)).
+				WithInstrument().
 				Limit(50).
 				All(ctx)
 			return e
@@ -598,11 +632,24 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL) {
 			if ctx.Err() != nil {
 				return
 			}
-			r2Err := deleteTickParquetFromR2(ctx, row)
+
+			// Branch on job type to use the correct R2 path.
+			var r2Err error
+			switch row.JobType {
+			case state.JobTypeTICK:
+				r2Err = deleteTickParquetFromR2(ctx, row)
+			case state.JobTypeCANDLE:
+				r2Err = deleteCandleParquetFromR2(ctx, row)
+			default:
+				// Unknown job type — no R2 object to delete; proceed directly
+				// to hard-delete so the DB row does not stay orphaned.
+			}
+
 			if r2Err != nil && !isR2NotFound(r2Err) {
 				// Transient R2 error — leave is_deleted=true for next cycle.
 				span.RecordError(r2Err)
-				log.Printf("pruning phase2: R2 delete %s (traceID=%s): %v (will retry next cycle)", row.ID, span.SpanContext().TraceID(), r2Err)
+				log.Printf("pruning phase2: R2 delete %s (%s) (traceID=%s): %v (will retry next cycle)",
+					row.ID, row.JobType, span.SpanContext().TraceID(), r2Err)
 				continue
 			}
 			// R2 succeeded or returned NoSuchKey — hard-delete from DB.

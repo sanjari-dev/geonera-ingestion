@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,8 +17,10 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
+	"github.com/sanjari-dev/geonera-ingestion/internal/candleparquet"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
+	"github.com/sanjari-dev/geonera-ingestion/internal/tickparquet"
 )
 
 var candleTracer = otel.Tracer("worker/candles")
@@ -195,6 +198,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 					state.HasInstrumentWith(instrument.IsActiveEQ(true)),
 					state.IsDeletedEQ(false),
 				).
+				WithInstrument().
 				Order(state.ByTimestamp()).
 				First(ctx)
 			if err != nil {
@@ -205,7 +209,11 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 				SetStatus(state.StatusPROCESSED).
 				SetUpdatedAt(time.Now().UTC()).
 				Save(ctx)
-			return err
+			if err != nil {
+				return err
+			}
+			claimed.Edges = row.Edges
+			return nil
 		})
 		if err != nil {
 			if ent.IsNotFound(err) {
@@ -292,8 +300,15 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	)
 	defer span.End()
 
+	if row.Edges.Instrument == nil {
+		span.RecordError(fmt.Errorf("candle agg: instrument not loaded for %s", row.ID))
+		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "candle agg: instrument not loaded")
+		return
+	}
+	instrName := row.Edges.Instrument.Name
+	dayStart := row.Timestamp.UTC() // CANDLE timestamp is already 00:00:00 UTC
+
 	// Step 1 — Query 24 CONFIRMED TICK rows for this instrument+day.
-	dayStart := row.Timestamp.UTC().Truncate(24 * time.Hour)
 	dayEnd := dayStart.Add(24 * time.Hour)
 
 	var tickStates []*ent.State
@@ -319,7 +334,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 
 	// Step 2 — Stream each hourly Parquet from R2 into the OHLCV accumulator.
-	acc := newOHLCVAccumulator()
+	acc := newOHLCVAccumulator(dayStart, instrName)
 	broken := false
 
 	for _, tickState := range tickStates {
@@ -332,7 +347,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 			continue
 		}
 
-		data, err := readTickParquetFromR2(ctx, tickState)
+		data, err := readTickParquetFromR2(ctx, instrName, tickState.Timestamp)
 		if err != nil {
 			if isNoSuchKeyError(err) {
 				// §4.F-d: NoSuchKey handling.
@@ -454,10 +469,7 @@ func candleHandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 }
 
-// ── External operation stubs ──────────────────────────────────────────────────
-// These require external client implementations (R2 SDK, Parquet library).
-// Until wired up they return errNotImplemented so claimed rows end up FAILED
-// (recoverable by Backfill) rather than crashing the process.
+// ── External operations ───────────────────────────────────────────────────────
 
 // errNoSuchKey mirrors r2.ErrNotFound so that candle aggregation can detect
 // a missing tick Parquet and apply the NoSuchKey handling rules from §4.F.
@@ -465,52 +477,198 @@ var errNoSuchKey = r2.ErrNotFound
 
 func isNoSuchKeyError(err error) bool { return errors.Is(err, r2.ErrNotFound) }
 
-// readTickParquetFromR2 fetches the hourly tick Parquet for the given TICK state row.
+// readTickParquetFromR2 fetches the hourly tick Parquet for the given instrument and timestamp.
 // Returns errNoSuchKey when the R2 object is absent.
-func readTickParquetFromR2(_ context.Context, _ *ent.State) ([]byte, error) {
-	// TODO: implement Cloudflare R2 (S3-compatible) GetObject for tick Parquet path
-	return nil, fmt.Errorf("readTickParquetFromR2: %w", errNotImplemented)
+func readTickParquetFromR2(ctx context.Context, instrument string, ts time.Time) ([]byte, error) {
+	if r2Client == nil {
+		return nil, errClientsNotInitialized
+	}
+	key := r2.TickObjectKey(instrument, ts)
+	data, err := r2Client.GetObject(ctx, key)
+	if errors.Is(err, r2.ErrNotFound) {
+		return nil, errNoSuchKey
+	}
+	if err != nil {
+		return nil, fmt.Errorf("readTickParquetFromR2 %s: %w", key, err)
+	}
+	return data, nil
 }
 
 // buildCandleParquet assembles a daily Candles Parquet file (all 19 timeframes)
 // from the OHLCV accumulator built by streaming the 24 hourly tick Parquets.
-func buildCandleParquet(_ context.Context, _ *ent.State, _ *ohlcvAccumulator) ([]byte, error) {
-	// TODO: implement Parquet writer for candle data (19 timeframes)
-	return nil, fmt.Errorf("buildCandleParquet: %w", errNotImplemented)
+func buildCandleParquet(_ context.Context, _ *ent.State, acc *ohlcvAccumulator) ([]byte, error) {
+	var rows []candleparquet.Row
+
+	for _, tf := range candleparquet.All19 {
+		buckets := acc.data[tf.Minutes]
+		// Collect and sort period keys for deterministic output order.
+		keys := make([]int64, 0, len(buckets))
+		for k := range buckets {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+		for _, k := range keys {
+			b := buckets[k]
+			if !b.initialized {
+				continue
+			}
+
+			vwap := 0.0
+			if b.vwapDen > 0 {
+				vwap = b.vwapNum / b.vwapDen
+			}
+			avgSpread := 0.0
+			if b.tickCount > 0 {
+				avgSpread = b.spreadSum / float64(b.tickCount)
+			}
+
+			rows = append(rows, candleparquet.Row{
+				Timestamp:      k,
+				Instrument:     acc.instrumentName,
+				Timeframe:      tf.Name,
+				Open:           b.open,
+				High:           b.high,
+				Low:            b.low,
+				Close:          b.close,
+				VWAP:           vwap,
+				MinSpread:      b.minSpread,
+				MaxSpread:      b.maxSpread,
+				AvgSpread:      avgSpread,
+				TickCount:      b.tickCount,
+				TotalBidVolume: b.totalBidVol,
+				TotalAskVolume: b.totalAskVol,
+			})
+		}
+	}
+	return candleparquet.Write(rows)
 }
 
 // uploadCandleParquetToR2 puts the daily Candle Parquet bytes at the canonical
 // R2 object path for this candle row.
-func uploadCandleParquetToR2(_ context.Context, _ *ent.State, _ []byte) error {
-	// TODO: implement Cloudflare R2 (S3-compatible) PutObject for candle Parquet path
-	return fmt.Errorf("uploadCandleParquetToR2: %w", errNotImplemented)
+func uploadCandleParquetToR2(ctx context.Context, row *ent.State, data []byte) error {
+	if r2Client == nil {
+		return errClientsNotInitialized
+	}
+	if row.Edges.Instrument == nil {
+		return fmt.Errorf("uploadCandleParquetToR2: instrument not loaded for %s", row.ID)
+	}
+	key := r2.CandleObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	return r2Client.PutObject(ctx, key, data)
 }
 
 // readCandleParquetFromR2 fetches the daily Candle Parquet from R2 for validation.
-func readCandleParquetFromR2(_ context.Context, _ *ent.State) ([]byte, error) {
-	// TODO: implement Cloudflare R2 (S3-compatible) GetObject for candle Parquet path
-	return nil, fmt.Errorf("readCandleParquetFromR2: %w", errNotImplemented)
+func readCandleParquetFromR2(ctx context.Context, row *ent.State) ([]byte, error) {
+	if r2Client == nil {
+		return nil, errClientsNotInitialized
+	}
+	if row.Edges.Instrument == nil {
+		return nil, fmt.Errorf("readCandleParquetFromR2: instrument not loaded for %s", row.ID)
+	}
+	key := r2.CandleObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	data, err := r2Client.GetObject(ctx, key)
+	if errors.Is(err, r2.ErrNotFound) {
+		return nil, fmt.Errorf("readCandleParquetFromR2: key not found: %s", key)
+	}
+	return data, err
 }
 
 // validateCandleParquet runs physical validation on the Candle Parquet bytes:
 // magic number, schema, timeframe coverage, OHLCV boundary checks.
-func validateCandleParquet(_ context.Context, _ *ent.State, _ []byte) error {
-	// TODO: implement Parquet validation for candle schema
-	return fmt.Errorf("validateCandleParquet: %w", errNotImplemented)
+func validateCandleParquet(_ context.Context, _ *ent.State, data []byte) error {
+	return candleparquet.Validate(data)
 }
 
-// ── OHLCV accumulator stub ────────────────────────────────────────────────────
+// ── OHLCV accumulator ─────────────────────────────────────────────────────────
 
-// ohlcvAccumulator accumulates raw tick Parquet rows into OHLCV candles for
-// all 19 supported timeframes. The stub holds no state until the real
-// implementation is wired in.
-type ohlcvAccumulator struct{}
+// periodBucket holds the aggregated OHLCV values for one timeframe period.
+type periodBucket struct {
+	open, high, low, close float64
+	vwapNum, vwapDen       float64 // VWAP = vwapNum / vwapDen
+	spreadSum              float64
+	minSpread, maxSpread   float64
+	tickCount              int64
+	totalBidVol            int64
+	totalAskVol            int64
+	initialized            bool
+}
 
-// newOHLCVAccumulator returns a fresh, empty accumulator.
-func newOHLCVAccumulator() *ohlcvAccumulator { return &ohlcvAccumulator{} }
+// ohlcvAccumulator accumulates tick data from 24 hourly Parquet files into
+// OHLCV candle buckets for all 19 timeframes.  One AccumulateTickParquet call
+// per hourly file; O(1) peak memory relative to the number of files.
+type ohlcvAccumulator struct {
+	dayStart       time.Time
+	instrumentName string
+	// data[timeframeMinutes][periodStartMicros] → bucket
+	data map[int]map[int64]*periodBucket
+}
 
-// AccumulateTickParquet feeds one hourly tick Parquet file into the accumulator.
-// Rows are processed in-place so memory is O(1) relative to the number of files.
-func (a *ohlcvAccumulator) AccumulateTickParquet(_ []byte) error {
-	return fmt.Errorf("AccumulateTickParquet: %w", errNotImplemented)
+// newOHLCVAccumulator returns a fresh, empty accumulator for the given day and instrument.
+func newOHLCVAccumulator(dayStart time.Time, instrumentName string) *ohlcvAccumulator {
+	data := make(map[int]map[int64]*periodBucket, len(candleparquet.All19))
+	for _, tf := range candleparquet.All19 {
+		data[tf.Minutes] = make(map[int64]*periodBucket)
+	}
+	return &ohlcvAccumulator{dayStart: dayStart, instrumentName: instrumentName, data: data}
+}
+
+// AccumulateTickParquet parses one hourly tick Parquet file and accumulates
+// its rows into OHLCV buckets.  Zero-row (holiday) files are silently skipped.
+func (a *ohlcvAccumulator) AccumulateTickParquet(raw []byte) error {
+	rows, err := tickparquet.ReadAll(raw)
+	if err != nil {
+		return fmt.Errorf("candle accumulate: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil // holiday hour
+	}
+
+	for _, row := range rows {
+		ts := time.UnixMicro(row.Timestamp).UTC()
+		mid := (row.Bid + row.Ask) / 2
+		spread := row.Ask - row.Bid
+		totalVol := float64(row.BidVolume + row.AskVolume)
+
+		for _, tf := range candleparquet.All19 {
+			elapsed := ts.Sub(a.dayStart)
+			periodIdx := int64(elapsed.Minutes()) / int64(tf.Minutes)
+			periodStart := a.dayStart.Add(time.Duration(periodIdx*int64(tf.Minutes)) * time.Minute)
+			key := periodStart.UnixMicro()
+
+			b, exists := a.data[tf.Minutes][key]
+			if !exists {
+				b = &periodBucket{}
+				a.data[tf.Minutes][key] = b
+			}
+			if !b.initialized {
+				b.open = mid
+				b.high = mid
+				b.low = mid
+				b.minSpread = spread
+				b.maxSpread = spread
+				b.initialized = true
+			} else {
+				if mid > b.high {
+					b.high = mid
+				}
+				if mid < b.low {
+					b.low = mid
+				}
+				if spread < b.minSpread {
+					b.minSpread = spread
+				}
+				if spread > b.maxSpread {
+					b.maxSpread = spread
+				}
+			}
+			b.close = mid
+			b.vwapNum += mid * totalVol
+			b.vwapDen += totalVol
+			b.spreadSum += spread
+			b.tickCount++
+			b.totalBidVol += row.BidVolume
+			b.totalAskVol += row.AskVolume
+		}
+	}
+	return nil
 }
