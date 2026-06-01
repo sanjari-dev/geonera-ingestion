@@ -1,1 +1,59 @@
+# ── Go Binaries & Tooling ─────────────────────────────────────────────────────
+# Compiled binaries and executables
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.prof
+*.out
+
+# ── Environment & Secrets ─────────────────────────────────────────────────────
+# Ignore all local environment configurations to prevent credential leakage
+.env
+.env.local
+.env.development.local
+.idea/
+.vscode/
+*.env
+**/*.env
+**/*.env.local
+
+# Allow example files
+!.env.example
+!**/ .env.example
+
+# ── Logs & Databases ──────────────────────────────────────────────────────────
+logs/
+**/logs/
+*.log
+
+# ── IDEs, Editors, & System Files ─────────────────────────────────────────────
+.idea/
 .idea/**
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db
+
+# ── Temporary & Scratch Files ─────────────────────────────────────────────────
+tmp/
+**/tmp/
+temp/
+**/temp/
+.temp/
+**/.temp/
+scratch/
+**/scratch/
+.claude/
+.gemini/
