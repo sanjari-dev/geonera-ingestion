@@ -7,11 +7,18 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
 )
+
+// mqTracer is the OTel tracer for the MQ consumer layer.
+// It creates a consumer span for each incoming message, acting as the
+// MQ equivalent of otelfiber.Middleware() on the HTTP layer.
+var mqTracer = otel.Tracer("mq/consumer")
 
 // Queue names — must match the names used by the external scheduler.
 const (
@@ -152,11 +159,36 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context)) err
 				// msgs channel closed; let consumeLoop retry.
 				return nil
 			}
+			// Extract incoming trace context from AMQP headers (W3C traceparent).
+			// If no traceparent is present, ctx carries no span and the consumer
+			// span below becomes the root of a new trace.
 			ctx := extractMQOtelCtx(msg.Headers)
+
+			// Create a CONSUMER span for this message.  This is the MQ equivalent
+			// of otelfiber.Middleware() on the HTTP layer: it establishes a parent
+			// span so that the worker goroutine's child spans are always visible in
+			// Jaeger under a single trace root.
+			//
+			// The span ends immediately after the goroutine is dispatched (fire-and-
+			// forget), just like the HTTP server span ends after returning 202.
+			// Worker child spans appear in Jaeger as async descendants of this span.
+			ctx, span := mqTracer.Start(ctx, "mq/receive",
+				trace.WithSpanKind(trace.SpanKindConsumer),
+				trace.WithAttributes(
+					attribute.String("messaging.system", "rabbitmq"),
+					attribute.String("messaging.destination.name", queue),
+					attribute.String("messaging.operation.type", "process"),
+				),
+			)
+
 			// Ack before dispatching: the worker is idempotent and advisory-locked,
 			// so re-queueing on crash would simply be a duplicate trigger (safe).
 			_ = msg.Ack(false)
 			handler(ctx)
+
+			// End the consumer span after dispatch (not after the worker completes).
+			// Worker spans run asynchronously but remain linked via the trace context.
+			span.End()
 
 		case amqpErr, ok := <-chClose:
 			if !ok || amqpErr == nil {

@@ -1,13 +1,29 @@
-name: geonera
+##
+## Geonera Ingestion — Infrastructure Stack
+##
+## Deploy via Portainer → Stacks → Add Stack → Web editor / Upload.
+## The stack name entered in Portainer becomes the Docker project prefix
+## (e.g. "geonera"), so the `name:` key is intentionally omitted here.
+##
+## Required .env / Portainer Stack-level env vars (override before first deployment):
+##   POSTGRES_PASSWORD    default: !P@ssw0rd123
+##   RABBITMQ_PASSWORD    default: !P@ssw0rd123
+##   MINIO_ROOT_USER      default: minioadmin
+##   MINIO_ROOT_PASSWORD  default: minioadmin
+##   GRAFANA_ADMIN_PASSWORD  default: !P@ssw0rd123
+##
 
 services:
+
+  # ── Database ──────────────────────────────────────────────────────────────────
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: geonera
       POSTGRES_USER: sans
-      POSTGRES_PASSWORD: "!P@ssw0rd123"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-!P@ssw0rd123}"
       TZ: UTC
       PGTZ: UTC
     command:
@@ -20,15 +36,26 @@ services:
       - max_connections=200
       - -c
       - timezone=UTC
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=3
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sans -d geonera"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - geonera
 
@@ -43,14 +70,17 @@ services:
       DB_PORT: 5432
       DB_NAME: geonera
       DB_USER: sans
-      DB_PASSWORD: "!P@ssw0rd123"
-      AUTH_TYPE: scram-sha-256
+      DB_PASSWORD: "${POSTGRES_PASSWORD:-!P@ssw0rd123}"
+      # md5 avoids auth_file complexity required by scram-sha-256 in edoburu image
+      AUTH_TYPE: md5
       POOL_MODE: transaction
       MAX_CLIENT_CONN: 1000
       DEFAULT_POOL_SIZE: 50
       RESERVE_POOL_SIZE: 10
+      # lib/pq sends extra_float_digits; ent ORM sends search_path
       IGNORE_STARTUP_PARAMETERS: extra_float_digits,search_path
-      TIMEZONE: UTC
+      # NOTE: TIMEZONE is intentionally omitted — it is not a valid pgbouncer.ini
+      # parameter and causes "unknown parameter" on startup.
     ports:
       - "6432:5432"
     healthcheck:
@@ -58,32 +88,104 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     networks:
       - geonera
+
+  # ── Message Broker ────────────────────────────────────────────────────────────
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: sans
-      RABBITMQ_DEFAULT_PASS: "!P@ssw0rd123"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASSWORD:-!P@ssw0rd123}"
       RABBITMQ_DEFAULT_VHOST: geonera
-    command: >
-      sh -c "rabbitmq-plugins enable --offline rabbitmq_prometheus &&
-             rabbitmq-server"
+    command:
+      - sh
+      - -c
+      - |
+        cat << 'EOF' > /etc/rabbitmq/advanced.config
+        [
+          {rabbitmq_management, [
+            {path_prefix, "/rabbitmq"},
+            {cors_allow_origins, ["*"]},
+            {headers_config, [
+              {content_security_policy, "frame-ancestors *"},
+              {x_frame_options, "ALLOWALL"}
+            ]}
+          ]}
+        ].
+        EOF
+        rabbitmq-plugins enable --offline rabbitmq_prometheus
+        rabbitmq-server
     ports:
-      - "5672:5672"
-      - "15672:15672"
-      - "15692:15692"
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # Management UI (exposed since Nginx is deleted)
+      - "15692:15692"   # Prometheus metrics
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - geonera
+
+
+  # ── Object Storage — local R2 simulation ─────────────────────────────────────
+  # MinIO is an S3-compatible server used in development to simulate Cloudflare R2.
+  # In production, point R2_ENDPOINT to the real Cloudflare R2 endpoint instead.
+
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+      # Expose Prometheus metrics without bearer token (dev only)
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    ports:
+      - "9000:9000"   # S3 API — set R2_ENDPOINT=http://<host>:9000 in app .env
+      - "9001:9001"   # MinIO web console
+    volumes:
+      - minio_data:/data
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      # Use MinIO's built-in health endpoint (no mc binary needed)
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 10
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - geonera
+
+  # One-shot service: creates the R2 bucket on the first stack deployment.
+  # Exits with code 0 after creation; Portainer shows it as "exited (0)" — expected.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    restart: on-failure
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}
+        mc mb --ignore-existing local/geonera-ingestion
+        echo "Bucket 'geonera-ingestion' is ready"
+    networks:
+      - geonera
+
+  # ── Observability — Traces ────────────────────────────────────────────────────
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.102.1
@@ -92,23 +194,48 @@ services:
     configs:
       - source: otel_collector_config
         target: /etc/otelcol-contrib/config.yaml
+    depends_on:
+      - jaeger
     ports:
-      - "4317:4317"
-      - "4318:4318"
-      - "8888:8888"
-      - "9464:9464"
+      - "4317:4317"   # OTLP gRPC  — OTEL_EXPORTER_OTLP_GRPC_ENDPOINT
+      - "4318:4318"   # OTLP HTTP  — OTEL_EXPORTER_OTLP_ENDPOINT
+      - "8888:8888"   # Collector self-metrics
+      - "9464:9464"   # Prometheus exporter (scraped by Prometheus)
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
     networks:
       - geonera
 
   jaeger:
     image: jaegertracing/all-in-one:1.57
     restart: unless-stopped
+    # Jaeger's default UID (10001) cannot write to a Docker-named volume
+    # owned by root. Running as root (user: "0") resolves the permission
+    # issue without requiring an init container or manual chmod.
+    user: "0"
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      # Badger storage — traces are persisted across container restarts
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
     ports:
-      - "16686:16686"
+      - "16686:16686"   # Jaeger UI — JAEGER_UI_URL
+    volumes:
+      - jaeger_data:/badger
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
     networks:
       - geonera
+
+  # ── Observability — Metrics ───────────────────────────────────────────────────
 
   prometheus:
     image: prom/prometheus:v2.52.0
@@ -117,13 +244,19 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --web.enable-lifecycle
+      - --storage.tsdb.retention.time=15d
     configs:
       - source: prometheus_config
         target: /etc/prometheus/prometheus.yml
     ports:
-      - "9090:9090"
+      - "9090:9090"   # Prometheus UI — PROMETHEUS_URL
     volumes:
       - prometheus_data:/prometheus
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - geonera
 
@@ -134,9 +267,42 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATA_SOURCE_NAME: "postgresql://sans:%21P%40ssw0rd123@postgres:5432/geonera?sslmode=disable"
+      # Split form avoids URL-encoding issues with special characters in passwords
+      DATA_SOURCE_USER: sans
+      DATA_SOURCE_PASS: "${POSTGRES_PASSWORD:-!P@ssw0rd123}"
+      DATA_SOURCE_URI: "postgres:5432/geonera?sslmode=disable"
     ports:
       - "9187:9187"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - geonera
+
+  # Exports host-level metrics (CPU, RAM, disk, network) — architecture §7.2
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    restart: unless-stopped
+    # pid: host gives accurate process-count and CPU metrics
+    pid: host
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.ignored-mount-points='^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     networks:
       - geonera
 
@@ -148,17 +314,28 @@ services:
         condition: service_started
     environment:
       GF_SECURITY_ADMIN_USER: sans
-      GF_SECURITY_ADMIN_PASSWORD: "!P@ssw0rd123"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-!P@ssw0rd123}"
       GF_USERS_DEFAULT_THEME: light
+      # Prevent anonymous access in production
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
     configs:
       - source: grafana_datasources
         target: /etc/grafana/provisioning/datasources/datasources.yml
     ports:
-      - "3000:3000"
+      - "3000:3000"   # Grafana UI — GRAFANA_URL
     volumes:
       - grafana_data:/var/lib/grafana
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     networks:
       - geonera
+
+# ── Configs (inline — self-contained for Portainer) ───────────────────────────
 
 configs:
   otel_collector_config:
@@ -224,15 +401,28 @@ configs:
         - job_name: prometheus
           static_configs:
             - targets: ["prometheus:9090"]
+
         - job_name: postgres
           static_configs:
             - targets: ["postgres-exporter:9187"]
+
+        - job_name: node
+          static_configs:
+            - targets: ["node-exporter:9100"]
+
         - job_name: rabbitmq
+          metrics_path: /metrics
           static_configs:
             - targets: ["rabbitmq:15692"]
+
         - job_name: otel-collector
           static_configs:
             - targets: ["otel-collector:8888", "otel-collector:9464"]
+
+        - job_name: minio
+          metrics_path: /minio/v2/metrics/cluster
+          static_configs:
+            - targets: ["minio:9000"]
 
   grafana_datasources:
     content: |
@@ -251,11 +441,17 @@ configs:
           url: http://jaeger:16686
           editable: true
 
+# ── Volumes ───────────────────────────────────────────────────────────────────
+
 volumes:
   postgres_data:
   rabbitmq_data:
+  minio_data:
+  jaeger_data:
   prometheus_data:
   grafana_data:
+
+# ── Networks ──────────────────────────────────────────────────────────────────
 
 networks:
   geonera:

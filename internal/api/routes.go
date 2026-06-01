@@ -66,12 +66,36 @@ func RegisterRoutes(app *fiber.App, d *dal.DAL) {
 	})
 }
 
-// extractOtelCtx reads the W3C traceparent/tracestate headers (or any
-// propagation format configured globally) from the incoming Fiber request
-// and returns a context carrying the extracted trace information.
+// extractOtelCtx returns a context that carries the OTel trace information for
+// the incoming Fiber request, suitable for passing to background worker goroutines.
+//
+// Design rationale — why c.UserContext() instead of context.Background():
+//
+// otelfiber.Middleware() creates an HTTP server span and stores it in
+// c.UserContext(). If we pass context.Background() to Extract(), we get a
+// fresh context that has no knowledge of that Fiber span, so any goroutine
+// launched from the handler creates a brand-new root trace completely
+// disconnected from the HTTP request span in Jaeger.
+//
+// By passing c.UserContext() as the base:
+//   - When the caller sends a W3C traceparent header: Extract() injects the
+//     remote span context on top of the Fiber span, linking the worker to the
+//     upstream distributed trace.
+//   - When the caller sends no traceparent header: c.UserContext() already
+//     contains the Fiber-created root span, so the worker goroutine's spans
+//     automatically appear as children of the HTTP request span in Jaeger.
+//
+// Result: in both cases, the full trace tree is:
+//
+//	POST /api/v1/ticks/regular (HTTP server span)
+//	  └─ RunTickParentHandler_REGULAR
+//	        ├─ ticks/T0
+//	        │    └─ ticks/etl → ticks/download-bi5, ticks/upload-r2 …
+//	        ├─ ticks/T1
+//	        └─ ticks/T2
 func extractOtelCtx(c *fiber.Ctx) context.Context {
 	return otel.GetTextMapPropagator().Extract(
-		context.Background(),
+		c.UserContext(), // inherits the Fiber middleware server span
 		propagation.HeaderCarrier(c.GetReqHeaders()),
 	)
 }
