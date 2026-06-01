@@ -1,4 +1,4 @@
-// Package tick parquet provides Parquet read/write/validate operations for the
+// Package tickparquet Package tick parquet provides Parquet read/write/validate operations for the
 // hourly Tick schema defined in architecture §3.A.
 package tickparquet
 
@@ -8,16 +8,16 @@ import (
 	"io"
 	"time"
 
-	parquet "github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go"
 )
 
 // Row is the canonical Go representation of one row in a Tick Parquet file.
 //
 // Architecture §3.A schema:
-//   - timestamp:  int64 — microseconds since Unix epoch, UTC
-//   - instrument: string — instrument name (e.g. "eurusd")
-//   - bid / ask:  float64 — actual price after divider (≈ Decimal precision)
-//   - bid_volume / ask_volume: int64
+//   - Timestamp: int64 — microseconds since Unix epoch, UTC
+//   - Instrument: string — instrument name (e.g. "eurusd")
+//   - Bid / ask: float64 — actual price after divider (≈ Decimal precision)
+//   - Bid_volume / ask_volume: int64
 type Row struct {
 	Timestamp  int64   `parquet:"timestamp"`
 	Instrument string  `parquet:"instrument"`
@@ -32,7 +32,7 @@ var expectedCols = []string{
 	"timestamp", "instrument", "bid", "ask", "bid_volume", "ask_volume",
 }
 
-// Write serialises rows into an in-memory Parquet file and returns the bytes.
+// Write serializes rows into an in-memory Parquet file and returns the bytes.
 // Passing nil or an empty slice produces a valid zero-row file.
 func Write(rows []Row) ([]byte, error) {
 	var buf bytes.Buffer
@@ -59,13 +59,13 @@ func WriteZeroRow() ([]byte, error) {
 
 // Validate performs the four-step physical validation from architecture §6.3:
 //
-//  1. File size > 0 and PAR1 magic bytes present (header + footer).
+//  1. File size > 0 and PAR1 magic bytes are present (header and footer).
 //  2. Parquet footer can be parsed (footer integrity).
 //  3. Column names and count match the expected Tick schema.
 //  4. If rowCount > 0: first and last timestamps lie within [hourStart, hourStart+1h).
 //
 // Special case (§6.3 §4 exception): if rowCount == 0 and isHoliday is true,
-// only checks 1–3.  If rowCount == 0 and isHoliday is false the file is rejected.
+// only checks 1–3.  If rowCount == 0 and isHoliday is false, the file is rejected.
 func Validate(data []byte, isHoliday bool, hourStart time.Time) error {
 	// 1. Minimum size and PAR1 magic number.
 	if len(data) < 8 {
@@ -96,7 +96,7 @@ func Validate(data []byte, isHoliday bool, hourStart time.Time) error {
 		if !isHoliday {
 			return fmt.Errorf("tickparquet validate: zero rows but IsHoliday=false (unexpected empty file)")
 		}
-		return nil // holiday zero-row: magic + schema checks are sufficient
+		return nil // holiday zero-row: magic + schema checks are enough
 	}
 
 	// 4. Data boundary check — timestamps within [hourStart, hourStart+1h).

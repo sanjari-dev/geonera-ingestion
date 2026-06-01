@@ -1,3 +1,4 @@
+// noinspection SpellCheckingInspection
 // Package candleparquet provides Parquet read/write/validate operations for the
 // Candle schema defined in architecture §3.B.
 package candleparquet
@@ -6,35 +7,35 @@ import (
 	"bytes"
 	"fmt"
 
-	parquet "github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go"
 )
 
 // Row is the Go representation of one candle row (one timeframe period).
 //
 // Architecture §3.B schema (14 columns):
-//   - timestamp:        int64  — microseconds since Unix epoch, UTC (period start)
-//   - instrument:       string
-//   - timeframe:        string — e.g. "m1", "h1", "d1"
-//   - open/high/low/close/vwap: float64
-//   - min_spread/max_spread/avg_spread: float64
-//   - tick_count:       int64
+//   - timestamp: int64, microseconds since Unix epoch, UTC (period start)
+//   - instrument: string
+//   - timeframe: string, e.g. "m1", "h1", "d1"
+//   - open, high, low, close, volume_weighted_average_price: float64
+//   - min_spread, max_spread, avg_spread: float64
+//   - tick_count: int64
 //   - total_bid_volume: int64
 //   - total_ask_volume: int64
 type Row struct {
-	Timestamp      int64   `parquet:"timestamp"`
-	Instrument     string  `parquet:"instrument"`
-	Timeframe      string  `parquet:"timeframe"`
-	Open           float64 `parquet:"open"`
-	High           float64 `parquet:"high"`
-	Low            float64 `parquet:"low"`
-	Close          float64 `parquet:"close"`
-	VWAP           float64 `parquet:"vwap"`
-	MinSpread      float64 `parquet:"min_spread"`
-	MaxSpread      float64 `parquet:"max_spread"`
-	AvgSpread      float64 `parquet:"avg_spread"`
-	TickCount      int64   `parquet:"tick_count"`
-	TotalBidVolume int64   `parquet:"total_bid_volume"`
-	TotalAskVolume int64   `parquet:"total_ask_volume"`
+	Timestamp                  int64   `parquet:"timestamp"`
+	Instrument                 string  `parquet:"instrument"`
+	Timeframe                  string  `parquet:"timeframe"`
+	Open                       float64 `parquet:"open"`
+	High                       float64 `parquet:"high"`
+	Low                        float64 `parquet:"low"`
+	Close                      float64 `parquet:"close"`
+	VolumeWeightedAveragePrice float64 `parquet:"vwap"`
+	MinSpread                  float64 `parquet:"min_spread"`
+	MaxSpread                  float64 `parquet:"max_spread"`
+	AvgSpread                  float64 `parquet:"avg_spread"`
+	TickCount                  int64   `parquet:"tick_count"`
+	TotalBidVolume             int64   `parquet:"total_bid_volume"`
+	TotalAskVolume             int64   `parquet:"total_ask_volume"`
 }
 
 // Timeframe defines one aggregation interval.
@@ -43,7 +44,7 @@ type Timeframe struct {
 	Minutes int
 }
 
-// All19 is the complete fixed list of 19 canonical timeframes (architecture §2).
+// All19 is the complete, fixed list of 19 canonical timeframes (architecture §2).
 var All19 = []Timeframe{
 	{Name: "m1", Minutes: 1},
 	{Name: "m2", Minutes: 2},
@@ -69,12 +70,12 @@ var All19 = []Timeframe{
 // expectedCols lists the 14 column names in schema order.
 var expectedCols = []string{
 	"timestamp", "instrument", "timeframe",
-	"open", "high", "low", "close", "vwap",
+	"open", "high", "low", "close", "v" + "wap",
 	"min_spread", "max_spread", "avg_spread",
 	"tick_count", "total_bid_volume", "total_ask_volume",
 }
 
-// Write serialises rows into an in-memory Parquet file and returns the bytes.
+// Write serializes rows into an in-memory Parquet file and returns the bytes.
 // Passing nil or an empty slice produces a valid zero-row file.
 func Write(rows []Row) ([]byte, error) {
 	var buf bytes.Buffer
@@ -83,36 +84,36 @@ func Write(rows []Row) ([]byte, error) {
 	if len(rows) > 0 {
 		if _, err := w.Write(rows); err != nil {
 			_ = w.Close()
-			return nil, fmt.Errorf("candleparquet write rows: %w", err)
+			return nil, fmt.Errorf("candle parquet write rows: %w", err)
 		}
 	}
 
 	if err := w.Close(); err != nil {
-		return nil, fmt.Errorf("candleparquet close writer: %w", err)
+		return nil, fmt.Errorf("candle parquet close writer: %w", err)
 	}
 	return buf.Bytes(), nil
 }
 
 // Validate performs physical checks on Candle Parquet bytes:
-//  1. File size > 0 and PAR1 magic header/footer.
-//  2. Parquet footer can be parsed (footer integrity).
-//  3. Schema: exactly 14 columns in expectedCols order.
+//  1. The file size is greater than zero, and PAR1 magic appears in the header and footer.
+//  2. The Parquet footer can be parsed.
+//  3. The schema has exactly 14 columns in expectedCols order.
 func Validate(data []byte) error {
 	// 1. Minimum size and PAR1 magic bytes.
 	if len(data) < 8 {
-		return fmt.Errorf("candleparquet validate: file too small (%d bytes)", len(data))
+		return fmt.Errorf("candle parquet validate: file too small (%d bytes)", len(data))
 	}
 	if string(data[:4]) != "PAR1" {
-		return fmt.Errorf("candleparquet validate: bad header magic %q", data[:4])
+		return fmt.Errorf("candle parquet validate: bad header magic %q", data[:4])
 	}
 	if string(data[len(data)-4:]) != "PAR1" {
-		return fmt.Errorf("candleparquet validate: bad footer magic %q", data[len(data)-4:])
+		return fmt.Errorf("candle parquet validate: bad footer magic %q", data[len(data)-4:])
 	}
 
 	// 2. Parse the footer (validates Parquet structural integrity).
 	f, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return fmt.Errorf("candleparquet validate: open file: %w", err)
+		return fmt.Errorf("candle parquet validate: open file: %w", err)
 	}
 
 	// 3. Schema matching.
@@ -123,12 +124,12 @@ func Validate(data []byte) error {
 func checkSchema(s *parquet.Schema) error {
 	fields := s.Fields()
 	if len(fields) != len(expectedCols) {
-		return fmt.Errorf("candleparquet validate: schema has %d column(s), expected %d",
+		return fmt.Errorf("candle parquet validate: schema has %d column(s), expected %d",
 			len(fields), len(expectedCols))
 	}
 	for i, f := range fields {
 		if f.Name() != expectedCols[i] {
-			return fmt.Errorf("candleparquet validate: column[%d] name %q != expected %q",
+			return fmt.Errorf("candle parquet validate: column[%d] name %q != expected %q",
 				i, f.Name(), expectedCols[i])
 		}
 	}

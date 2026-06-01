@@ -16,6 +16,7 @@ import (
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
+	"github.com/sanjari-dev/geonera-ingestion/ent/predicate"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
 	"github.com/sanjari-dev/geonera-ingestion/internal/candleparquet"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
@@ -24,6 +25,13 @@ import (
 )
 
 var candleTracer = otel.Tracer("worker/candles")
+
+const (
+	// language=PostgreSQL
+	candleAdvisoryLockSQL = "SELECT pg_try_advisory_xact_lock($1)"
+	// language=PostgreSQL
+	candleHeartbeatSQL = "SELECT true"
+)
 
 // RunCandleParentHandler is the single entry point for all candle-aggregation work.
 // It acquires LockIDCandle so Regular and Backfill modes cannot run concurrently.
@@ -42,7 +50,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 	defer func() { _ = tx.Rollback() }()
 
 	var locked bool
-	err = tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDCandle).Scan(&locked)
+	err = tx.QueryRowContext(ctx, candleAdvisoryLockSQL, dal.LockIDCandle).Scan(&locked)
 	if err != nil || !locked {
 		span.AddEvent("LockIDCandle already held by another instance, skipping")
 		return
@@ -61,7 +69,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 			case <-ticker.C:
 				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
 				var alive bool
-				err := tx.QueryRowContext(hbCtx, "SELECT true").Scan(&alive)
+				err := tx.QueryRowContext(hbCtx, candleHeartbeatSQL).Scan(&alive)
 				hbCancel()
 				if err != nil {
 					span.RecordError(fmt.Errorf("candle lock heartbeat lost: %w", err))
@@ -89,8 +97,8 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 // runCandleRegular implements §4.F:
 //  1. Seed: upsert a CANDLE state row for today 00:00:00 UTC (Status=PENDING) for
 //     every active instrument. Idempotent — ent.IsConstraintError means already seeded.
-//  2. Aggregation: claim PENDING CANDLE rows where ResolvedTickCount=24 and run
-//     the full stream-aggregation pipeline per executeCandleAggregation.
+//  2. Aggregation: claim PENDING CANDLE rows with ResolvedTickCount=24 and run
+//     the full stream-aggregation pipeline by calling executeCandleAggregation.
 func runCandleRegular(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runCandleRegular")
@@ -108,7 +116,7 @@ func runCandleRegular(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // runCandleBackfill implements §4.G:
 //  1. Reset: claim PROCESSED/FAILED/BROKEN CANDLE rows and reset them to PENDING
 //     (incrementing RetryCount for FAILED/BROKEN; ABANDONED at ≥ 5).
-//  2. Aggregation: same pipeline as Regular Step 2.
+//  2. Aggregation: the same pipeline as the regular aggregation step.
 func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runCandleBackfill")
@@ -181,39 +189,20 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, span trace.Span, instrume
 
 // ── Aggregation loop ──────────────────────────────────────────────────────────
 
-// runCandleAggregationLoop claims PENDING CANDLE rows where ResolvedTickCount=24
+// runCandleAggregationLoop claims PENDING CANDLE rows with ResolvedTickCount=24
 // and dispatches each to executeCandleAggregation in a goroutine.
 // The loop uses the same serial-claim pattern as tick workers: because
 // LockIDCandle is held, no other candle process competes for these rows.
 func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
-		var claimed *ent.State
-		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			row, err := tx.State.Query().
-				Where(
-					state.JobTypeEQ(state.JobTypeCANDLE),
-					state.StatusEQ(state.StatusPENDING),
-					state.ResolvedTickCount(24),
-					state.HasInstrumentWith(instrument.IsActiveEQ(true)),
-					state.IsDeletedEQ(false),
-				).
+		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
+			return candleStateRows(q,
+				state.StatusEQ(state.StatusPENDING),
+				state.ResolvedTickCount(24),
+			).
 				WithInstrument().
-				Order(state.ByTimestamp()).
-				First(ctx)
-			if err != nil {
-				return err
-			}
-			claimed, err = tx.State.UpdateOneID(row.ID).
-				SetPreviousStatus(state.PreviousStatus(row.Status)).
-				SetStatus(state.StatusPROCESSED).
-				SetUpdatedAt(time.Now().UTC()).
-				Save(ctx)
-			if err != nil {
-				return err
-			}
-			claimed.Edges = row.Edges
-			return nil
+				Order(state.ByTimestamp())
 		})
 		if err != nil {
 			if ent.IsNotFound(err) {
@@ -243,30 +232,15 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 // Processing is sequential (no goroutines): these are fast DB-only operations.
 func runCandleResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 	for ctx.Err() == nil {
-		var claimed *ent.State
-		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			row, err := tx.State.Query().
-				Where(
-					state.JobTypeEQ(state.JobTypeCANDLE),
-					state.StatusIn(
-						state.StatusPROCESSED,
-						state.StatusFAILED,
-						state.StatusBROKEN,
-					),
-					state.HasInstrumentWith(instrument.IsActiveEQ(true)),
-					state.IsDeletedEQ(false),
-				).
-				Order(state.ByTimestamp()).
-				First(ctx)
-			if err != nil {
-				return err
-			}
-			claimed, err = tx.State.UpdateOneID(row.ID).
-				SetPreviousStatus(state.PreviousStatus(row.Status)).
-				SetStatus(state.StatusPROCESSED).
-				SetUpdatedAt(time.Now().UTC()).
-				Save(ctx)
-			return err
+		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
+			return candleStateRows(q,
+				state.StatusIn(
+					state.StatusPROCESSED,
+					state.StatusFAILED,
+					state.StatusBROKEN,
+				),
+			).
+				Order(state.ByTimestamp())
 		})
 		if err != nil {
 			if ent.IsNotFound(err) {
@@ -281,12 +255,21 @@ func runCandleResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 	}
 }
 
+func candleStateRows(q *ent.StateQuery, filters ...predicate.State) *ent.StateQuery {
+	baseFilters := []predicate.State{
+		state.JobTypeEQ(state.JobTypeCANDLE),
+		state.HasInstrumentWith(instrument.IsActiveEQ(true)),
+		state.IsDeletedEQ(false),
+	}
+	return q.Where(append(baseFilters, filters...)...)
+}
+
 // ── Aggregation pipeline ──────────────────────────────────────────────────────
 
 // executeCandleAggregation is the main candle aggregation pipeline (§4.F step 2):
-//  1. Query the 24 CONFIRMED TICK state rows for this instrument+day.
+//  1. Query the 24 CONFIRMED TICK state rows for this instrument and day.
 //  2. Stream each hourly Parquet from R2 into the OHLCV accumulator (O(1) memory).
-//     - Skip hours where tickState.IsHoliday == true (Zero-Row tick file).
+//     - Skip hours when tickState.IsHoliday == true (Zero-Row tick file).
 //     - Handle NoSuchKey: IsDeleted=true → safe skip; IsDeleted=false → BROKEN.
 //  3. Build the daily Candles Parquet from the accumulator.
 //  4. Upload to R2, validate, promote to CONFIRMED.
@@ -308,7 +291,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	instrName := row.Edges.Instrument.Name
 	dayStart := row.Timestamp.UTC() // CANDLE timestamp is already 00:00:00 UTC
 
-	// Step 1 — Query 24 CONFIRMED TICK rows for this instrument+day.
+	// Step 1 — Query the 24 CONFIRMED TICK rows for this instrument and day.
 	dayEnd := dayStart.Add(24 * time.Hour)
 
 	var tickStates []*ent.State
@@ -333,8 +316,8 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 		return
 	}
 
-	// Step 2 — Stream each hourly Parquet from R2 into the OHLCV accumulator.
-	acc := newOHLCVAccumulator(dayStart, instrName)
+	// Step 2 — Stream each hourly Parquet from R2 into the candle accumulator.
+	acc := newCandleAccumulator(dayStart, instrName)
 	broken := false
 
 	for _, tickState := range tickStates {
@@ -432,40 +415,8 @@ func executeCandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusPENDING, "candle reset stuck PROCESSED")
 
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
-		// Increment RetryCount first, then decide PENDING vs ABANDONED.
-		candleHandleRetryReset(ctx, d, row)
-	}
-}
-
-// candleHandleRetryReset increments RetryCount atomically and either resets the
-// row to PENDING (for another attempt) or transitions it to ABANDONED (≥ maxRetryCount).
-// Mirrors handleRetryReset in ticks.go but scoped to CANDLE rows.
-func candleHandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
-	span := trace.SpanFromContext(ctx)
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		// First update: only increment the counter — no status transition.
-		updated, e := tx.State.UpdateOneID(row.ID).
-			AddRetryCount(1).
-			SetUpdatedAt(time.Now().UTC()).
-			Save(ctx)
-		if e != nil {
-			return e
-		}
-		newStatus := state.StatusPENDING
-		if updated.RetryCount >= maxRetryCount {
-			newStatus = state.StatusABANDONED
-		}
-		// Second update: actual status transition — PreviousStatus is set here.
-		_, e = tx.State.UpdateOneID(row.ID).
-			SetPreviousStatus(state.PreviousStatusPROCESSED).
-			SetStatus(newStatus).
-			SetUpdatedAt(time.Now().UTC()).
-			Save(ctx)
-		return e
-	})
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("candle retry reset for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		// Increment RetryCount first, then decide PENDING vs. ABANDONED.
+		handleRetryReset(ctx, d, row)
 	}
 }
 
@@ -477,8 +428,8 @@ var errNoSuchKey = r2.ErrNotFound
 
 func isNoSuchKeyError(err error) bool { return errors.Is(err, r2.ErrNotFound) }
 
-// readTickParquetFromR2 fetches the hourly tick Parquet for the given instrument and timestamp.
-// Returns errNoSuchKey when the R2 object is absent.
+// readTickParquetFromR2 fetches the hourly tick Parquet for the specified instrument and timestamp.
+// Returns errNoSuchKey if the R2 object is absent.
 func readTickParquetFromR2(ctx context.Context, instrument string, ts time.Time) ([]byte, error) {
 	if r2Client == nil {
 		return nil, errClientsNotInitialized
@@ -495,8 +446,8 @@ func readTickParquetFromR2(ctx context.Context, instrument string, ts time.Time)
 }
 
 // buildCandleParquet assembles a daily Candles Parquet file (all 19 timeframes)
-// from the OHLCV accumulator built by streaming the 24 hourly tick Parquets.
-func buildCandleParquet(_ context.Context, _ *ent.State, acc *ohlcvAccumulator) ([]byte, error) {
+// from the candle accumulator built by streaming the 24 hourly tick Parquets.
+func buildCandleParquet(_ context.Context, _ *ent.State, acc *candleAccumulator) ([]byte, error) {
 	var rows []candleparquet.Row
 
 	for _, tf := range candleparquet.All19 {
@@ -514,9 +465,9 @@ func buildCandleParquet(_ context.Context, _ *ent.State, acc *ohlcvAccumulator) 
 				continue
 			}
 
-			vwap := 0.0
-			if b.vwapDen > 0 {
-				vwap = b.vwapNum / b.vwapDen
+			volumeWeightedAveragePrice := 0.0
+			if b.totalVolume > 0 {
+				volumeWeightedAveragePrice = b.weightedMidVolume / b.totalVolume
 			}
 			avgSpread := 0.0
 			if b.tickCount > 0 {
@@ -524,20 +475,20 @@ func buildCandleParquet(_ context.Context, _ *ent.State, acc *ohlcvAccumulator) 
 			}
 
 			rows = append(rows, candleparquet.Row{
-				Timestamp:      k,
-				Instrument:     acc.instrumentName,
-				Timeframe:      tf.Name,
-				Open:           b.open,
-				High:           b.high,
-				Low:            b.low,
-				Close:          b.close,
-				VWAP:           vwap,
-				MinSpread:      b.minSpread,
-				MaxSpread:      b.maxSpread,
-				AvgSpread:      avgSpread,
-				TickCount:      b.tickCount,
-				TotalBidVolume: b.totalBidVol,
-				TotalAskVolume: b.totalAskVol,
+				Timestamp:                  k,
+				Instrument:                 acc.instrumentName,
+				Timeframe:                  tf.Name,
+				Open:                       b.open,
+				High:                       b.high,
+				Low:                        b.low,
+				Close:                      b.close,
+				VolumeWeightedAveragePrice: volumeWeightedAveragePrice,
+				MinSpread:                  b.minSpread,
+				MaxSpread:                  b.maxSpread,
+				AvgSpread:                  avgSpread,
+				TickCount:                  b.tickCount,
+				TotalBidVolume:             b.totalBidVol,
+				TotalAskVolume:             b.totalAskVol,
 			})
 		}
 	}
@@ -574,17 +525,18 @@ func readCandleParquetFromR2(ctx context.Context, row *ent.State) ([]byte, error
 }
 
 // validateCandleParquet runs physical validation on the Candle Parquet bytes:
-// magic number, schema, timeframe coverage, OHLCV boundary checks.
+// magic number, schema, timeframe coverage, and boundary checks.
 func validateCandleParquet(_ context.Context, _ *ent.State, data []byte) error {
 	return candleparquet.Validate(data)
 }
 
-// ── OHLCV accumulator ─────────────────────────────────────────────────────────
+// ── Candle accumulator ────────────────────────────────────────────────────────
 
-// periodBucket holds the aggregated OHLCV values for one timeframe period.
+// periodBucket holds the aggregated candle values for one timeframe period.
 type periodBucket struct {
 	open, high, low, close float64
-	vwapNum, vwapDen       float64 // VWAP = vwapNum / vwapDen
+	weightedMidVolume      float64
+	totalVolume            float64
 	spreadSum              float64
 	minSpread, maxSpread   float64
 	tickCount              int64
@@ -593,28 +545,28 @@ type periodBucket struct {
 	initialized            bool
 }
 
-// ohlcvAccumulator accumulates tick data from 24 hourly Parquet files into
-// OHLCV candle buckets for all 19 timeframes.  One AccumulateTickParquet call
+// candleAccumulator accumulates tick data from the 24 hourly Parquet files into
+// candle buckets for all 19 timeframes.  One AccumulateTickParquet call
 // per hourly file; O(1) peak memory relative to the number of files.
-type ohlcvAccumulator struct {
+type candleAccumulator struct {
 	dayStart       time.Time
 	instrumentName string
 	// data[timeframeMinutes][periodStartMicros] → bucket
 	data map[int]map[int64]*periodBucket
 }
 
-// newOHLCVAccumulator returns a fresh, empty accumulator for the given day and instrument.
-func newOHLCVAccumulator(dayStart time.Time, instrumentName string) *ohlcvAccumulator {
+// newCandleAccumulator returns a fresh, empty accumulator for the given day and instrument.
+func newCandleAccumulator(dayStart time.Time, instrumentName string) *candleAccumulator {
 	data := make(map[int]map[int64]*periodBucket, len(candleparquet.All19))
 	for _, tf := range candleparquet.All19 {
 		data[tf.Minutes] = make(map[int64]*periodBucket)
 	}
-	return &ohlcvAccumulator{dayStart: dayStart, instrumentName: instrumentName, data: data}
+	return &candleAccumulator{dayStart: dayStart, instrumentName: instrumentName, data: data}
 }
 
 // AccumulateTickParquet parses one hourly tick Parquet file and accumulates
-// its rows into OHLCV buckets.  Zero-row (holiday) files are silently skipped.
-func (a *ohlcvAccumulator) AccumulateTickParquet(raw []byte) error {
+// its rows into candle buckets.  Zero-row (holiday) files are silently skipped.
+func (a *candleAccumulator) AccumulateTickParquet(raw []byte) error {
 	rows, err := tickparquet.ReadAll(raw)
 	if err != nil {
 		return fmt.Errorf("candle accumulate: %w", err)
@@ -662,8 +614,8 @@ func (a *ohlcvAccumulator) AccumulateTickParquet(raw []byte) error {
 				}
 			}
 			b.close = mid
-			b.vwapNum += mid * totalVol
-			b.vwapDen += totalVol
+			b.weightedMidVolume += mid * totalVol
+			b.totalVolume += totalVol
 			b.spreadSum += spread
 			b.tickCount++
 			b.totalBidVol += row.BidVolume

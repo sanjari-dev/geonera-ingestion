@@ -8,7 +8,7 @@ import (
 )
 
 // errNotImplemented is returned by external operations whose client code has
-// not yet been wired up (e.g. candle Parquet builder, candle R2 paths).
+// not yet been wired up (e.g., candle Parquet builder, candle R2 paths).
 // Claimed rows will land in FAILED (recoverable by Backfill).
 var errNotImplemented = errors.New("not implemented")
 
@@ -19,7 +19,7 @@ var (
 	dukClient *dukascopy.Client
 )
 
-// errClientsNotInitialized is returned by any external operation that is
+// errClientsNotInitialized is returned by any external operation
 // invoked before InitClients has been called.
 var errClientsNotInitialized = errors.New(
 	"worker: external clients not initialised — call worker.InitClients at startup",

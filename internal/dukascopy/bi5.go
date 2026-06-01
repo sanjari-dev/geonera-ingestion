@@ -25,14 +25,14 @@ type Tick struct {
 // ParseBI5 decompresses an LZMA-compressed BI5 payload and returns the ticks.
 //
 // hourUTC is the UTC start-of-hour that the file represents.
-// divider is the instrument's price divisor (e.g. 100 000 for EURUSD with 5
-// decimal places, 1 000 for XAUUSD/USDJPY with 3 decimal places).
+// divider is the instrument's price divisor (e.g., 100,000 for EUR/USD with 5
+// decimal places, 1,000 for XAU/USD or USD/JPY with 3 decimal places).
 //
 // BI5 record layout — big-endian, 20 bytes per tick:
 //
-//	[0:4]   uint32  milliseconds from hourUTC start
-//	[4:8]   uint32  ask price integer (divide by divider for actual price)
-//	[8:12]  uint32  bid price integer
+//	[0:4] uint32 milliseconds from hourUTC start
+//	[4:8] uint32 ask price integer (divide by divider for actual price)
+//	[8:12] uint32 bid price integer
 //	[12:16] float32 ask volume
 //	[16:20] float32 bid volume
 func ParseBI5(compressed []byte, hourUTC time.Time, divider int) ([]Tick, error) {
@@ -43,11 +43,11 @@ func ParseBI5(compressed []byte, hourUTC time.Time, divider int) ([]Tick, error)
 	// Decompress LZMA1 stream (Dukascopy BI5 uses LZMA1, not LZMA2/XZ).
 	lr, err := lzma.NewReader(bytes.NewReader(compressed))
 	if err != nil {
-		return nil, fmt.Errorf("bi5: lzma reader: %w", err)
+		return nil, fmt.Errorf("bi5: LZMA reader: %w", err)
 	}
 	raw, err := io.ReadAll(lr)
 	if err != nil {
-		return nil, fmt.Errorf("bi5: lzma decompress: %w", err)
+		return nil, fmt.Errorf("bi5: LZMA decompress: %w", err)
 	}
 	if len(raw)%bi5RecordBytes != 0 {
 		return nil, fmt.Errorf("bi5: decompressed %d bytes is not a multiple of %d", len(raw), bi5RecordBytes)

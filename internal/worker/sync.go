@@ -20,7 +20,7 @@ import (
 var syncTracer = otel.Tracer("worker/sync")
 
 // RunSyncHandler processes all pending SyncTask (Outbox) events.
-// It acquires LockIDSync to serialise sync runs and prevent concurrent
+// It acquires LockIDSync to serialize sync runs and prevent concurrent
 // ResolvedTickCount recomputes on the same CANDLE rows.
 func RunSyncHandler(ctx context.Context, d *dal.DAL) {
 	ctx, span := syncTracer.Start(ctx, "RunSyncHandler")
@@ -76,7 +76,7 @@ func processPendingSyncTasks(ctx context.Context, d *dal.DAL) {
 	span := trace.SpanFromContext(ctx)
 
 	// Collect all PENDING task IDs in one read so that each subsequent
-	// processSingleSyncTask call can open a short-lived write transaction
+	// processSingleSyncTask call can open a short-lived writing transaction
 	// without holding a long query open.
 	var ids []uuid.UUID
 	err := d.ExecuteInPool(ctx, func(etx *ent.Tx) error {
@@ -161,7 +161,7 @@ func processSingleSyncTask(ctx context.Context, d *dal.DAL, taskID uuid.UUID) {
 		}
 
 		// Step 4: UPDATE the CANDLE row — always write the fresh count.
-		// If actualCount < 24 the CANDLE is also demoted back to PENDING so
+		// If actualCount < 24, the CANDLE is also demoted back to PENDING, so
 		// the aggregation job picks it up again on the next cycle.
 		candleUpdate := tx.State.Update().
 			Where(

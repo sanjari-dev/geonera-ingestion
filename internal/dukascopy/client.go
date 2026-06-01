@@ -26,7 +26,7 @@ type Client struct {
 }
 
 // NewClient returns a Dukascopy Client with a 30-second per-request timeout.
-// Outbound HTTP calls are wrapped with an OpenTelemetry transport so each
+// Outbound HTTP calls are wrapped with an OpenTelemetry transport, so each
 // request produces a child span.
 func NewClient() *Client {
 	return &Client{

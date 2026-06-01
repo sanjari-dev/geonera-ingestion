@@ -22,7 +22,7 @@ const (
 // It is used exclusively by Parent Handlers to hold a transaction-level
 // advisory lock for the full duration of an ETL run.
 //
-// pool is the PgBouncer-routed ent.Client used by all goroutine workers
+// Pool is the PgBouncer-routed ent.Client used by all goroutine workers
 // for short-lived transactional queries (claim, update, count).
 type DAL struct {
 	lockDB *sql.DB

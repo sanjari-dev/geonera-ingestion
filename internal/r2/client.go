@@ -16,7 +16,7 @@ import (
 )
 
 // ErrNotFound is returned by GetObject / DeleteObject when the key is absent.
-var ErrNotFound = errors.New("R2: no such key")
+var ErrNotFound = errors.New("r2: no such key")
 
 // Client wraps the S3-compatible Cloudflare R2 API.
 type Client struct {
