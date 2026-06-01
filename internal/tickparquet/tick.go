@@ -6,10 +6,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/parquet-go/parquet-go"
 )
+
+const decimalScale = 100_000
 
 // Row is the canonical Go representation of one row in a Tick Parquet file.
 //
@@ -27,19 +31,38 @@ type Row struct {
 	AskVolume  int64   `parquet:"ask_volume"`
 }
 
+type parquetRow struct {
+	Timestamp  int64  `parquet:"timestamp,timestamp(microsecond)"`
+	Instrument string `parquet:"instrument"`
+	Bid        int64  `parquet:"bid,decimal(5:18)"`
+	Ask        int64  `parquet:"ask,decimal(5:18)"`
+	BidVolume  int64  `parquet:"bid_volume"`
+	AskVolume  int64  `parquet:"ask_volume"`
+}
+
 // expectedCols is the ordered list of column names the file schema must have.
 var expectedCols = []string{
 	"timestamp", "instrument", "bid", "ask", "bid_volume", "ask_volume",
+}
+
+var expectedLogicalTypes = []string{
+	"TIMESTAMP(isAdjustedToUTC=true,unit=MICROS)", "",
+	"DECIMAL(18,5)", "DECIMAL(18,5)",
+	"", "",
 }
 
 // Write serializes rows into an in-memory Parquet file and returns the bytes.
 // Passing nil or an empty slice produces a valid zero-row file.
 func Write(rows []Row) ([]byte, error) {
 	var buf bytes.Buffer
-	w := parquet.NewGenericWriter[Row](&buf)
+	w := parquet.NewGenericWriter[parquetRow](&buf)
 
 	if len(rows) > 0 {
-		if _, err := w.Write(rows); err != nil {
+		encoded := make([]parquetRow, len(rows))
+		for i, row := range rows {
+			encoded[i] = toParquetRow(row)
+		}
+		if _, err := w.Write(encoded); err != nil {
 			_ = w.Close()
 			return nil, fmt.Errorf("tickparquet write rows: %w", err)
 		}
@@ -117,12 +140,16 @@ func ReadAll(data []byte) ([]Row, error) {
 	if n == 0 {
 		return nil, nil
 	}
-	rows := make([]Row, n)
-	r := parquet.NewGenericReader[Row](f)
+	encoded := make([]parquetRow, n)
+	r := parquet.NewGenericReader[parquetRow](f)
 	defer r.Close()
-	got, err := r.Read(rows)
+	got, err := r.Read(encoded)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("tickparquet read rows: %w", err)
+	}
+	rows := make([]Row, got)
+	for i := range encoded[:got] {
+		rows[i] = fromParquetRow(encoded[i])
 	}
 	return rows[:got], nil
 }
@@ -139,6 +166,10 @@ func checkSchema(s *parquet.Schema) error {
 			return fmt.Errorf("tickparquet validate: column[%d] name %q != expected %q",
 				i, f.Name(), expectedCols[i])
 		}
+		if expectedLogicalTypes[i] != "" && !strings.Contains(f.String(), expectedLogicalTypes[i]) {
+			return fmt.Errorf("tickparquet validate: column[%d] %q logical type %q missing from %q",
+				i, f.Name(), expectedLogicalTypes[i], f.String())
+		}
 	}
 	return nil
 }
@@ -146,10 +177,10 @@ func checkSchema(s *parquet.Schema) error {
 // checkBoundary reads all rows and verifies that the first and last tick
 // timestamps fall within [hourStart, hourStart+1h).
 func checkBoundary(f *parquet.File, hourStart time.Time) error {
-	r := parquet.NewGenericReader[Row](f)
+	r := parquet.NewGenericReader[parquetRow](f)
 	defer r.Close()
 
-	rows := make([]Row, f.NumRows())
+	rows := make([]parquetRow, f.NumRows())
 	n, err := r.Read(rows)
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("tick parquet validate: read rows: %w", err)
@@ -171,4 +202,34 @@ func checkBoundary(f *parquet.File, hourStart time.Time) error {
 			last.Format(time.RFC3339), hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
 	}
 	return nil
+}
+
+func toParquetRow(row Row) parquetRow {
+	return parquetRow{
+		Timestamp:  row.Timestamp,
+		Instrument: row.Instrument,
+		Bid:        encodeDecimal(row.Bid),
+		Ask:        encodeDecimal(row.Ask),
+		BidVolume:  row.BidVolume,
+		AskVolume:  row.AskVolume,
+	}
+}
+
+func fromParquetRow(row parquetRow) Row {
+	return Row{
+		Timestamp:  row.Timestamp,
+		Instrument: row.Instrument,
+		Bid:        decodeDecimal(row.Bid),
+		Ask:        decodeDecimal(row.Ask),
+		BidVolume:  row.BidVolume,
+		AskVolume:  row.AskVolume,
+	}
+}
+
+func encodeDecimal(v float64) int64 {
+	return int64(math.Round(v * decimalScale))
+}
+
+func decodeDecimal(v int64) float64 {
+	return float64(v) / decimalScale
 }

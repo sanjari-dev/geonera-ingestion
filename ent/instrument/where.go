@@ -212,16 +212,6 @@ func DescriptionHasSuffix(v string) predicate.Instrument {
 	return predicate.Instrument(sql.FieldHasSuffix(FieldDescription, v))
 }
 
-// DescriptionIsNil applies the IsNil predicate on the "description" field.
-func DescriptionIsNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldIsNull(FieldDescription))
-}
-
-// DescriptionNotNil applies the NotNil predicate on the "description" field.
-func DescriptionNotNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldNotNull(FieldDescription))
-}
-
 // DescriptionEqualFold applies the EqualFold predicate on the "description" field.
 func DescriptionEqualFold(v string) predicate.Instrument {
 	return predicate.Instrument(sql.FieldEqualFold(FieldDescription, v))
@@ -287,16 +277,6 @@ func AssetClassHasSuffix(v string) predicate.Instrument {
 	return predicate.Instrument(sql.FieldHasSuffix(FieldAssetClass, v))
 }
 
-// AssetClassIsNil applies the IsNil predicate on the "asset_class" field.
-func AssetClassIsNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldIsNull(FieldAssetClass))
-}
-
-// AssetClassNotNil applies the NotNil predicate on the "asset_class" field.
-func AssetClassNotNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldNotNull(FieldAssetClass))
-}
-
 // AssetClassEqualFold applies the EqualFold predicate on the "asset_class" field.
 func AssetClassEqualFold(v string) predicate.Instrument {
 	return predicate.Instrument(sql.FieldEqualFold(FieldAssetClass, v))
@@ -357,16 +337,6 @@ func DividerLTE(v int) predicate.Instrument {
 	return predicate.Instrument(sql.FieldLTE(FieldDivider, v))
 }
 
-// DividerIsNil applies the IsNil predicate on the "divider" field.
-func DividerIsNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldIsNull(FieldDivider))
-}
-
-// DividerNotNil applies the NotNil predicate on the "divider" field.
-func DividerNotNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldNotNull(FieldDivider))
-}
-
 // StartDateEQ applies the EQ predicate on the "start_date" field.
 func StartDateEQ(v time.Time) predicate.Instrument {
 	return predicate.Instrument(sql.FieldEQ(FieldStartDate, v))
@@ -405,16 +375,6 @@ func StartDateLT(v time.Time) predicate.Instrument {
 // StartDateLTE applies the LTE predicate on the "start_date" field.
 func StartDateLTE(v time.Time) predicate.Instrument {
 	return predicate.Instrument(sql.FieldLTE(FieldStartDate, v))
-}
-
-// StartDateIsNil applies the IsNil predicate on the "start_date" field.
-func StartDateIsNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldIsNull(FieldStartDate))
-}
-
-// StartDateNotNil applies the NotNil predicate on the "start_date" field.
-func StartDateNotNil() predicate.Instrument {
-	return predicate.Instrument(sql.FieldNotNull(FieldStartDate))
 }
 
 // IsPauseEQ applies the EQ predicate on the "is_pause" field.

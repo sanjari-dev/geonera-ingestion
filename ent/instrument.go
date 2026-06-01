@@ -21,15 +21,15 @@ type Instrument struct {
 	// Name holds the value of the "name" field.
 	Name string `json:"name,omitempty"`
 	// Description holds the value of the "description" field.
-	Description *string `json:"description,omitempty"`
+	Description string `json:"description,omitempty"`
 	// AssetClass holds the value of the "asset_class" field.
-	AssetClass *string `json:"asset_class,omitempty"`
+	AssetClass string `json:"asset_class,omitempty"`
 	// IsActive holds the value of the "is_active" field.
 	IsActive bool `json:"is_active,omitempty"`
 	// Divider holds the value of the "divider" field.
-	Divider *int `json:"divider,omitempty"`
+	Divider int `json:"divider,omitempty"`
 	// StartDate holds the value of the "start_date" field.
-	StartDate *time.Time `json:"start_date,omitempty"`
+	StartDate time.Time `json:"start_date,omitempty"`
 	// IsPause holds the value of the "is_pause" field.
 	IsPause bool `json:"is_pause,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
@@ -113,15 +113,13 @@ func (_m *Instrument) assignValues(columns []string, values []any) error {
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field description", values[i])
 			} else if value.Valid {
-				_m.Description = new(string)
-				*_m.Description = value.String
+				_m.Description = value.String
 			}
 		case instrument.FieldAssetClass:
 			if value, ok := values[i].(*sql.NullString); !ok {
 				return fmt.Errorf("unexpected type %T for field asset_class", values[i])
 			} else if value.Valid {
-				_m.AssetClass = new(string)
-				*_m.AssetClass = value.String
+				_m.AssetClass = value.String
 			}
 		case instrument.FieldIsActive:
 			if value, ok := values[i].(*sql.NullBool); !ok {
@@ -133,15 +131,13 @@ func (_m *Instrument) assignValues(columns []string, values []any) error {
 			if value, ok := values[i].(*sql.NullInt64); !ok {
 				return fmt.Errorf("unexpected type %T for field divider", values[i])
 			} else if value.Valid {
-				_m.Divider = new(int)
-				*_m.Divider = int(value.Int64)
+				_m.Divider = int(value.Int64)
 			}
 		case instrument.FieldStartDate:
 			if value, ok := values[i].(*sql.NullTime); !ok {
 				return fmt.Errorf("unexpected type %T for field start_date", values[i])
 			} else if value.Valid {
-				_m.StartDate = new(time.Time)
-				*_m.StartDate = value.Time
+				_m.StartDate = value.Time
 			}
 		case instrument.FieldIsPause:
 			if value, ok := values[i].(*sql.NullBool); !ok {
@@ -198,28 +194,20 @@ func (_m *Instrument) String() string {
 	builder.WriteString("name=")
 	builder.WriteString(_m.Name)
 	builder.WriteString(", ")
-	if v := _m.Description; v != nil {
-		builder.WriteString("description=")
-		builder.WriteString(*v)
-	}
+	builder.WriteString("description=")
+	builder.WriteString(_m.Description)
 	builder.WriteString(", ")
-	if v := _m.AssetClass; v != nil {
-		builder.WriteString("asset_class=")
-		builder.WriteString(*v)
-	}
+	builder.WriteString("asset_class=")
+	builder.WriteString(_m.AssetClass)
 	builder.WriteString(", ")
 	builder.WriteString("is_active=")
 	builder.WriteString(fmt.Sprintf("%v", _m.IsActive))
 	builder.WriteString(", ")
-	if v := _m.Divider; v != nil {
-		builder.WriteString("divider=")
-		builder.WriteString(fmt.Sprintf("%v", *v))
-	}
+	builder.WriteString("divider=")
+	builder.WriteString(fmt.Sprintf("%v", _m.Divider))
 	builder.WriteString(", ")
-	if v := _m.StartDate; v != nil {
-		builder.WriteString("start_date=")
-		builder.WriteString(v.Format(time.ANSIC))
-	}
+	builder.WriteString("start_date=")
+	builder.WriteString(_m.StartDate.Format(time.ANSIC))
 	builder.WriteString(", ")
 	builder.WriteString("is_pause=")
 	builder.WriteString(fmt.Sprintf("%v", _m.IsPause))

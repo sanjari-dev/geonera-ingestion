@@ -61,8 +61,7 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var locked bool
-	err = tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDTick).Scan(&locked)
+	locked, err := tx.QueryBoolContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDTick)
 	if err != nil || !locked {
 		span.AddEvent("LockIDTick already held by another instance, skipping")
 		return
@@ -81,8 +80,7 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 				return
 			case <-ticker.C:
 				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				var alive bool
-				err := tx.QueryRowContext(hbCtx, "SELECT true").Scan(&alive)
+				_, err := tx.QueryBoolContext(hbCtx, "SELECT true")
 				hbCancel()
 				if err != nil {
 					span.RecordError(fmt.Errorf("lock heartbeat lost: %w", err))
@@ -101,20 +99,9 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 		go runT1Phase(lockCtx, d, &wg)
 		go runT2Phase(lockCtx, d, &wg)
 	case "BACKFILL":
-		// Phase 1 — Reset runs first and must complete before Ingestion starts.
-		// Because LockIDTick is held, any PROCESSED/FAILED/BROKEN rows that exist
-		// right now are guaranteed to be zombies from previously crashed runs.
-		// Running Reset concurrently with Ingestion would cause Reset to clobber
-		// rows that Ingestion just promoted from PENDING→PROCESSED, corrupting state.
-		var resetWg sync.WaitGroup
-		resetWg.Add(1)
-		go runBackfillResetGroup(lockCtx, d, &resetWg)
-		resetWg.Wait()
-
-		// Phase 2 — Ingestion and Validation are safe to run in parallel now:
-		// no PROCESSED/FAILED/BROKEN rows remain for Reset to interfere with.
-		wg.Add(2)
+		wg.Add(3)
 		go runBackfillIngestionGroup(lockCtx, d, &wg)
+		go runBackfillResetGroup(lockCtx, d, &wg)
 		go runBackfillValidationGroup(lockCtx, d, &wg)
 	default:
 		log.Printf("ticks: unknown mode %q", mode)
@@ -232,10 +219,9 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 // If the timestamp is non-nil, only rows for that exact hour are claimed (T-0 mode).
 // A nil timestamp processes all historical PENDING rows (Backfill mode).
 //
-// Correctness note: FOR UPDATE SKIP LOCKED is not used here because
-// (a) LockIDTick prevents any concurrent tick worker process, and
-// (b) the serial claim loop means no two goroutines within this process
-// ever compete for the same row.
+// Correctness note: row claims use FOR UPDATE SKIP LOCKED inside the pool
+// transaction so parallel backfill groups route work by current status without
+// competing for the same row.
 func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
@@ -262,6 +248,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestam
 		loopWg.Add(1)
 		go func(r *ent.State) {
 			defer loopWg.Done()
+			defer recoverGoroutine(ctx, "ticks/ingestion-row")
 			executeIngestionETL(ctx, d, r)
 		}(claimed)
 	}
@@ -307,6 +294,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target ti
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
+			defer recoverGoroutine(ctx, "ticks/recovery-row")
 			executeRecoveryAction(ctx, d, r, prev)
 		}(claimed, prevStatus)
 	}
@@ -314,8 +302,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target ti
 }
 
 // runValidationLoop claims COMPLETED rows (optionally for a specific timestamp)
-// and validates their Parquet files. Stray PROCESSED rows in the window are
-// reset to PENDING without ETL.
+// and validates their Parquet files.
 //
 // A nil timestamp processes all historical COMPLETED rows (Backfill mode).
 //
@@ -339,7 +326,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 			query := q.
 				Where(
 					state.JobTypeEQ(state.JobTypeTICK),
-					state.StatusIn(state.StatusCOMPLETED, state.StatusPROCESSED),
+					state.StatusEQ(state.StatusCOMPLETED),
 					state.HasInstrumentWith(instrumentFilters...),
 					state.IsDeletedEQ(false),
 				).
@@ -367,14 +354,10 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 			break
 		}
 
-		if claimed.Status == state.StatusPENDING {
-			// Was a stray PROCESSED, now reset — skip validation.
-			continue
-		}
-
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
+			defer recoverGoroutine(ctx, "ticks/validation-row")
 			executeValidation(ctx, d, r, prev)
 		}(claimed, preclaimPrev)
 	}
@@ -445,6 +428,7 @@ func runNotFoundRecheckLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
+			defer recoverGoroutine(ctx, "ticks/not-found-recheck-row")
 			executeNotFoundRecheckFull(ctx, d, r, prev)
 		}(claimed, preclaimPrev)
 	}
@@ -654,6 +638,15 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 		if e != nil {
 			return e
 		}
+		log.Printf(
+			"state_transition status=%s state_id=%s job_type=%s previous_status=%s traceID=%s message=%q",
+			state.StatusBROKEN,
+			broken.ID,
+			broken.JobType,
+			state.PreviousStatusPROCESSED,
+			trace.SpanFromContext(ctx).SpanContext().TraceID(),
+			"tick parquet validation failed",
+		)
 		if preclaimPrev != nil && *preclaimPrev == state.PreviousStatusCONFIRMED {
 			return upsertSyncTaskInTx(ctx, tx, broken.InstrumentID, broken.Timestamp)
 		}
@@ -840,26 +833,18 @@ func updateStateBroken(ctx context.Context, d *dal.DAL, row *ent.State) {
 func upsertSyncTaskInTx(ctx context.Context, tx *ent.Tx, instrumentID uuid.UUID, tickTimestamp time.Time) error {
 	targetDate := tickTimestamp.Truncate(24 * time.Hour)
 
-	existing, err := tx.SyncTask.Query().
-		Where(
-			synctask.InstrumentIDEQ(instrumentID),
-			synctask.TargetDateEQ(targetDate),
-		).
-		First(ctx)
-	if err != nil && !ent.IsNotFound(err) {
-		return fmt.Errorf("upsert SyncTask query: %w", err)
-	}
-	if existing != nil {
-		_, err = tx.SyncTask.UpdateOneID(existing.ID).
-			SetStatus(synctask.StatusPENDING).
-			Save(ctx)
-		return err
-	}
-	return tx.SyncTask.Create().
-		SetInstrumentID(instrumentID).
-		SetTargetDate(targetDate).
-		SetStatus(synctask.StatusPENDING).
-		Exec(ctx)
+	return tx.ExecContext(ctx, `
+		INSERT INTO ingestion.sync_tasks (id, instrument_id, target_date, status, created_at)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (instrument_id, target_date)
+		DO UPDATE SET status = EXCLUDED.status
+	`,
+		uuid.New(),
+		instrumentID,
+		targetDate,
+		string(synctask.StatusPENDING),
+		time.Now().UTC(),
+	)
 }
 
 // ── Shared sub-pipeline ───────────────────────────────────────────────────────
@@ -905,6 +890,18 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 	}); err != nil {
 		span.RecordError(err)
 		log.Printf("%s for %s (traceID=%s): %v", errMsg, row.ID, span.SpanContext().TraceID(), err)
+		return
+	}
+	if next == state.StatusFAILED || next == state.StatusBROKEN {
+		log.Printf(
+			"state_transition status=%s state_id=%s job_type=%s previous_status=%s traceID=%s message=%q",
+			next,
+			row.ID,
+			row.JobType,
+			prev,
+			span.SpanContext().TraceID(),
+			errMsg,
+		)
 	}
 }
 
@@ -973,12 +970,7 @@ func convertBI5ToParquet(raw []byte, row *ent.State) ([]byte, error) {
 	}
 	inst := row.Edges.Instrument
 
-	divider := 100_000 // default for 5-decimal FX pairs
-	if inst.Divider != nil && *inst.Divider > 0 {
-		divider = *inst.Divider
-	}
-
-	ticks, err := dukascopy.ParseBI5(raw, row.Timestamp, divider)
+	ticks, err := dukascopy.ParseBI5(raw, row.Timestamp, inst.Divider)
 	if err != nil {
 		return nil, fmt.Errorf("convertBI5ToParquet: parse BI5: %w", err)
 	}

@@ -49,8 +49,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var locked bool
-	err = tx.QueryRowContext(ctx, candleAdvisoryLockSQL, dal.LockIDCandle).Scan(&locked)
+	locked, err := tx.QueryBoolContext(ctx, candleAdvisoryLockSQL, dal.LockIDCandle)
 	if err != nil || !locked {
 		span.AddEvent("LockIDCandle already held by another instance, skipping")
 		return
@@ -68,8 +67,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL) {
 				return
 			case <-ticker.C:
 				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				var alive bool
-				err := tx.QueryRowContext(hbCtx, candleHeartbeatSQL).Scan(&alive)
+				_, err := tx.QueryBoolContext(hbCtx, candleHeartbeatSQL)
 				hbCancel()
 				if err != nil {
 					span.RecordError(fmt.Errorf("candle lock heartbeat lost: %w", err))
@@ -134,9 +132,9 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 
 // ── Seeding ───────────────────────────────────────────────────────────────────
 
-// seedTodayCandleRows queries every active instrument and attempts to insert a
+// seedTodayCandleRows queries every active, unpaused instrument and attempts to insert a
 // CANDLE state row for today 00:00:00 UTC with Status=PENDING.
-// A constraint error means the row already exists — silently skip it.
+// ON CONFLICT DO NOTHING means an existing row is silently skipped by PostgreSQL.
 func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 
@@ -145,7 +143,10 @@ func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
 	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 		var e error
 		instruments, e = tx.Instrument.Query().
-			Where(instrument.IsActiveEQ(true)).
+			Where(
+				instrument.IsActiveEQ(true),
+				instrument.IsPauseEQ(false),
+			).
 			All(ctx)
 		return e
 	}); err != nil {
@@ -162,28 +163,28 @@ func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
 	}
 }
 
-// seedOneCandleRow attempts to insert a CANDLE PENDING row for (instrumentID, today).
-// Constraint errors are silently ignored (idempotent seed — row already exists).
+// seedOneCandleRow idempotently inserts a CANDLE PENDING row for (instrumentID, today).
 func seedOneCandleRow(ctx context.Context, d *dal.DAL, span trace.Span, instrumentID uuid.UUID, today time.Time) {
 	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		return tx.State.Create().
-			SetInstrumentID(instrumentID).
-			SetJobType(state.JobTypeCANDLE).
-			SetTimestamp(today).
-			SetStatus(state.StatusPENDING).
-			SetResolvedTickCount(0).
-			SetRetryCount(0).
-			SetNotFoundStreak(0).
-			SetIsHoliday(false).
-			SetIsDeleted(false).
-			SetUpdatedAt(time.Now().UTC()).
-			Exec(ctx)
+		return tx.ExecContext(ctx, `
+			INSERT INTO ingestion.states (
+				id, instrument_id, job_type, timestamp, status,
+				is_holiday, resolved_tick_count, retry_count, not_found_streak,
+				is_deleted, updated_at
+			)
+			VALUES ($1, $2, $3, $4, $5, false, 0, 0, 0, false, $6)
+			ON CONFLICT (instrument_id, timestamp, job_type) DO NOTHING
+		`,
+			uuid.New(),
+			instrumentID,
+			string(state.JobTypeCANDLE),
+			today,
+			string(state.StatusPENDING),
+			time.Now().UTC(),
+		)
 	}); err != nil {
-		if !ent.IsConstraintError(err) {
-			span.RecordError(err)
-			log.Printf("candle seed %s %s (traceID=%s): %v", instrumentID, today.Format(time.DateOnly), span.SpanContext().TraceID(), err)
-		}
-		// constraint error = row already exists; silently skip
+		span.RecordError(err)
+		log.Printf("candle seed %s %s (traceID=%s): %v", instrumentID, today.Format(time.DateOnly), span.SpanContext().TraceID(), err)
 	}
 }
 
@@ -191,8 +192,8 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, span trace.Span, instrume
 
 // runCandleAggregationLoop claims PENDING CANDLE rows with ResolvedTickCount=24
 // and dispatches each to executeCandleAggregation in a goroutine.
-// The loop uses the same serial-claim pattern as tick workers: because
-// LockIDCandle is held, no other candle process competes for these rows.
+// Claims use FOR UPDATE SKIP LOCKED via claimStateAsProcessed so Regular and
+// Backfill runs can safely route work by status under LockIDCandle.
 func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
@@ -216,6 +217,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 		loopWg.Add(1)
 		go func(r *ent.State) {
 			defer loopWg.Done()
+			defer recoverGoroutine(ctx, "candles/aggregation-row")
 			executeCandleAggregation(ctx, d, r)
 		}(claimed)
 	}
@@ -226,7 +228,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 
 // runCandleResetLoop (Backfill only) claims PROCESSED/FAILED/BROKEN CANDLE rows
 // and resets them:
-//   - PROCESSED → PENDING (stuck-worker recovery, no retry increment)
+//   - PROCESSED → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
 //   - FAILED / BROKEN → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
 //
 // Processing is sequential (no goroutines): these are fast DB-only operations.
@@ -258,7 +260,10 @@ func runCandleResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 func candleStateRows(q *ent.StateQuery, filters ...predicate.State) *ent.StateQuery {
 	baseFilters := []predicate.State{
 		state.JobTypeEQ(state.JobTypeCANDLE),
-		state.HasInstrumentWith(instrument.IsActiveEQ(true)),
+		state.HasInstrumentWith(
+			instrument.IsActiveEQ(true),
+			instrument.IsPauseEQ(false),
+		),
 		state.IsDeletedEQ(false),
 	}
 	return q.Where(append(baseFilters, filters...)...)
@@ -379,31 +384,32 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload candle parquet failed")
 		return
 	}
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusCOMPLETED, "set candle COMPLETED")
 
 	// Step 4b — Read back and validate.
 	stored, err := readCandleParquetFromR2(ctx, row)
 	if err != nil {
 		span.RecordError(err)
 		log.Printf("candle agg %s: read back candle parquet (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusBROKEN, "read-back candle parquet failed")
+		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "read-back candle parquet failed")
 		return
 	}
 
 	if err := validateCandleParquet(ctx, row, stored); err != nil {
 		span.RecordError(err)
 		log.Printf("candle agg %s: validate candle parquet (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusBROKEN, "validate candle parquet failed")
+		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "validate candle parquet failed")
 		return
 	}
 
-	// Step 4c — Promote to CONFIRMED (§4.F: PROCESSED → CONFIRMED directly).
-	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusCONFIRMED, "set candle CONFIRMED")
+	// Step 4c — Promote to CONFIRMED after readback validation.
+	updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusCONFIRMED, "set candle CONFIRMED")
 }
 
 // ── Reset action ──────────────────────────────────────────────────────────────
 
 // executeCandleRetryReset applies the Backfill Reset rule for a claimed CANDLE row:
-//   - PROCESSED → PENDING (stuck-worker recovery; no RetryCount increment)
+//   - PROCESSED → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
 //   - FAILED / BROKEN → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
 func executeCandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 	if row.PreviousStatus == nil {
@@ -411,8 +417,7 @@ func executeCandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 	switch *row.PreviousStatus {
 	case state.PreviousStatusPROCESSED:
-		// Stuck PROCESSED: reset directly to PENDING, no retry increment.
-		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusPENDING, "candle reset stuck PROCESSED")
+		handleRetryReset(ctx, d, row)
 
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
 		// Increment RetryCount first, then decide PENDING vs. ABANDONED.
@@ -526,8 +531,8 @@ func readCandleParquetFromR2(ctx context.Context, row *ent.State) ([]byte, error
 
 // validateCandleParquet runs physical validation on the Candle Parquet bytes:
 // magic number, schema, timeframe coverage, and boundary checks.
-func validateCandleParquet(_ context.Context, _ *ent.State, data []byte) error {
-	return candleparquet.Validate(data)
+func validateCandleParquet(_ context.Context, row *ent.State, data []byte) error {
+	return candleparquet.Validate(data, row.Timestamp.UTC())
 }
 
 // ── Candle accumulator ────────────────────────────────────────────────────────

@@ -60,12 +60,6 @@ func (_u *InstrumentUpdate) SetNillableDescription(v *string) *InstrumentUpdate 
 	return _u
 }
 
-// ClearDescription clears the value of the "description" field.
-func (_u *InstrumentUpdate) ClearDescription() *InstrumentUpdate {
-	_u.mutation.ClearDescription()
-	return _u
-}
-
 // SetAssetClass sets the "asset_class" field.
 func (_u *InstrumentUpdate) SetAssetClass(v string) *InstrumentUpdate {
 	_u.mutation.SetAssetClass(v)
@@ -77,12 +71,6 @@ func (_u *InstrumentUpdate) SetNillableAssetClass(v *string) *InstrumentUpdate {
 	if v != nil {
 		_u.SetAssetClass(*v)
 	}
-	return _u
-}
-
-// ClearAssetClass clears the value of the "asset_class" field.
-func (_u *InstrumentUpdate) ClearAssetClass() *InstrumentUpdate {
-	_u.mutation.ClearAssetClass()
 	return _u
 }
 
@@ -121,12 +109,6 @@ func (_u *InstrumentUpdate) AddDivider(v int) *InstrumentUpdate {
 	return _u
 }
 
-// ClearDivider clears the value of the "divider" field.
-func (_u *InstrumentUpdate) ClearDivider() *InstrumentUpdate {
-	_u.mutation.ClearDivider()
-	return _u
-}
-
 // SetStartDate sets the "start_date" field.
 func (_u *InstrumentUpdate) SetStartDate(v time.Time) *InstrumentUpdate {
 	_u.mutation.SetStartDate(v)
@@ -138,12 +120,6 @@ func (_u *InstrumentUpdate) SetNillableStartDate(v *time.Time) *InstrumentUpdate
 	if v != nil {
 		_u.SetStartDate(*v)
 	}
-	return _u
-}
-
-// ClearStartDate clears the value of the "start_date" field.
-func (_u *InstrumentUpdate) ClearStartDate() *InstrumentUpdate {
-	_u.mutation.ClearStartDate()
 	return _u
 }
 
@@ -272,6 +248,21 @@ func (_u *InstrumentUpdate) check() error {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "Instrument.name": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.Description(); ok {
+		if err := instrument.DescriptionValidator(v); err != nil {
+			return &ValidationError{Name: "description", err: fmt.Errorf(`ent: validator failed for field "Instrument.description": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.AssetClass(); ok {
+		if err := instrument.AssetClassValidator(v); err != nil {
+			return &ValidationError{Name: "asset_class", err: fmt.Errorf(`ent: validator failed for field "Instrument.asset_class": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.Divider(); ok {
+		if err := instrument.DividerValidator(v); err != nil {
+			return &ValidationError{Name: "divider", err: fmt.Errorf(`ent: validator failed for field "Instrument.divider": %w`, err)}
+		}
+	}
 	return nil
 }
 
@@ -293,14 +284,8 @@ func (_u *InstrumentUpdate) sqlSave(ctx context.Context) (_node int, err error) 
 	if value, ok := _u.mutation.Description(); ok {
 		_spec.SetField(instrument.FieldDescription, field.TypeString, value)
 	}
-	if _u.mutation.DescriptionCleared() {
-		_spec.ClearField(instrument.FieldDescription, field.TypeString)
-	}
 	if value, ok := _u.mutation.AssetClass(); ok {
 		_spec.SetField(instrument.FieldAssetClass, field.TypeString, value)
-	}
-	if _u.mutation.AssetClassCleared() {
-		_spec.ClearField(instrument.FieldAssetClass, field.TypeString)
 	}
 	if value, ok := _u.mutation.IsActive(); ok {
 		_spec.SetField(instrument.FieldIsActive, field.TypeBool, value)
@@ -311,14 +296,8 @@ func (_u *InstrumentUpdate) sqlSave(ctx context.Context) (_node int, err error) 
 	if value, ok := _u.mutation.AddedDivider(); ok {
 		_spec.AddField(instrument.FieldDivider, field.TypeInt, value)
 	}
-	if _u.mutation.DividerCleared() {
-		_spec.ClearField(instrument.FieldDivider, field.TypeInt)
-	}
 	if value, ok := _u.mutation.StartDate(); ok {
 		_spec.SetField(instrument.FieldStartDate, field.TypeTime, value)
-	}
-	if _u.mutation.StartDateCleared() {
-		_spec.ClearField(instrument.FieldStartDate, field.TypeTime)
 	}
 	if value, ok := _u.mutation.IsPause(); ok {
 		_spec.SetField(instrument.FieldIsPause, field.TypeBool, value)
@@ -469,12 +448,6 @@ func (_u *InstrumentUpdateOne) SetNillableDescription(v *string) *InstrumentUpda
 	return _u
 }
 
-// ClearDescription clears the value of the "description" field.
-func (_u *InstrumentUpdateOne) ClearDescription() *InstrumentUpdateOne {
-	_u.mutation.ClearDescription()
-	return _u
-}
-
 // SetAssetClass sets the "asset_class" field.
 func (_u *InstrumentUpdateOne) SetAssetClass(v string) *InstrumentUpdateOne {
 	_u.mutation.SetAssetClass(v)
@@ -486,12 +459,6 @@ func (_u *InstrumentUpdateOne) SetNillableAssetClass(v *string) *InstrumentUpdat
 	if v != nil {
 		_u.SetAssetClass(*v)
 	}
-	return _u
-}
-
-// ClearAssetClass clears the value of the "asset_class" field.
-func (_u *InstrumentUpdateOne) ClearAssetClass() *InstrumentUpdateOne {
-	_u.mutation.ClearAssetClass()
 	return _u
 }
 
@@ -530,12 +497,6 @@ func (_u *InstrumentUpdateOne) AddDivider(v int) *InstrumentUpdateOne {
 	return _u
 }
 
-// ClearDivider clears the value of the "divider" field.
-func (_u *InstrumentUpdateOne) ClearDivider() *InstrumentUpdateOne {
-	_u.mutation.ClearDivider()
-	return _u
-}
-
 // SetStartDate sets the "start_date" field.
 func (_u *InstrumentUpdateOne) SetStartDate(v time.Time) *InstrumentUpdateOne {
 	_u.mutation.SetStartDate(v)
@@ -547,12 +508,6 @@ func (_u *InstrumentUpdateOne) SetNillableStartDate(v *time.Time) *InstrumentUpd
 	if v != nil {
 		_u.SetStartDate(*v)
 	}
-	return _u
-}
-
-// ClearStartDate clears the value of the "start_date" field.
-func (_u *InstrumentUpdateOne) ClearStartDate() *InstrumentUpdateOne {
-	_u.mutation.ClearStartDate()
 	return _u
 }
 
@@ -694,6 +649,21 @@ func (_u *InstrumentUpdateOne) check() error {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "Instrument.name": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.Description(); ok {
+		if err := instrument.DescriptionValidator(v); err != nil {
+			return &ValidationError{Name: "description", err: fmt.Errorf(`ent: validator failed for field "Instrument.description": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.AssetClass(); ok {
+		if err := instrument.AssetClassValidator(v); err != nil {
+			return &ValidationError{Name: "asset_class", err: fmt.Errorf(`ent: validator failed for field "Instrument.asset_class": %w`, err)}
+		}
+	}
+	if v, ok := _u.mutation.Divider(); ok {
+		if err := instrument.DividerValidator(v); err != nil {
+			return &ValidationError{Name: "divider", err: fmt.Errorf(`ent: validator failed for field "Instrument.divider": %w`, err)}
+		}
+	}
 	return nil
 }
 
@@ -732,14 +702,8 @@ func (_u *InstrumentUpdateOne) sqlSave(ctx context.Context) (_node *Instrument, 
 	if value, ok := _u.mutation.Description(); ok {
 		_spec.SetField(instrument.FieldDescription, field.TypeString, value)
 	}
-	if _u.mutation.DescriptionCleared() {
-		_spec.ClearField(instrument.FieldDescription, field.TypeString)
-	}
 	if value, ok := _u.mutation.AssetClass(); ok {
 		_spec.SetField(instrument.FieldAssetClass, field.TypeString, value)
-	}
-	if _u.mutation.AssetClassCleared() {
-		_spec.ClearField(instrument.FieldAssetClass, field.TypeString)
 	}
 	if value, ok := _u.mutation.IsActive(); ok {
 		_spec.SetField(instrument.FieldIsActive, field.TypeBool, value)
@@ -750,14 +714,8 @@ func (_u *InstrumentUpdateOne) sqlSave(ctx context.Context) (_node *Instrument, 
 	if value, ok := _u.mutation.AddedDivider(); ok {
 		_spec.AddField(instrument.FieldDivider, field.TypeInt, value)
 	}
-	if _u.mutation.DividerCleared() {
-		_spec.ClearField(instrument.FieldDivider, field.TypeInt)
-	}
 	if value, ok := _u.mutation.StartDate(); ok {
 		_spec.SetField(instrument.FieldStartDate, field.TypeTime, value)
-	}
-	if _u.mutation.StartDateCleared() {
-		_spec.ClearField(instrument.FieldStartDate, field.TypeTime)
 	}
 	if value, ok := _u.mutation.IsPause(); ok {
 		_spec.SetField(instrument.FieldIsPause, field.TypeBool, value)

@@ -3,6 +3,7 @@
 package instrument
 
 import (
+	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/google/uuid"
@@ -71,11 +72,23 @@ func ValidColumn(column string) bool {
 	return false
 }
 
+// Note that the variables below are initialized by the runtime
+// package on the initialization of the application. Therefore,
+// it should be imported in the main as follows:
+//
+//	import _ "github.com/sanjari-dev/geonera-ingestion/ent/runtime"
 var (
+	Hooks [1]ent.Hook
 	// NameValidator is a validator for the "name" field. It is called by the builders before save.
 	NameValidator func(string) error
+	// DescriptionValidator is a validator for the "description" field. It is called by the builders before save.
+	DescriptionValidator func(string) error
+	// AssetClassValidator is a validator for the "asset_class" field. It is called by the builders before save.
+	AssetClassValidator func(string) error
 	// DefaultIsActive holds the default value on creation for the "is_active" field.
 	DefaultIsActive bool
+	// DividerValidator is a validator for the "divider" field. It is called by the builders before save.
+	DividerValidator func(int) error
 	// DefaultIsPause holds the default value on creation for the "is_pause" field.
 	DefaultIsPause bool
 	// DefaultID holds the default value on creation for the "id" field.

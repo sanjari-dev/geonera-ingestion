@@ -35,25 +35,9 @@ func (_c *InstrumentCreate) SetDescription(v string) *InstrumentCreate {
 	return _c
 }
 
-// SetNillableDescription sets the "description" field if the given value is not nil.
-func (_c *InstrumentCreate) SetNillableDescription(v *string) *InstrumentCreate {
-	if v != nil {
-		_c.SetDescription(*v)
-	}
-	return _c
-}
-
 // SetAssetClass sets the "asset_class" field.
 func (_c *InstrumentCreate) SetAssetClass(v string) *InstrumentCreate {
 	_c.mutation.SetAssetClass(v)
-	return _c
-}
-
-// SetNillableAssetClass sets the "asset_class" field if the given value is not nil.
-func (_c *InstrumentCreate) SetNillableAssetClass(v *string) *InstrumentCreate {
-	if v != nil {
-		_c.SetAssetClass(*v)
-	}
 	return _c
 }
 
@@ -77,25 +61,9 @@ func (_c *InstrumentCreate) SetDivider(v int) *InstrumentCreate {
 	return _c
 }
 
-// SetNillableDivider sets the "divider" field if the given value is not nil.
-func (_c *InstrumentCreate) SetNillableDivider(v *int) *InstrumentCreate {
-	if v != nil {
-		_c.SetDivider(*v)
-	}
-	return _c
-}
-
 // SetStartDate sets the "start_date" field.
 func (_c *InstrumentCreate) SetStartDate(v time.Time) *InstrumentCreate {
 	_c.mutation.SetStartDate(v)
-	return _c
-}
-
-// SetNillableStartDate sets the "start_date" field if the given value is not nil.
-func (_c *InstrumentCreate) SetNillableStartDate(v *time.Time) *InstrumentCreate {
-	if v != nil {
-		_c.SetStartDate(*v)
-	}
 	return _c
 }
 
@@ -164,7 +132,9 @@ func (_c *InstrumentCreate) Mutation() *InstrumentMutation {
 
 // Save creates the Instrument in the database.
 func (_c *InstrumentCreate) Save(ctx context.Context) (*Instrument, error) {
-	_c.defaults()
+	if err := _c.defaults(); err != nil {
+		return nil, err
+	}
 	return withHooks(ctx, _c.sqlSave, _c.mutation, _c.hooks)
 }
 
@@ -191,7 +161,7 @@ func (_c *InstrumentCreate) ExecX(ctx context.Context) {
 }
 
 // defaults sets the default values of the builder before save.
-func (_c *InstrumentCreate) defaults() {
+func (_c *InstrumentCreate) defaults() error {
 	if _, ok := _c.mutation.IsActive(); !ok {
 		v := instrument.DefaultIsActive
 		_c.mutation.SetIsActive(v)
@@ -201,9 +171,13 @@ func (_c *InstrumentCreate) defaults() {
 		_c.mutation.SetIsPause(v)
 	}
 	if _, ok := _c.mutation.ID(); !ok {
+		if instrument.DefaultID == nil {
+			return fmt.Errorf("ent: uninitialized instrument.DefaultID (forgotten import ent/runtime?)")
+		}
 		v := instrument.DefaultID()
 		_c.mutation.SetID(v)
 	}
+	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
@@ -216,8 +190,35 @@ func (_c *InstrumentCreate) check() error {
 			return &ValidationError{Name: "name", err: fmt.Errorf(`ent: validator failed for field "Instrument.name": %w`, err)}
 		}
 	}
+	if _, ok := _c.mutation.Description(); !ok {
+		return &ValidationError{Name: "description", err: errors.New(`ent: missing required field "Instrument.description"`)}
+	}
+	if v, ok := _c.mutation.Description(); ok {
+		if err := instrument.DescriptionValidator(v); err != nil {
+			return &ValidationError{Name: "description", err: fmt.Errorf(`ent: validator failed for field "Instrument.description": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.AssetClass(); !ok {
+		return &ValidationError{Name: "asset_class", err: errors.New(`ent: missing required field "Instrument.asset_class"`)}
+	}
+	if v, ok := _c.mutation.AssetClass(); ok {
+		if err := instrument.AssetClassValidator(v); err != nil {
+			return &ValidationError{Name: "asset_class", err: fmt.Errorf(`ent: validator failed for field "Instrument.asset_class": %w`, err)}
+		}
+	}
 	if _, ok := _c.mutation.IsActive(); !ok {
 		return &ValidationError{Name: "is_active", err: errors.New(`ent: missing required field "Instrument.is_active"`)}
+	}
+	if _, ok := _c.mutation.Divider(); !ok {
+		return &ValidationError{Name: "divider", err: errors.New(`ent: missing required field "Instrument.divider"`)}
+	}
+	if v, ok := _c.mutation.Divider(); ok {
+		if err := instrument.DividerValidator(v); err != nil {
+			return &ValidationError{Name: "divider", err: fmt.Errorf(`ent: validator failed for field "Instrument.divider": %w`, err)}
+		}
+	}
+	if _, ok := _c.mutation.StartDate(); !ok {
+		return &ValidationError{Name: "start_date", err: errors.New(`ent: missing required field "Instrument.start_date"`)}
 	}
 	if _, ok := _c.mutation.IsPause(); !ok {
 		return &ValidationError{Name: "is_pause", err: errors.New(`ent: missing required field "Instrument.is_pause"`)}
@@ -264,11 +265,11 @@ func (_c *InstrumentCreate) createSpec() (*Instrument, *sqlgraph.CreateSpec) {
 	}
 	if value, ok := _c.mutation.Description(); ok {
 		_spec.SetField(instrument.FieldDescription, field.TypeString, value)
-		_node.Description = &value
+		_node.Description = value
 	}
 	if value, ok := _c.mutation.AssetClass(); ok {
 		_spec.SetField(instrument.FieldAssetClass, field.TypeString, value)
-		_node.AssetClass = &value
+		_node.AssetClass = value
 	}
 	if value, ok := _c.mutation.IsActive(); ok {
 		_spec.SetField(instrument.FieldIsActive, field.TypeBool, value)
@@ -276,11 +277,11 @@ func (_c *InstrumentCreate) createSpec() (*Instrument, *sqlgraph.CreateSpec) {
 	}
 	if value, ok := _c.mutation.Divider(); ok {
 		_spec.SetField(instrument.FieldDivider, field.TypeInt, value)
-		_node.Divider = &value
+		_node.Divider = value
 	}
 	if value, ok := _c.mutation.StartDate(); ok {
 		_spec.SetField(instrument.FieldStartDate, field.TypeTime, value)
-		_node.StartDate = &value
+		_node.StartDate = value
 	}
 	if value, ok := _c.mutation.IsPause(); ok {
 		_spec.SetField(instrument.FieldIsPause, field.TypeBool, value)

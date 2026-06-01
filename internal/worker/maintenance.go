@@ -75,8 +75,7 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var locked bool
-	err = tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDMaintenance).Scan(&locked)
+	locked, err := tx.QueryBoolContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDMaintenance)
 	if err != nil || !locked {
 		span.AddEvent("LockIDMaintenance already held by another instance, skipping")
 		return
@@ -94,8 +93,7 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL) {
 				return
 			case <-ticker.C:
 				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				var alive bool
-				err := tx.QueryRowContext(hbCtx, "SELECT true").Scan(&alive)
+				_, err := tx.QueryBoolContext(hbCtx, "SELECT true")
 				hbCancel()
 				if err != nil {
 					span.RecordError(fmt.Errorf("maintenance lock heartbeat lost: %w", err))
@@ -136,9 +134,6 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL) {
 	for _, inst := range instruments {
 		if ctx.Err() != nil {
 			return
-		}
-		if inst.StartDate == nil {
-			continue
 		}
 		seedForwardForInstrument(ctx, d, inst, state.JobTypeTICK)
 		seedForwardForInstrument(ctx, d, inst, state.JobTypeCANDLE)
@@ -221,43 +216,11 @@ func seedForwardForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrum
 		return
 	}
 
-	// Query existing timestamps in range, then insert only missing ones.
 	err = d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		rangeStart := candidates[0]
-		rangeLast := candidates[len(candidates)-1]
-
-		existing, e := tx.State.Query().
-			Where(
-				state.InstrumentID(inst.ID),
-				state.JobTypeEQ(jobType),
-				state.TimestampGTE(rangeStart),
-				state.TimestampLTE(rangeLast),
-				state.IsDeletedEQ(false),
-			).
-			All(ctx)
-		if e != nil {
-			return e
-		}
-
-		existingSet := make(map[time.Time]struct{}, len(existing))
-		for _, r := range existing {
-			existingSet[r.Timestamp.UTC()] = struct{}{}
-		}
-
 		insertedAt := time.Now().UTC()
 		for _, ts := range candidates {
-			if _, ok := existingSet[ts]; ok {
-				continue
-			}
-			e = tx.State.Create().
-				SetInstrumentID(inst.ID).
-				SetJobType(jobType).
-				SetTimestamp(ts).
-				SetStatus(state.StatusPENDING).
-				SetUpdatedAt(insertedAt).
-				Exec(ctx)
-			if e != nil {
-				return fmt.Errorf("seed forward insert %s %s %s: %w", inst.Name, jobType, ts, e)
+			if err := insertStatePendingOnConflictDoNothing(ctx, tx, inst.ID, jobType, ts, insertedAt); err != nil {
+				return fmt.Errorf("seed forward insert %s %s %s: %w", inst.Name, jobType, ts, err)
 			}
 		}
 		return nil
@@ -293,9 +256,6 @@ func runHistoricalGapFill(ctx context.Context, d *dal.DAL) {
 	for _, inst := range instruments {
 		if ctx.Err() != nil {
 			return
-		}
-		if inst.StartDate == nil {
-			continue
 		}
 		gapFillInstrument(ctx, d, inst)
 	}
@@ -407,42 +367,10 @@ func seedBackwardForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instru
 	}
 
 	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		// Candidates are in descending order; rangeStart is the last, rangeLast is the first.
-		rangeLast := candidates[0]
-		rangeStart := candidates[len(candidates)-1]
-
-		existing, e := tx.State.Query().
-			Where(
-				state.InstrumentID(inst.ID),
-				state.JobTypeEQ(state.JobTypeTICK),
-				state.TimestampGTE(rangeStart),
-				state.TimestampLTE(rangeLast),
-				state.IsDeletedEQ(false),
-			).
-			All(ctx)
-		if e != nil {
-			return e
-		}
-
-		existingSet := make(map[time.Time]struct{}, len(existing))
-		for _, r := range existing {
-			existingSet[r.Timestamp.UTC()] = struct{}{}
-		}
-
 		insertedAt := time.Now().UTC()
 		for _, ts := range candidates {
-			if _, ok := existingSet[ts]; ok {
-				continue
-			}
-			e = tx.State.Create().
-				SetInstrumentID(inst.ID).
-				SetJobType(state.JobTypeTICK).
-				SetTimestamp(ts).
-				SetStatus(state.StatusPENDING).
-				SetUpdatedAt(insertedAt).
-				Exec(ctx)
-			if e != nil {
-				return fmt.Errorf("seed backward insert %s %s: %w", inst.Name, ts, e)
+			if err := insertStatePendingOnConflictDoNothing(ctx, tx, inst.ID, state.JobTypeTICK, ts, insertedAt); err != nil {
+				return fmt.Errorf("seed backward insert %s %s: %w", inst.Name, ts, err)
 			}
 		}
 		return nil
@@ -451,6 +379,32 @@ func seedBackwardForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instru
 		span.RecordError(err)
 		log.Printf("gap fill %s: backward seed (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
 	}
+}
+
+func insertStatePendingOnConflictDoNothing(
+	ctx context.Context,
+	tx *ent.Tx,
+	instrumentID uuid.UUID,
+	jobType state.JobType,
+	ts time.Time,
+	updatedAt time.Time,
+) error {
+	return tx.ExecContext(ctx, `
+		INSERT INTO ingestion.states (
+			id, instrument_id, job_type, timestamp, status,
+			is_holiday, resolved_tick_count, retry_count, not_found_streak,
+			is_deleted, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, false, 0, 0, 0, false, $6)
+		ON CONFLICT (instrument_id, timestamp, job_type) DO NOTHING
+	`,
+		uuid.New(),
+		instrumentID,
+		string(jobType),
+		ts,
+		string(state.StatusPENDING),
+		updatedAt,
+	)
 }
 
 // isBackfillComplete checks whether there are stuck rows between [startDate, minConfirmedTS).
@@ -548,10 +502,7 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL) {
 		if ctx.Err() != nil {
 			return
 		}
-		if inst.StartDate == nil {
-			continue
-		}
-		startDate := *inst.StartDate
+		startDate := inst.StartDate
 
 		// Batch loop: keep marking until no rows remain below startDate.
 		for ctx.Err() == nil {

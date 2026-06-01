@@ -50,17 +50,6 @@ func main() {
 		}
 	}()
 
-	// ── Database: raw direct connection (for advisory locks) ─────────────────
-	lockDB, err := database.NewLockDB(ctx)
-	if err != nil {
-		log.Fatalf("lock db: %v", err)
-	}
-	defer func() {
-		if err := lockDB.Close(); err != nil {
-			log.Printf("lock db close: %v", err)
-		}
-	}()
-
 	// ── Database: PgBouncer pool ent client (for ETL workers) ────────────────
 	poolClient, err := database.NewPoolClient(ctx)
 	if err != nil {
@@ -73,7 +62,7 @@ func main() {
 	}()
 
 	// ── DAL: enforces split-connection strategy ───────────────────────────────
-	appDAL := dal.New(lockDB, poolClient)
+	appDAL := dal.New(dbClient, poolClient)
 
 	// ── Cloudflare R2 client ──────────────────────────────────────────────────
 	r2Client, err := r2.New(r2.Config{

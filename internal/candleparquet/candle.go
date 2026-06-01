@@ -6,9 +6,15 @@ package candleparquet
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"math"
+	"strings"
+	"time"
 
 	"github.com/parquet-go/parquet-go"
 )
+
+const decimalScale = 100_000
 
 // Row is the Go representation of one candle row (one timeframe period).
 //
@@ -36,6 +42,23 @@ type Row struct {
 	TickCount                  int64   `parquet:"tick_count"`
 	TotalBidVolume             int64   `parquet:"total_bid_volume"`
 	TotalAskVolume             int64   `parquet:"total_ask_volume"`
+}
+
+type parquetRow struct {
+	Timestamp                  int64  `parquet:"timestamp,timestamp(microsecond)"`
+	Instrument                 string `parquet:"instrument"`
+	Timeframe                  string `parquet:"timeframe"`
+	Open                       int64  `parquet:"open,decimal(5:18)"`
+	High                       int64  `parquet:"high,decimal(5:18)"`
+	Low                        int64  `parquet:"low,decimal(5:18)"`
+	Close                      int64  `parquet:"close,decimal(5:18)"`
+	VolumeWeightedAveragePrice int64  `parquet:"vwap,decimal(5:18)"`
+	MinSpread                  int64  `parquet:"min_spread,decimal(5:18)"`
+	MaxSpread                  int64  `parquet:"max_spread,decimal(5:18)"`
+	AvgSpread                  int64  `parquet:"avg_spread,decimal(5:18)"`
+	TickCount                  int64  `parquet:"tick_count"`
+	TotalBidVolume             int64  `parquet:"total_bid_volume"`
+	TotalAskVolume             int64  `parquet:"total_ask_volume"`
 }
 
 // Timeframe defines one aggregation interval.
@@ -75,14 +98,25 @@ var expectedCols = []string{
 	"tick_count", "total_bid_volume", "total_ask_volume",
 }
 
+var expectedLogicalTypes = []string{
+	"TIMESTAMP(isAdjustedToUTC=true,unit=MICROS)", "", "",
+	"DECIMAL(18,5)", "DECIMAL(18,5)", "DECIMAL(18,5)", "DECIMAL(18,5)", "DECIMAL(18,5)",
+	"DECIMAL(18,5)", "DECIMAL(18,5)", "DECIMAL(18,5)",
+	"", "", "",
+}
+
 // Write serializes rows into an in-memory Parquet file and returns the bytes.
 // Passing nil or an empty slice produces a valid zero-row file.
 func Write(rows []Row) ([]byte, error) {
 	var buf bytes.Buffer
-	w := parquet.NewGenericWriter[Row](&buf)
+	w := parquet.NewGenericWriter[parquetRow](&buf)
 
 	if len(rows) > 0 {
-		if _, err := w.Write(rows); err != nil {
+		encoded := make([]parquetRow, len(rows))
+		for i, row := range rows {
+			encoded[i] = toParquetRow(row)
+		}
+		if _, err := w.Write(encoded); err != nil {
 			_ = w.Close()
 			return nil, fmt.Errorf("candle parquet write rows: %w", err)
 		}
@@ -97,8 +131,10 @@ func Write(rows []Row) ([]byte, error) {
 // Validate performs physical checks on Candle Parquet bytes:
 //  1. The file size is greater than zero, and PAR1 magic appears in the header and footer.
 //  2. The Parquet footer can be parsed.
-//  3. The schema has exactly 14 columns in expectedCols order.
-func Validate(data []byte) error {
+//  3. The schema has exactly 14 columns in expectedCols order with expected logical types.
+//  4. Every row timestamp is inside [dayStart, dayStart+24h).
+//  5. Non-empty files contain all 19 canonical timeframes.
+func Validate(data []byte, dayStart time.Time) error {
 	// 1. Minimum size and PAR1 magic bytes.
 	if len(data) < 8 {
 		return fmt.Errorf("candle parquet validate: file too small (%d bytes)", len(data))
@@ -117,7 +153,12 @@ func Validate(data []byte) error {
 	}
 
 	// 3. Schema matching.
-	return checkSchema(f.Schema())
+	if err := checkSchema(f.Schema()); err != nil {
+		return err
+	}
+
+	// 4–5. Boundary and timeframe coverage checks.
+	return checkRows(f, dayStart.UTC())
 }
 
 // checkSchema verifies that the file's top-level columns match expectedCols.
@@ -132,6 +173,69 @@ func checkSchema(s *parquet.Schema) error {
 			return fmt.Errorf("candle parquet validate: column[%d] name %q != expected %q",
 				i, f.Name(), expectedCols[i])
 		}
+		if expectedLogicalTypes[i] != "" && !strings.Contains(f.String(), expectedLogicalTypes[i]) {
+			return fmt.Errorf("candle parquet validate: column[%d] %q logical type %q missing from %q",
+				i, f.Name(), expectedLogicalTypes[i], f.String())
+		}
 	}
 	return nil
+}
+
+func checkRows(f *parquet.File, dayStart time.Time) error {
+	if f.NumRows() == 0 {
+		return nil
+	}
+
+	r := parquet.NewGenericReader[parquetRow](f)
+	defer r.Close()
+
+	rows := make([]parquetRow, f.NumRows())
+	n, err := r.Read(rows)
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("candle parquet validate: read rows: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("candle parquet validate: file reports rows but none could be read")
+	}
+
+	dayEnd := dayStart.Add(24 * time.Hour)
+	seen := make(map[string]struct{}, len(All19))
+	for _, row := range rows[:n] {
+		ts := time.UnixMicro(row.Timestamp).UTC()
+		if ts.Before(dayStart) || !ts.Before(dayEnd) {
+			return fmt.Errorf("candle parquet validate: timestamp %s outside window [%s, %s)",
+				ts.Format(time.RFC3339), dayStart.Format(time.RFC3339), dayEnd.Format(time.RFC3339))
+		}
+		seen[row.Timeframe] = struct{}{}
+	}
+
+	for _, tf := range All19 {
+		if _, ok := seen[tf.Name]; !ok {
+			return fmt.Errorf("candle parquet validate: missing timeframe %q", tf.Name)
+		}
+	}
+	return nil
+}
+
+func toParquetRow(row Row) parquetRow {
+	return parquetRow{
+		Timestamp:                  row.Timestamp,
+		Instrument:                 row.Instrument,
+		Timeframe:                  row.Timeframe,
+		Open:                       encodeDecimal(row.Open),
+		High:                       encodeDecimal(row.High),
+		Low:                        encodeDecimal(row.Low),
+		Close:                      encodeDecimal(row.Close),
+		VolumeWeightedAveragePrice: encodeDecimal(row.VolumeWeightedAveragePrice),
+		MinSpread:                  encodeDecimal(row.MinSpread),
+		MaxSpread:                  encodeDecimal(row.MaxSpread),
+		AvgSpread:                  encodeDecimal(row.AvgSpread),
+		TickCount:                  row.TickCount,
+		TotalBidVolume:             row.TotalBidVolume,
+		TotalAskVolume:             row.TotalAskVolume,
+	}
+}
+
+func encodeDecimal(v float64) int64 {
+	return int64(math.Round(v * decimalScale))
 }

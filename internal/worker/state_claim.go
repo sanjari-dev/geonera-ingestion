@@ -25,7 +25,7 @@ func claimStateWithPrevious(
 	var claimed *ent.State
 	var preclaimPrevious *state.PreviousStatus
 	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		row, err := configure(tx.State.Query()).First(ctx)
+		row, err := configure(tx.State.Query()).FirstForUpdateSkipLocked(ctx)
 		if err != nil {
 			return err
 		}

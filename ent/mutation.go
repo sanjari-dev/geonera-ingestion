@@ -217,7 +217,7 @@ func (m *InstrumentMutation) Description() (r string, exists bool) {
 // OldDescription returns the old "description" field's value of the Instrument entity.
 // If the Instrument object wasn't provided to the builder, the object is fetched from the database.
 // An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *InstrumentMutation) OldDescription(ctx context.Context) (v *string, err error) {
+func (m *InstrumentMutation) OldDescription(ctx context.Context) (v string, err error) {
 	if !m.op.Is(OpUpdateOne) {
 		return v, errors.New("OldDescription is only allowed on UpdateOne operations")
 	}
@@ -231,22 +231,9 @@ func (m *InstrumentMutation) OldDescription(ctx context.Context) (v *string, err
 	return oldValue.Description, nil
 }
 
-// ClearDescription clears the value of the "description" field.
-func (m *InstrumentMutation) ClearDescription() {
-	m.description = nil
-	m.clearedFields[instrument.FieldDescription] = struct{}{}
-}
-
-// DescriptionCleared returns if the "description" field was cleared in this mutation.
-func (m *InstrumentMutation) DescriptionCleared() bool {
-	_, ok := m.clearedFields[instrument.FieldDescription]
-	return ok
-}
-
 // ResetDescription resets all changes to the "description" field.
 func (m *InstrumentMutation) ResetDescription() {
 	m.description = nil
-	delete(m.clearedFields, instrument.FieldDescription)
 }
 
 // SetAssetClass sets the "asset_class" field.
@@ -266,7 +253,7 @@ func (m *InstrumentMutation) AssetClass() (r string, exists bool) {
 // OldAssetClass returns the old "asset_class" field's value of the Instrument entity.
 // If the Instrument object wasn't provided to the builder, the object is fetched from the database.
 // An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *InstrumentMutation) OldAssetClass(ctx context.Context) (v *string, err error) {
+func (m *InstrumentMutation) OldAssetClass(ctx context.Context) (v string, err error) {
 	if !m.op.Is(OpUpdateOne) {
 		return v, errors.New("OldAssetClass is only allowed on UpdateOne operations")
 	}
@@ -280,22 +267,9 @@ func (m *InstrumentMutation) OldAssetClass(ctx context.Context) (v *string, err 
 	return oldValue.AssetClass, nil
 }
 
-// ClearAssetClass clears the value of the "asset_class" field.
-func (m *InstrumentMutation) ClearAssetClass() {
-	m.asset_class = nil
-	m.clearedFields[instrument.FieldAssetClass] = struct{}{}
-}
-
-// AssetClassCleared returns if the "asset_class" field was cleared in this mutation.
-func (m *InstrumentMutation) AssetClassCleared() bool {
-	_, ok := m.clearedFields[instrument.FieldAssetClass]
-	return ok
-}
-
 // ResetAssetClass resets all changes to the "asset_class" field.
 func (m *InstrumentMutation) ResetAssetClass() {
 	m.asset_class = nil
-	delete(m.clearedFields, instrument.FieldAssetClass)
 }
 
 // SetIsActive sets the "is_active" field.
@@ -352,7 +326,7 @@ func (m *InstrumentMutation) Divider() (r int, exists bool) {
 // OldDivider returns the old "divider" field's value of the Instrument entity.
 // If the Instrument object wasn't provided to the builder, the object is fetched from the database.
 // An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *InstrumentMutation) OldDivider(ctx context.Context) (v *int, err error) {
+func (m *InstrumentMutation) OldDivider(ctx context.Context) (v int, err error) {
 	if !m.op.Is(OpUpdateOne) {
 		return v, errors.New("OldDivider is only allowed on UpdateOne operations")
 	}
@@ -384,24 +358,10 @@ func (m *InstrumentMutation) AddedDivider() (r int, exists bool) {
 	return *v, true
 }
 
-// ClearDivider clears the value of the "divider" field.
-func (m *InstrumentMutation) ClearDivider() {
-	m.divider = nil
-	m.adddivider = nil
-	m.clearedFields[instrument.FieldDivider] = struct{}{}
-}
-
-// DividerCleared returns if the "divider" field was cleared in this mutation.
-func (m *InstrumentMutation) DividerCleared() bool {
-	_, ok := m.clearedFields[instrument.FieldDivider]
-	return ok
-}
-
 // ResetDivider resets all changes to the "divider" field.
 func (m *InstrumentMutation) ResetDivider() {
 	m.divider = nil
 	m.adddivider = nil
-	delete(m.clearedFields, instrument.FieldDivider)
 }
 
 // SetStartDate sets the "start_date" field.
@@ -421,7 +381,7 @@ func (m *InstrumentMutation) StartDate() (r time.Time, exists bool) {
 // OldStartDate returns the old "start_date" field's value of the Instrument entity.
 // If the Instrument object wasn't provided to the builder, the object is fetched from the database.
 // An error is returned if the mutation operation is not UpdateOne, or the database query fails.
-func (m *InstrumentMutation) OldStartDate(ctx context.Context) (v *time.Time, err error) {
+func (m *InstrumentMutation) OldStartDate(ctx context.Context) (v time.Time, err error) {
 	if !m.op.Is(OpUpdateOne) {
 		return v, errors.New("OldStartDate is only allowed on UpdateOne operations")
 	}
@@ -435,22 +395,9 @@ func (m *InstrumentMutation) OldStartDate(ctx context.Context) (v *time.Time, er
 	return oldValue.StartDate, nil
 }
 
-// ClearStartDate clears the value of the "start_date" field.
-func (m *InstrumentMutation) ClearStartDate() {
-	m.start_date = nil
-	m.clearedFields[instrument.FieldStartDate] = struct{}{}
-}
-
-// StartDateCleared returns if the "start_date" field was cleared in this mutation.
-func (m *InstrumentMutation) StartDateCleared() bool {
-	_, ok := m.clearedFields[instrument.FieldStartDate]
-	return ok
-}
-
 // ResetStartDate resets all changes to the "start_date" field.
 func (m *InstrumentMutation) ResetStartDate() {
 	m.start_date = nil
-	delete(m.clearedFields, instrument.FieldStartDate)
 }
 
 // SetIsPause sets the "is_pause" field.
@@ -800,20 +747,7 @@ func (m *InstrumentMutation) AddField(name string, value ent.Value) error {
 // ClearedFields returns all nullable fields that were cleared during this
 // mutation.
 func (m *InstrumentMutation) ClearedFields() []string {
-	var fields []string
-	if m.FieldCleared(instrument.FieldDescription) {
-		fields = append(fields, instrument.FieldDescription)
-	}
-	if m.FieldCleared(instrument.FieldAssetClass) {
-		fields = append(fields, instrument.FieldAssetClass)
-	}
-	if m.FieldCleared(instrument.FieldDivider) {
-		fields = append(fields, instrument.FieldDivider)
-	}
-	if m.FieldCleared(instrument.FieldStartDate) {
-		fields = append(fields, instrument.FieldStartDate)
-	}
-	return fields
+	return nil
 }
 
 // FieldCleared returns a boolean indicating if a field with the given name was
@@ -826,20 +760,6 @@ func (m *InstrumentMutation) FieldCleared(name string) bool {
 // ClearField clears the value of the field with the given name. It returns an
 // error if the field is not defined in the schema.
 func (m *InstrumentMutation) ClearField(name string) error {
-	switch name {
-	case instrument.FieldDescription:
-		m.ClearDescription()
-		return nil
-	case instrument.FieldAssetClass:
-		m.ClearAssetClass()
-		return nil
-	case instrument.FieldDivider:
-		m.ClearDivider()
-		return nil
-	case instrument.FieldStartDate:
-		m.ClearStartDate()
-		return nil
-	}
 	return fmt.Errorf("unknown Instrument nullable field %s", name)
 }
 

@@ -90,20 +90,20 @@ CREATE TYPE ingestion.sync_status_enum AS ENUM (
 CREATE TABLE IF NOT EXISTS master.instruments (
     id          UUID    NOT NULL DEFAULT gen_random_uuid(),
     name        VARCHAR NOT NULL,
-    description TEXT,
-    asset_class VARCHAR,
+    description TEXT    NOT NULL,
+    asset_class VARCHAR NOT NULL,
 
     -- Whether the instrument is currently active in the ingestion pipeline.
     is_active   BOOLEAN NOT NULL DEFAULT TRUE,
 
     -- Divisor applied to the raw integer price from the Dukascopy BI5 feed
     -- (e.g., 100,000 for 5-decimal FX pairs such as EURUSD).
-    divider     INT,
+    divider     INT     NOT NULL CHECK (divider > 0),
 
     -- The earliest date for which historical data is available at Dukascopy.
     -- Always stored in UTC. All local timezone inputs must be converted to UTC
     -- before persisting to avoid off-by-hours errors in daily gap detection.
-    start_date  TIMESTAMPTZ,
+    start_date  TIMESTAMPTZ NOT NULL,
 
     -- Mutex flag: set to TRUE automatically when a per-instrument data
     -- inconsistency is detected. While TRUE, the regular pipeline skips this

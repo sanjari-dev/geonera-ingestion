@@ -2,7 +2,108 @@
 
 package runtime
 
-// The schema-stitching logic is generated in github.com/sanjari-dev/geonera-ingestion/ent/runtime.go
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
+	"github.com/sanjari-dev/geonera-ingestion/ent/schema"
+	"github.com/sanjari-dev/geonera-ingestion/ent/state"
+	"github.com/sanjari-dev/geonera-ingestion/ent/synctask"
+	"github.com/sanjari-dev/geonera-ingestion/ent/timeframe"
+)
+
+// The init function reads all schema descriptors with runtime code
+// (default values, validators, hooks and policies) and stitches it
+// to their package variables.
+func init() {
+	instrumentHooks := schema.Instrument{}.Hooks()
+	instrument.Hooks[0] = instrumentHooks[0]
+	instrumentFields := schema.Instrument{}.Fields()
+	_ = instrumentFields
+	// instrumentDescName is the schema descriptor for name field.
+	instrumentDescName := instrumentFields[1].Descriptor()
+	// instrument.NameValidator is a validator for the "name" field. It is called by the builders before save.
+	instrument.NameValidator = instrumentDescName.Validators[0].(func(string) error)
+	// instrumentDescDescription is the schema descriptor for description field.
+	instrumentDescDescription := instrumentFields[2].Descriptor()
+	// instrument.DescriptionValidator is a validator for the "description" field. It is called by the builders before save.
+	instrument.DescriptionValidator = instrumentDescDescription.Validators[0].(func(string) error)
+	// instrumentDescAssetClass is the schema descriptor for asset_class field.
+	instrumentDescAssetClass := instrumentFields[3].Descriptor()
+	// instrument.AssetClassValidator is a validator for the "asset_class" field. It is called by the builders before save.
+	instrument.AssetClassValidator = instrumentDescAssetClass.Validators[0].(func(string) error)
+	// instrumentDescIsActive is the schema descriptor for is_active field.
+	instrumentDescIsActive := instrumentFields[4].Descriptor()
+	// instrument.DefaultIsActive holds the default value on creation for the is_active field.
+	instrument.DefaultIsActive = instrumentDescIsActive.Default.(bool)
+	// instrumentDescDivider is the schema descriptor for divider field.
+	instrumentDescDivider := instrumentFields[5].Descriptor()
+	// instrument.DividerValidator is a validator for the "divider" field. It is called by the builders before save.
+	instrument.DividerValidator = instrumentDescDivider.Validators[0].(func(int) error)
+	// instrumentDescIsPause is the schema descriptor for is_pause field.
+	instrumentDescIsPause := instrumentFields[7].Descriptor()
+	// instrument.DefaultIsPause holds the default value on creation for the is_pause field.
+	instrument.DefaultIsPause = instrumentDescIsPause.Default.(bool)
+	// instrumentDescID is the schema descriptor for id field.
+	instrumentDescID := instrumentFields[0].Descriptor()
+	// instrument.DefaultID holds the default value on creation for the id field.
+	instrument.DefaultID = instrumentDescID.Default.(func() uuid.UUID)
+	stateFields := schema.State{}.Fields()
+	_ = stateFields
+	// stateDescIsHoliday is the schema descriptor for is_holiday field.
+	stateDescIsHoliday := stateFields[6].Descriptor()
+	// state.DefaultIsHoliday holds the default value on creation for the is_holiday field.
+	state.DefaultIsHoliday = stateDescIsHoliday.Default.(bool)
+	// stateDescResolvedTickCount is the schema descriptor for resolved_tick_count field.
+	stateDescResolvedTickCount := stateFields[7].Descriptor()
+	// state.DefaultResolvedTickCount holds the default value on creation for the resolved_tick_count field.
+	state.DefaultResolvedTickCount = stateDescResolvedTickCount.Default.(int)
+	// stateDescRetryCount is the schema descriptor for retry_count field.
+	stateDescRetryCount := stateFields[8].Descriptor()
+	// state.DefaultRetryCount holds the default value on creation for the retry_count field.
+	state.DefaultRetryCount = stateDescRetryCount.Default.(int)
+	// stateDescNotFoundStreak is the schema descriptor for not_found_streak field.
+	stateDescNotFoundStreak := stateFields[9].Descriptor()
+	// state.DefaultNotFoundStreak holds the default value on creation for the not_found_streak field.
+	state.DefaultNotFoundStreak = stateDescNotFoundStreak.Default.(int)
+	// stateDescIsDeleted is the schema descriptor for is_deleted field.
+	stateDescIsDeleted := stateFields[10].Descriptor()
+	// state.DefaultIsDeleted holds the default value on creation for the is_deleted field.
+	state.DefaultIsDeleted = stateDescIsDeleted.Default.(bool)
+	// stateDescID is the schema descriptor for id field.
+	stateDescID := stateFields[0].Descriptor()
+	// state.DefaultID holds the default value on creation for the id field.
+	state.DefaultID = stateDescID.Default.(func() uuid.UUID)
+	synctaskFields := schema.SyncTask{}.Fields()
+	_ = synctaskFields
+	// synctaskDescCreatedAt is the schema descriptor for created_at field.
+	synctaskDescCreatedAt := synctaskFields[4].Descriptor()
+	// synctask.DefaultCreatedAt holds the default value on creation for the created_at field.
+	synctask.DefaultCreatedAt = synctaskDescCreatedAt.Default.(func() time.Time)
+	// synctaskDescID is the schema descriptor for id field.
+	synctaskDescID := synctaskFields[0].Descriptor()
+	// synctask.DefaultID holds the default value on creation for the id field.
+	synctask.DefaultID = synctaskDescID.Default.(func() uuid.UUID)
+	timeframeFields := schema.Timeframe{}.Fields()
+	_ = timeframeFields
+	// timeframeDescName is the schema descriptor for name field.
+	timeframeDescName := timeframeFields[1].Descriptor()
+	// timeframe.NameValidator is a validator for the "name" field. It is called by the builders before save.
+	timeframe.NameValidator = timeframeDescName.Validators[0].(func(string) error)
+	// timeframeDescMinutes is the schema descriptor for minutes field.
+	timeframeDescMinutes := timeframeFields[2].Descriptor()
+	// timeframe.MinutesValidator is a validator for the "minutes" field. It is called by the builders before save.
+	timeframe.MinutesValidator = timeframeDescMinutes.Validators[0].(func(int) error)
+	// timeframeDescIsActive is the schema descriptor for is_active field.
+	timeframeDescIsActive := timeframeFields[3].Descriptor()
+	// timeframe.DefaultIsActive holds the default value on creation for the is_active field.
+	timeframe.DefaultIsActive = timeframeDescIsActive.Default.(bool)
+	// timeframeDescID is the schema descriptor for id field.
+	timeframeDescID := timeframeFields[0].Descriptor()
+	// timeframe.DefaultID holds the default value on creation for the id field.
+	timeframe.DefaultID = timeframeDescID.Default.(func() uuid.UUID)
+}
 
 const (
 	Version = "v0.14.6"                                         // Version of ent codegen.

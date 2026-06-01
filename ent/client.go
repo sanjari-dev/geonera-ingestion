@@ -381,7 +381,8 @@ func (c *InstrumentClient) QuerySyncTasks(_m *Instrument) *SyncTaskQuery {
 
 // Hooks returns the client hooks.
 func (c *InstrumentClient) Hooks() []Hook {
-	return c.hooks.Instrument
+	hooks := c.hooks.Instrument
+	return append(hooks[:len(hooks):len(hooks)], instrument.Hooks[:]...)
 }
 
 // Interceptors returns the client interceptors.

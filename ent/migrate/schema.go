@@ -13,11 +13,11 @@ var (
 	InstrumentsColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeUUID},
 		{Name: "name", Type: field.TypeString, Unique: true},
-		{Name: "description", Type: field.TypeString, Nullable: true},
-		{Name: "asset_class", Type: field.TypeString, Nullable: true},
+		{Name: "description", Type: field.TypeString},
+		{Name: "asset_class", Type: field.TypeString},
 		{Name: "is_active", Type: field.TypeBool, Default: true},
-		{Name: "divider", Type: field.TypeInt, Nullable: true},
-		{Name: "start_date", Type: field.TypeTime, Nullable: true, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "divider", Type: field.TypeInt},
+		{Name: "start_date", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
 		{Name: "is_pause", Type: field.TypeBool, Default: false},
 	}
 	// InstrumentsTable holds the schema information for the "instruments" table.

@@ -1,6 +1,9 @@
 package schema
 
 import (
+	"context"
+	"time"
+
 	"entgo.io/ent"
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/entsql"
@@ -26,29 +29,44 @@ func (Instrument) Fields() []ent.Field {
 			Unique().
 			NotEmpty(),
 		field.String("description").
-			Optional().
-			Nillable(),
+			NotEmpty(),
 		field.String("asset_class").
-			Optional().
-			Nillable(),
+			NotEmpty(),
 		// Whether the instrument is currently active in the ingestion pipeline.
 		field.Bool("is_active").
 			Default(true),
 		// Divisor applied to the raw integer price from the Dukascopy BI5 feed
 		// (e.g., 100,000 for 5-decimal FX pairs such as EURUSD).
 		field.Int("divider").
-			Optional().
-			Nillable(),
+			Positive(),
 		// Earliest date for which historical data is available at Dukascopy (UTC).
 		field.Time("start_date").
-			Optional().
-			Nillable().
 			SchemaType(map[string]string{
 				dialect.Postgres: "timestamptz",
 			}),
 		// Mutex flag: TRUE pauses the pipeline for this instrument pending manual resolution.
 		field.Bool("is_pause").
 			Default(false),
+	}
+}
+
+// Hooks of the Instrument.
+func (Instrument) Hooks() []ent.Hook {
+	return []ent.Hook{
+		func(next ent.Mutator) ent.Mutator {
+			return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+				if m.Op().Is(ent.OpCreate | ent.OpUpdate | ent.OpUpdateOne) {
+					if value, exists := m.Field("start_date"); exists {
+						if startDate, ok := value.(time.Time); ok {
+							if err := m.SetField("start_date", startDate.UTC()); err != nil {
+								return nil, err
+							}
+						}
+					}
+				}
+				return next.Mutate(ctx, m)
+			})
+		},
 	}
 }
 

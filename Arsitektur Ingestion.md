@@ -54,7 +54,7 @@ Daftar 19 timeframe baku (Solid, tidak boleh diubah/ditambah):
 * **PreviousStatus:** enum (Nullable) \- Berisi nilai status tepat sebelum status saat ini. Wajib digeser secara otomatis pada setiap transaksi pembaruan status. Digunakan sebagai konteks historis cepat (misal: untuk mendeteksi demosi/penurunan kasta dari CONFIRMED ke BROKEN).  
 * **IsHoliday:** bool (Default: false) \- Flag eksplisit penanda hari libur. Diset menjadi true HANYA ketika sistem secara sengaja merilis *Zero-Row Parquet*.  
 * **ResolvedTickCount:** int (Default: 0\) \- Counter harian khusus untuk job CANDLE. Menggabungkan jumlah file TICK yang berstatus CONFIRMED di hari tersebut.  
-* **RetryCount:** int (Default: 0\) \- Bertambah (+1) jika terjadi FAILED/BROKEN. Seluruh modifikasi field ini **wajib** menggunakan operasi atomik.  
+* **RetryCount:** int (Default: 0\) \- Bertambah (+1) jika terjadi FAILED/BROKEN. Khusus untuk data CANDLE, jika ada task berstatus PROCESSED yang stuck dan diturunkan kembali ke PENDING, nilai RetryCount juga ditambah 1. Seluruh modifikasi field ini **wajib** menggunakan operasi atomik.  
 * **NotFoundStreak:** int (Default: 0\) \- Bertambah (+1) secara atomik HANYA saat sumber API mengembalikan 404 (data kosong). **Wajib di-reset ke 0** jika pada pengulangan berikutnya data ternyata ditemukan. Digunakan untuk menentukan ambang batas pelepasan *Zero-Row Parquet* (libur permanen) secara presisi tanpa tumpang tindih dengan error jaringan.  
 * **IsDeleted:** bool (Default: false) \- Penanda *soft-delete* untuk menggaransi proses *2-Phase Commit* saat siklus pembersihan/pruning.  
 * **UpdatedAt:** time.Time  
@@ -361,11 +361,12 @@ Proses reguler dipicu melalui **Event (Message Broker / HTTP)** yang secara ekst
    * **Hasil Akhir:** Diperbarui ke COMPLETED, FAILED, ABANDONED, NOT\_FOUND (jika belum mencapai ambang batas \>= 3), atau **CONFIRMED** (jika batas streak tercapai, *Zero-Row* valid, dan *SyncTask* terkirim). Jika pada saat proses ternyata data ditemukan (tidak kosong), maka status NotFoundStreak **wajib di-reset menjadi 0**.  
 3. **T-2 (Two Hours Ago \- Validasi Fisik & Promosi):**  
    * **Target Waktu:** Dua jam sebelumnya (misal: target timestamp 08:00:00 UTC).  
-   * **Kondisi Claim:** Mengambil record dengan Status \= 'COMPLETED' (untuk instrumen yang IsActive \= true). Jika terdapat status PROCESSED yang secara janggal terselip di rentang waktu ini, baris tersebut akan langsung diklaim dan di-reset ke PENDING.  
+   * **Kondisi Claim:** Mengambil record dengan Status \= 'COMPLETED' (untuk instrumen yang IsActive \= true). Worker T-2 **hanya** bertugas memvalidasi file yang sudah berhasil diunggah. Seluruh status PROCESSED yang menggantung (*stray/stuck*) tidak ditangani oleh T-2, melainkan sepenuhnya menjadi tanggung jawab proses Reset/Backfill agar pemulihan status tetap terpusat dan tidak tumpang tindih dengan validasi fisik.  
    * **Aksi Compute Engine:** Tidak melakukan unduhan ke sumber data. Sistem membaca objek langsung dari Cloudflare R2 dan menjalankan **Validasi Fisik File Parquet (sesuai metrik Poin 6.3)**.  
    * **Hasil Akhir:**  
      * **LULUS:** Mengubah status menjadi CONFIRMED dan **menyisipkan SyncTask di dalam transaksi database yang sama (Poin 6.1)** untuk mengatur counter agregasi.  
      * **GAGAL:** Status diubah menjadi BROKEN agar nantinya dikerjakan ulang pada siklus eksekusi *Backfill Ticks*. **Sistem juga wajib menyisipkan SyncTask (memicu rekalkulasi hitungan agregasi harian) secara transaksional jika nilai PreviousStatus \== CONFIRMED (kasus terjadinya demosi data yang sebelumnya dianggap final)**.
+     * **Catatan Demotion:** Jalur penurunan status dari CONFIRMED menjadi BROKEN (yang men-trigger pembuatan SyncTask demosi) **hanya** terjadi melalui eksekusi **Worker Backfill / Manual Reset**. Worker validasi reguler T-2 didesain khusus hanya untuk memproses status COMPLETED, sehingga tidak memvalidasi ulang baris CONFIRMED secara rutin.
 
 ### **E. Backfill Ticks (Setiap 10 Menit)**
 
@@ -401,17 +402,17 @@ Proses pembentukan file *Candles* (agregasi dari data *Ticks* ke 19 timeframe) b
 
 1. **Seeding Harian (Inisialisasi PENDING):**  
    * **Target Waktu:** Dijalankan via **Event (Message Broker / HTTP)** sekali sehari setiap pukul 00:00 UTC.  
-   * **Kondisi Claim:** Seluruh instrumen yang berstatus aktif (IsActive \= true).  
+   * **Kondisi Claim:** Seluruh instrumen yang berstatus aktif (IsActive \= true) dan tidak sedang di-pause (IsPause \= false).  
    * **Aksi Compute Engine:** Menjalankan query Upsert (OnConflict Do Nothing) untuk membooking baris dengan JobType \= 'CANDLE', timestamp pada 00:00:00 hari tersebut, Status \= 'PENDING', dan ResolvedTickCount \= 0\.  
 2. **Eksekusi Reguler (Agregasi Utama 05:08 UTC):**  
    * **Target Waktu:** Dipicu via **Event (Message Broker / HTTP)** pukul 05:08 UTC setiap harinya. Jeda waktu ekstra diberikan untuk memberi ruang agar 24 jam data *Tick* hari sebelumnya selesai di-ingesti dan divalidasi penuh oleh sistem.  
-   * **Kondisi Claim:** Baris dengan JobType \= 'CANDLE', Status \= 'PENDING', instrumen aktif, dan **syarat mutlak:** ResolvedTickCount \= 24 (Artinya 24 jam siklus *Tick* di hari tersebut telah mencapai fase akhir/terminal CONFIRMED).  
+   * **Kondisi Claim:** Baris dengan JobType \= 'CANDLE', Status \= 'PENDING', instrumen aktif (IsActive \= true), tidak sedang di-pause (IsPause \= false), dan **syarat mutlak:** ResolvedTickCount \= 24 (Artinya 24 jam siklus *Tick* di hari tersebut telah mencapai fase akhir/terminal CONFIRMED).  
    * **Aksi Compute Engine (Di Background Goroutine):** 1\. Klaim baris secara atomik (Ubah ke PROCESSED).  
-     2\. **Stream-based Aggregation (O(1) Memory Footprint):** *Worker* dilarang keras mengunduh seluruh 24 file Ticks sekaligus ke dalam memori atau melakukan penumpukan sementara di disk (*disk-staging*). Sistem wajib memproses file secara *streaming* dan bergiliran. *Worker* membaca satu persatu file Ticks dari R2, mem-*parsing* barisnya untuk mengkomputasi dan mengakumulasikan nilai *Open, High, Low, Close, VWAP, Spread,* dan *Volume* ke dalam struktur agregasi di memori (*OHLCV accumulators* untuk 19 timeframe baku). Setelah satu file selesai diproses, sistem wajib membersihkan baris mentah (*raw rows*) tersebut dari memori sebelum lanjut mengunduh file jam berikutnya. *(Catatan Penting: Karena semua status CONFIRMED kini selalu memiliki file fisik Parquet, worker **TIDAK BOLEH mengabaikan error NoSuchKey dari R2 secara sembarangan**. Jika terjadi NoSuchKey, worker wajib mengecek flag IsDeleted pada baris TICK di database. Jika IsDeleted \= true (efek dari proses pruning), file tersebut dapat diabaikan secara aman. Namun, jika IsDeleted \= false, itu adalah indikasi nyata BROKEN Storage dan job harus FAILED).*  
+    2\. **Stream-based Aggregation (O(1) Memory Footprint):** *Worker* dilarang keras mengunduh seluruh 24 file Ticks sekaligus ke dalam memori atau melakukan penumpukan sementara di disk (*disk-staging*). Sistem wajib memproses file secara *streaming* dan bergiliran. *Worker* membaca satu persatu file Ticks dari R2, mem-*parsing* barisnya untuk mengkomputasi dan mengakumulasikan nilai *Open, High, Low, Close, VWAP, Spread,* dan *Volume* ke dalam struktur agregasi di memori (*OHLCV accumulators* untuk 19 timeframe baku). Setelah satu file selesai diproses, sistem wajib membersihkan baris mentah (*raw rows*) tersebut dari memori sebelum lanjut mengunduh file jam berikutnya. *(Catatan Penting: Karena semua status CONFIRMED kini selalu memiliki file fisik Parquet, worker **TIDAK BOLEH mengabaikan error NoSuchKey dari R2 secara sembarangan**. Jika terjadi NoSuchKey, worker wajib mengecek flag IsDeleted pada baris TICK di database. Jika IsDeleted \= true (efek dari proses pruning), file tersebut dapat diabaikan secara aman. Namun, jika IsDeleted \= false, itu adalah indikasi nyata BROKEN Storage dan job harus BROKEN).*  
      3\. Lakukan proses *streaming* agregasi komputasi tersebut secara terus-menerus hingga seluruh 24 jam selesai dibaca. Jika saat memproses suatu file ditemukan file tersebut adalah *Zero-Row Parquet* (libur), sistem langsung melewatinya dari kalkulasi harga namun *looping* tetap dilanjutkan.  
      4\. Setelah seluruh data diakumulasikan, bentuk *accumulators* tersebut menjadi **1 (satu) file Parquet harian** terpadu (meskipun isinya kosong/flat jika libur sehari penuh).  
      5\. Unggah file hasil agregasi ke struktur folder *Candles* di R2.  
-   * **Hasil Akhir:** Status diperbarui ke COMPLETED (berhasil diunggah) atau FAILED (gagal proses agregasi/unggah/NoSuchKey yang tak wajar). Status COMPLETED akan diiringi verifikasi instan untuk menaikkannya menjadi CONFIRMED.
+  * **Hasil Akhir:** Status diperbarui ke COMPLETED (berhasil diunggah), FAILED (gagal proses agregasi/unggah), atau BROKEN (khusus anomali storage seperti NoSuchKey pada file TICK yang seharusnya ada dan IsDeleted \= false). Status COMPLETED akan diiringi verifikasi instan untuk menaikkannya menjadi CONFIRMED.
 
 ### **G. Backfill Candles (Setiap 20 Menit)**
 
@@ -419,7 +420,7 @@ Proses *Backfill* ini bertindak sebagai *sweeper* di latar belakang khusus untuk
 
 1. **Backfill & Recovery:**  
    * **Target Waktu:** Dipicu via **Event (Message Broker / HTTP)** (ideal diset dari luar setiap 20 menit mulai dari menit ke-04 yakni pada menit ke-04, 24, 44, dst).  
-   * **Kondisi Claim:** Mengambil baris CANDLE (instrumen aktif) dengan:  
+   * **Kondisi Claim:** Mengambil baris CANDLE milik instrumen aktif (IsActive \= true) dan tidak sedang di-pause (IsPause \= false) dengan:  
      * Status FAILED, BROKEN, atau **PROCESSED** (langsung diklaim dan di-reset tanpa batasan batas waktu).  
      * Status PENDING masa lampau (tertinggal) di mana syarat agregasi sudah terpenuhi (ResolvedTickCount \= 24).  
    * **Aksi Compute Engine:**  
@@ -474,6 +475,8 @@ Tugas utama fase ini adalah memulihkan job yang stuck, gagal, atau perlu dicoba 
 | NOT\_FOUND | Ditemukan (Ternyata ada) | PENDING | **Reset NotFoundStreak \= 0** | Data yang sebelumnya kosong kini tersedia, reset hitungan kemangkiran ke awal. |
 
 | NOT\_FOUND | Tetap tidak ditemukan | NOT\_FOUND | NotFoundStreak (+1) | Data masih belum tersedia, tambah hitungan *streak*. |
+
+**Catatan Khusus CANDLE:** Pada alur umum TICK, transisi PROCESSED \-\> PENDING untuk memulihkan job stuck tidak menaikkan RetryCount. Namun pada CANDLE, transisi PROCESSED \-\> PENDING di fase Backfill/Reset dianggap sebagai indikasi agregasi harian yang sempat tersangkut, sehingga RetryCount wajib dinaikkan secara atomik (+1) sebagai pengecualian dari perilaku TICK.
 
 #### **C. Fase Validasi (Reguler T-2 & Backfill Validate)**
 
@@ -544,6 +547,8 @@ graph TD
     NOT\_FOUND \-- "T-2 / B-Validate\\n(Streak \>= 3 & Sukses)" \--\> CONFIRMED      
     NOT\_FOUND \-- "T-2 / B-Validate\\n(Streak \>= 3 & Corrupt/Ada Row)" \--\> BROKEN
 
+**Catatan Diagram:** Panah PROCESSED \-\> PENDING menggambarkan perilaku umum TICK tanpa perubahan RetryCount. Untuk CANDLE, panah yang sama pada Backfill/Reset disertai kenaikan RetryCount (+1) secara atomik.
+
 ## **6\. Integritas Data & Sinkronisasi**
 
 ### **6.1. Transactional Outbox Pattern (Sinkronisasi Count Aktual)**
@@ -566,57 +571,36 @@ err := dal.ExecuteInPool(ctx, func(tx \*ent.Tx) error {
         Save(ctx)              
     if err \!= nil { return err }
 
-    // 2\. Sisipkan SyncTask (Outbox Event) dalam Tx yang sama              
-    // Menggunakan OnConflict Update status ke PENDING untuk mencegah Lost Update (Race Condition).            
-    // Jika event di hari yang sama sudah ada (misal sedang dieksekusi worker di waktu yang berdekatan),             
-    // statusnya akan kembali menjadi PENDING sehingga akan dipaksa untuk dihitung ulang (recompute).            
+    // 2\. Sisipkan SyncTask (Outbox Event) dalam Tx yang sama.
+    // Implementasi memakai raw SQL INSERT ... ON CONFLICT ... DO UPDATE agar
+    // event lama di hari yang sama selalu dikembalikan ke PENDING.
+    // Ini mencegah Lost Update ketika worker SyncTask sedang memproses event,
+    // tetapi ada event TICK baru yang membutuhkan recompute ulang.
     targetDate := tick.Timestamp.Truncate(24 \* time.Hour)              
-    return tx.SyncTask.Create().              
-        SetInstrumentID(tick.InstrumentID).              
-        SetTargetDate(targetDate).              
-        SetStatus(synctask.StatusPENDING).              
-        OnConflictColumns(synctask.FieldInstrumentID, synctask.FieldTargetDate).              
-        Update(func(u \*synctask.Upsert) {            
-            u.SetStatus(synctask.StatusPENDING)            
-        }).              
-        Exec(ctx)              
+    err = tx.ExecContext(ctx, `
+        INSERT INTO ingestion.sync_tasks (id, instrument_id, target_date, status, created_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (instrument_id, target_date)
+        DO UPDATE SET status = EXCLUDED.status
+    `, uuid.New(), tick.InstrumentID, targetDate, synctask.StatusPENDING)
+    return err
 })
 
 #### **Tahap 2: Outbox Worker (Consumer Idempotent via Message Broker / HTTP)**
 
 Event pemrosesan dipanggil secara berkala oleh trigger eksternal. Handler menerima instruksi dan memproses sinkronisasi menggunakan LockIDSync (1004).
 
-Untuk menghindari *Lost Update* akibat penghapusan task secara prematur (saat ada event *TICK* baru yang mengubahnya kembali menjadi PENDING), kita memisahkan klaim baris menggunakan FOR UPDATE SKIP LOCKED, meng-update-nya ke PROCESSED, lalu melakukan **Penghapusan Kondisional** di akhir proses:
+Untuk menghindari *Lost Update* akibat penghapusan task secara prematur (saat ada event *TICK* baru yang mengubahnya kembali menjadi PENDING), worker melakukan klaim menggunakan **atomic Common Table Expression (CTE)** di dalam satu transaksi tunggal. CTE tersebut memilih task berstatus PENDING dengan `FOR UPDATE SKIP LOCKED`, langsung mengubahnya menjadi PROCESSED pada statement yang sama, lalu mengembalikan data task untuk diproses tanpa validasi ulang (*no read-after-read*).
 
 // Di dalam Goroutine background khusus Sync              
-func processSyncTask(ctx context.Context, taskID uuid.UUID, dal \*DAL) error {              
+func processSyncTask(ctx context.Context, dal \*DAL) error {              
     // Menggunakan Guardrail ExecuteInPool    
     return dal.ExecuteInPool(ctx, func(tx \*ent.Tx) error {              
-        // 1\. Klaim tugas menggunakan FOR UPDATE SKIP LOCKED    
-        // Hanya ambil yang berstatus PENDING agar race condition dapat dihindari    
-        task, err := tx.SyncTask.Query().          
-            Where(    
-                synctask.IDEQ(taskID),    
-                synctask.StatusEQ(synctask.StatusPENDING),    
-            ).          
-            ForUpdate(sql.WithLockAction(sql.SkipLocked)).          
-            First(ctx)          
-                      
-        if err \!= nil {          
-            // Jika task tidak ditemukan, berarti sudah diproses & dihapus oleh worker lain,     
-            // atau tidak ada data yang memenuhi kriteria PENDING.          
-            if ent.IsNotFound(err) {          
-                return nil          
-            }          
-            return err          
-        }
-
-        // 2\. Tandai status sebagai PROCESSED di database.    
-        // Ini memastikan worker lain tidak memproses baris yang sama.    
-        \_, err \= tx.SyncTask.UpdateOneID(task.ID).    
-            SetStatus(synctask.StatusPROCESSED).    
-            Save(ctx)    
+        // 1\. Klaim task secara atomik dan ubah statusnya menjadi PROCESSED
+        // dalam statement yang sama. Worker lain akan melewati baris terkunci.
+        task, err := claimOneSyncTaskInTx(ctx, tx)
         if err \!= nil { return err }
+        if task == nil { return nil }
 
         startOfDay := task.TargetDate              
         endOfDay := startOfDay.Add(24 \* time.Hour)
@@ -683,6 +667,7 @@ Status CONFIRMED adalah penanda bahwa data sudah dijamin keamanannya secara fisi
 3. **Schema Matching:** Mencocokkan skema *internal file* dengan spesifikasi sistem. Jumlah kolom, nama kolom, dan presisi tipe datanya (Decimal, bigint) harus 100% sama dengan definisi pada **Poin 3.A**.  
 4. **Data Continuity & Boundary Check (Context-Aware Validation):** Jika file memiliki baris (row count \> 0), sistem membaca nilai timestamp dari baris pertama dan terakhir. Timestamp tersebut harus berkesinambungan dan berada di dalam batas jendela 1 jam (HH) yang sesuai dengan representasi barisnya pada database states.  
    **Pengecualian Khusus (Zero-Row Context):** Untuk file *Zero-Row Parquet*, nilai row count diizinkan berjumlah 0 **HANYA JIKA** flag IsHoliday pada entitas database terkait bernilai true. Jika file kosong namun IsHoliday bernilai false (indikasi *bug parser* pada file yang sebetulnya harus berisi data), file tersebut wajib ditolak. Jika lolos kondisi konteks ini, sistem hanya akan memvalidasi *Schema Matching* dan *Magic Number* tanpa mengecek batas *timestamp*.
+   **Pengecualian Khusus Candle Harian Libur Penuh:** Jika satu hari penuh merupakan hari libur dan file Candles harian berisi 0 row, file Parquet boleh kosong (*zero-row*) selama magic number, footer, dan schema tetap valid. Untuk kasus *zero-row* ini, validasi kelengkapan 19 timeframe akan dilewati (*bypassed*) karena tidak ada baris timeframe yang dapat diverifikasi.
 
 // Di dalam validator, implementasikan parameter konteks stateRecord:        
 func validateParquet(ctx context.Context, stateRecord \*ent.State, fileBytes \[\]byte) error {        
