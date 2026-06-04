@@ -1,0 +1,33 @@
+# Version control
+.git/
+.gitignore
+
+# Environment files — NEVER bake credentials into the image
+.env
+.env.*
+
+# Docker files (not needed inside the image)
+docker-compose*.yml
+Dockerfile
+.dockerignore
+
+# Documentation
+*.md
+docs/
+
+# Database init scripts (only used by the postgres container, not the app)
+init.sql
+
+# Editor / IDE artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Go build artifacts that might exist locally
+geonera-ingestion
+geonera-ingestion.exe

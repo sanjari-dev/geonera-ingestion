@@ -1,15 +1,15 @@
 ##
-## Geonera Ingestion — Infrastructure Stack
+## Geonera Ingestion — Full Stack
 ##
 ## Deploy via Portainer → Stacks → Add Stack → Web editor / Upload.
 ## The stack name entered in Portainer becomes the Docker project prefix
 ## (e.g. "geonera"), so the `name:` key is intentionally omitted here.
 ##
-## Required .env / Portainer Stack-level env vars (override before first deployment):
-##   POSTGRES_PASSWORD    default: !P@ssw0rd123
-##   RABBITMQ_PASSWORD    default: !P@ssw0rd123
-##   MINIO_ROOT_USER      default: minioadmin
-##   MINIO_ROOT_PASSWORD  default: minioadmin
+## Portainer Stack-level env vars (set in Portainer UI before first deployment):
+##   POSTGRES_PASSWORD       default: !P@ssw0rd123
+##   RABBITMQ_PASSWORD       default: !P@ssw0rd123
+##   MINIO_ROOT_USER         default: minioadmin
+##   MINIO_ROOT_PASSWORD     default: minioadmin
 ##   GRAFANA_ADMIN_PASSWORD  default: !P@ssw0rd123
 ##
 
@@ -134,6 +134,119 @@ services:
       - geonera
 
 
+  # ── Admin Dashboard ───────────────────────────────────────────────────────────
+
+  admin-backend:
+    image: sansalfian/geonera-admin-backend:latest
+    restart: unless-stopped
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+      ingestion:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://sans:${POSTGRES_PASSWORD:-!P@ssw0rd123}@pgbouncer:5432/geonera"
+      RABBITMQ_URL: "amqp://sans:${RABBITMQ_PASSWORD:-!P@ssw0rd123}@rabbitmq:5672/geonera"
+      # Use internal Docker network — avoids external DNS dependency and reduces latency
+      GO_DAEMON_URL: "http://ingestion:8080/api/v1"
+      PORT: "3001"
+      NODE_ENV: production
+    ports:
+      - "3001:3001"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    networks:
+      - geonera
+
+  admin-frontend:
+    image: sansalfian/geonera-admin-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      - admin-backend
+    environment:
+      BACKEND_HOST: admin-backend
+      BACKEND_PORT: "3001"
+    ports:
+      - "5173:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - geonera
+
+
+  # ── Application — Ingestion Engine ───────────────────────────────────────────
+  # Main Go application: ETL workers (T-0/T-1/T-2/Backfill), Fiber HTTP API,
+  # RabbitMQ consumer, and Outbox Sync worker.
+
+  ingestion:
+    image: sansalfian/geonera-ingestion:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      APP_PORT: "8080"
+      TZ: UTC
+
+      # ── Database — split-connection strategy (architecture §4.A) ──────────
+      # Direct port (5432): bypasses PgBouncer, used exclusively for advisory
+      # lock transactions by the Parent Handlers.
+      DATABASE_DIRECT_URL: "postgres://sans:${POSTGRES_PASSWORD:-!P@ssw0rd123}@postgres:5432/geonera?sslmode=disable"
+      # PgBouncer port (6432 host → 5432 containers): used by all ETL goroutines
+      # for short-lived transactional queries.
+      DATABASE_POOL_URL: "postgres://sans:${POSTGRES_PASSWORD:-!P@ssw0rd123}@pgbouncer:5432/geonera?sslmode=disable"
+
+      # ── Message Broker ────────────────────────────────────────────────────
+      RABBITMQ_URL: "amqp://sans:${RABBITMQ_PASSWORD:-!P@ssw0rd123}@rabbitmq:5672/geonera"
+
+      # ── Object Storage — MinIO (local R2 simulation) ──────────────────────
+      # For production: replace R2_ENDPOINT with the Cloudflare R2 endpoint
+      # and update R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY accordingly.
+      R2_ENDPOINT:          "http://minio:9000"
+      R2_BUCKET:            "ingestion"
+      R2_ACCESS_KEY_ID:     "${MINIO_ROOT_USER:-minioadmin}"
+      R2_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin}"
+
+      # ── OpenTelemetry ─────────────────────────────────────────────────────
+      OTEL_SERVICE_NAME:                ingestion
+      OTEL_EXPORTER_OTLP_ENDPOINT:     "http://otel-collector:4318"
+      OTEL_EXPORTER_OTLP_PROTOCOL:     "http/protobuf"
+      OTEL_EXPORTER_OTLP_GRPC_ENDPOINT: "otel-collector:4317"
+      OTEL_TRACES_EXPORTER:  otlp
+      OTEL_METRICS_EXPORTER: otlp
+      OTEL_LOGS_EXPORTER:    otlp
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - geonera
+
   # ── Object Storage — local R2 simulation ─────────────────────────────────────
   # MinIO is an S3-compatible server used in development to simulate Cloudflare R2.
   # In production, point R2_ENDPOINT to the real Cloudflare R2 endpoint instead.
@@ -180,8 +293,8 @@ services:
       - -c
       - |
         mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}
-        mc mb --ignore-existing local/geonera-ingestion
-        echo "Bucket 'geonera-ingestion' is ready"
+        mc mb --ignore-existing local/ingestion
+        echo "Bucket 'ingestion' is ready"
     networks:
       - geonera
 
