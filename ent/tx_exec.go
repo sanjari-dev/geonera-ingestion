@@ -3,6 +3,8 @@ package ent
 import (
 	"context"
 	"database/sql"
+
+	entsql "entgo.io/ent/dialect/sql"
 )
 
 // ExecContext executes raw SQL on the current ent transaction.
@@ -13,8 +15,8 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) error 
 
 // QueryContext executes raw SQL on the current ent transaction and returns rows.
 // The caller is responsible for closing the returned rows.
-func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	var rows sql.Rows
+func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*entsql.Rows, error) {
+	var rows entsql.Rows
 	if err := tx.config.driver.Query(ctx, query, args, &rows); err != nil {
 		return nil, err
 	}

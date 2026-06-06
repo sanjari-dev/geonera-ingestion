@@ -63,50 +63,16 @@ func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
 
 // ── RunMaintenanceHandler ─────────────────────────────────────────────────────
 
-func RunMaintenanceHandler(ctx context.Context, d *dal.DAL) {
+func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 	ctx, span := maintenanceTracer.Start(ctx, "RunMaintenanceHandler")
 	defer span.End()
 
-	tx, err := d.AcquireAdvisoryLock(ctx)
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("maintenance: acquire lock (traceID=%s): %v", span.SpanContext().TraceID(), err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	locked, err := tx.QueryBoolContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDMaintenance)
-	if err != nil || !locked {
-		span.AddEvent("LockIDMaintenance already held by another instance, skipping")
-		return
-	}
-
-	lockCtx, cancelETL := context.WithCancel(ctx)
-	defer cancelETL()
-
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-lockCtx.Done():
-				return
-			case <-ticker.C:
-				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				_, err := tx.QueryBoolContext(hbCtx, "SELECT true")
-				hbCancel()
-				if err != nil {
-					span.RecordError(fmt.Errorf("maintenance lock heartbeat lost: %w", err))
-					cancelETL()
-					return
-				}
-			}
-		}
-	}()
-
-	runForwardSeeding(lockCtx, d)
-	runHistoricalGapFill(lockCtx, d)
-	runPruning(lockCtx, d)
+	return runWithLocks(ctx, d, "maintenance", []int64{dal.LockIDTick, dal.LockIDCandle}, onStarted, func(lockCtx context.Context) {
+		log.Printf("maintenance: locks acquired (tick+candle), running!")
+		runForwardSeeding(lockCtx, d)
+		runHistoricalGapFill(lockCtx, d)
+		runPruning(lockCtx, d)
+	})
 }
 
 // ── Forward Seeding ───────────────────────────────────────────────────────────
@@ -147,10 +113,11 @@ func seedForwardForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrum
 	_, span := maintenanceTracer.Start(ctx, "maintenance/forward-seeding/instrument",
 		trace.WithAttributes(
 			attribute.String("instrument.name", inst.Name),
-			attribute.String("job.type", string(jobType)),
-		),
-	)
+			attribute.String("jobType", string(jobType)),
+		))
 	defer span.End()
+
+	log.Printf("forward seeding: processing instrument %s %s", inst.Name, jobType)
 
 	var interval time.Duration
 	if jobType == state.JobTypeTICK {
@@ -320,26 +287,16 @@ func gapFillInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		return
 	}
 
-	if hasStuck {
-		if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
-			return e
-		}); e != nil {
-			span.RecordError(e)
-			log.Printf("gap fill %s: set IsPause=true (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), e)
-		}
-		return
-	}
-
-	// If MIN <= StartDate: backfill fully complete — set IsPause=false.
-	if !minConfirmedTS.After(startDate) {
-		if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(false).Save(ctx)
-			return e
-		}); e != nil {
-			span.RecordError(e)
-			log.Printf("gap fill %s: set IsPause=false (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), e)
-		}
+	// is_pause reflects whether stuck rows currently exist, not backfill completeness.
+	// A previously-paused instrument must be unpaused as soon as its stuck rows are
+	// resolved, so that forward workers can resume immediately.
+	newPause := hasStuck
+	if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(newPause).Save(ctx)
+		return e
+	}); e != nil {
+		span.RecordError(e)
+		log.Printf("gap fill %s: set IsPause=%v (traceID=%s): %v", inst.Name, newPause, span.SpanContext().TraceID(), e)
 	}
 }
 
@@ -407,16 +364,23 @@ func insertStatePendingOnConflictDoNothing(
 	)
 }
 
-// isBackfillComplete checks whether there are stuck rows between [startDate, minConfirmedTS).
-// Returns (hasStuck=true, nil) if any stuck rows exist.
+// isBackfillComplete checks whether there are hard-stuck rows between [startDate, minConfirmedTS).
+// Returns (hasStuck=true, nil) if any hard-stuck rows exist.
 //
 // Stuck row definition:
-//   - Status IN (FAILED, BROKEN, ABANDONED)
-//   - OR: Status IN (PENDING, PROCESSED) AND UpdatedAt < now()-24h
-//   - EXCLUDE: NOT_FOUND with NotFoundStreak < 3 (valid waiting cycle)
+//   - FAILED  — persistent download error; worker cannot self-recover without intervention
+//   - BROKEN  — data integrity failure; requires manual investigation
+//
+// ABANDONED is intentionally excluded: it means the worker gave up after repeated "not found"
+// responses from the data source. This is semantically equivalent to NOT_FOUND — the data
+// simply does not exist at source (e.g., markets closed, public holiday) and should not
+// block forward processing or trigger a pause.
+//
+// PENDING and PROCESSED rows are also excluded: they are actively worked by the
+// backfill/recovery workers and only appear "stale" when the backfill window is large.
+// Treating them as stuck would deadlock the backfill — maintenance would pause the instrument,
+// workers would stop claiming rows, and the rows would never progress past "stale".
 func isBackfillComplete(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, startDate, minConfirmedTS time.Time) (bool, error) {
-	staleThreshold := time.Now().UTC().Add(-24 * time.Hour)
-
 	var stuckCount int
 	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 		count, e := tx.State.Query().
@@ -426,31 +390,11 @@ func isBackfillComplete(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID,
 				state.TimestampGTE(startDate),
 				state.TimestampLT(minConfirmedTS),
 				state.IsDeletedEQ(false),
-				state.And(
-					// Matches any stuck row variant.
-					state.Or(
-						// Hard-stuck: terminal failure statuses.
-						state.StatusIn(
-							state.StatusFAILED,
-							state.StatusBROKEN,
-							state.StatusABANDONED,
-						),
-						// Soft-stuck: in-progress but stale for > 24h.
-						state.And(
-							state.StatusIn(
-								state.StatusPENDING,
-								state.StatusPROCESSED,
-							),
-							state.UpdatedAtLT(staleThreshold),
-						),
-					),
-					// Exclude NOT_FOUND rows with streak < 3 (valid waiting cycle).
-					state.Not(
-						state.And(
-							state.StatusEQ(state.StatusNOT_FOUND),
-							state.NotFoundStreakLT(3),
-						),
-					),
+				// Hard-stuck only: FAILED (download error) and BROKEN (data corruption).
+				// ABANDONED is excluded — it indicates "no data at source", not a blockage.
+				state.StatusIn(
+					state.StatusFAILED,
+					state.StatusBROKEN,
 				),
 			).
 			Count(ctx)

@@ -19,50 +19,15 @@ import (
 var syncTracer = otel.Tracer("worker/sync")
 
 // RunSyncHandler processes all pending SyncTask (Outbox) events.
-// It acquires LockIDSync to serialize sync runs and prevent concurrent
-// ResolvedTickCount recomputes on the same CANDLE rows.
-func RunSyncHandler(ctx context.Context, d *dal.DAL) {
+// It holds the global advisory lock so sync cannot overlap with ticks,
+// candles, or maintenance. If the lock is already held the trigger is dropped.
+func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 	ctx, span := syncTracer.Start(ctx, "RunSyncHandler")
 	defer span.End()
 
-	tx, err := d.AcquireAdvisoryLock(ctx)
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("sync: acquire lock (traceID=%s): %v", span.SpanContext().TraceID(), err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	locked, err := tx.QueryBoolContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDSync)
-	if err != nil || !locked {
-		span.AddEvent("LockIDSync already held by another instance, skipping")
-		return
-	}
-
-	lockCtx, cancelETL := context.WithCancel(ctx)
-	defer cancelETL()
-
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-lockCtx.Done():
-				return
-			case <-ticker.C:
-				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				_, err := tx.QueryBoolContext(hbCtx, "SELECT true")
-				hbCancel()
-				if err != nil {
-					span.RecordError(fmt.Errorf("sync lock heartbeat lost: %w", err))
-					cancelETL()
-					return
-				}
-			}
-		}
-	}()
-
-	processPendingSyncTasks(lockCtx, d)
+	return runWithLocks(ctx, d, "sync", []int64{dal.LockIDSync}, onStarted, func(lockCtx context.Context) {
+		processPendingSyncTasks(lockCtx, d)
+	})
 }
 
 // processPendingSyncTasks fetches the IDs of all PENDING SyncTask rows in a
@@ -99,7 +64,7 @@ func claimOneSyncTaskInTx(ctx context.Context, tx *ent.Tx) (*ent.SyncTask, error
 				LIMIT 1
 			)
 			UPDATE ingestion.sync_tasks AS st
-			SET status = $3
+			SET status = $2
 			FROM claimed
 			WHERE st.id = claimed.id
 			RETURNING st.id, st.instrument_id, st.target_date, st.status, st.created_at
@@ -138,6 +103,7 @@ func processOneSyncTask(ctx context.Context, d *dal.DAL) (bool, error) {
 		}
 		processed = true
 		span.SetAttributes(attribute.String("task.id", task.ID.String()))
+		log.Printf("sync: processing task %s for instrument %s targetDate %s", task.ID, task.InstrumentID, task.TargetDate.Format(time.DateOnly))
 
 		// COUNT TICK/CONFIRMED rows in [targetDate, targetDate+24h).
 		windowStart := task.TargetDate
@@ -177,6 +143,7 @@ func processOneSyncTask(ctx context.Context, d *dal.DAL) (bool, error) {
 			return fmt.Errorf("sync update candle for instrument %s date %s: %w",
 				task.InstrumentID, task.TargetDate.Format(time.DateOnly), err)
 		}
+		log.Printf("sync: completed task %s - candle %s actual count: %d", task.ID, task.TargetDate.Format(time.DateOnly), actualCount)
 
 		// Conditional DELETE — only removes the row when it is still
 		// PROCESSED.  If a concurrent CONFIRMED/BROKEN event has already reset

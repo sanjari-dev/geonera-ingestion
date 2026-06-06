@@ -309,5 +309,35 @@ ON CONFLICT (name) DO NOTHING;
 
 
 -- =============================================================================
+-- 9. SEED DATA — Instruments
+-- =============================================================================
+-- Default instruments for the ingestion pipeline.
+-- is_active = FALSE: instruments are inactive by default and must be explicitly
+-- enabled (along with start_date correction) before the pipeline processes them.
+-- start_date defaults to 2003-01-01 for all instruments.
+-- ON CONFLICT DO NOTHING makes this block safe to re-run on an existing database.
+-- =============================================================================
+
+INSERT INTO master.instruments (name, description, asset_class, is_active, divider, start_date) VALUES
+    ('XAUUSD', 'Gold vs US Dollar',                    'Commodity', FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('AUDJPY', 'Australian Dollar vs Japanese Yen',    'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('CHFJPY', 'Swiss Franc vs Japanese Yen',          'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('CADJPY', 'Canadian Dollar vs Japanese Yen',      'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('GBPJPY', 'British Pound vs Japanese Yen',        'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('EURJPY', 'Euro vs Japanese Yen',                 'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('NZDJPY', 'New Zealand Dollar vs Japanese Yen',   'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('USDJPY', 'US Dollar vs Japanese Yen',            'Forex',     FALSE, 3, '2003-01-01 00:00:00+00'),
+    ('GBPUSD', 'British Pound vs US Dollar',           'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('EURUSD', 'Euro vs US Dollar',                    'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('USDCHF', 'US Dollar vs Swiss Franc',             'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('USDCAD', 'US Dollar vs Canadian Dollar',         'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('AUDUSD', 'Australian Dollar vs US Dollar',       'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('NZDUSD', 'New Zealand Dollar vs US Dollar',      'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('EURGBP', 'Euro vs British Pound',                'Forex',     FALSE, 5, '2003-01-01 00:00:00+00'),
+    ('EURNZD', 'Euro vs New Zealand Dollar',           'Forex',     FALSE, 5, '2003-01-01 00:00:00+00')
+ON CONFLICT (name) DO NOTHING;
+
+
+-- =============================================================================
 -- END OF INIT SCRIPT
 -- =============================================================================

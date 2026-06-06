@@ -32,12 +32,73 @@ const (
 	notFoundThreshold = 3
 	// maxRetryCount is the ceiling for RetryCount before a row is ABANDONED.
 	maxRetryCount = 5
+
+	// dukascopyMaxRPS is the global maximum requests-per-second sent to Dukascopy.
+	// Aligned with dukascopyBurst (= concurrency cap) so every semaphore slot can
+	// fire once per second in steady state.  This prevents 503 thundering-herd
+	// without slowing down the pipeline: a fresh worker saturates all 12 slots in
+	// the first second, then sustains 12 downloads/s.
+	dukascopyMaxRPS = 12
+
+	// dukascopyBurst is the token-bucket burst capacity — equals the concurrency cap
+	// so the burst and sustained rate are identical (12 per second).
+	dukascopyBurst = dukascopyMaxRPS
 )
 
+// tickLoopMaxGoroutines caps the number of concurrent goroutines that any
+// single runIngestionLoop / runValidationLoop / runNotFoundRecheckLoop can
+// have in flight simultaneously.
+//
+// Without this cap, a loop can spawn tens-of-thousands of goroutines
+// (one per claimed row) before the download rate-limiter processes them,
+// resulting in ~400 MB of goroutine stacks and an overloaded scheduler.
+//
+// Setting it to 4 × dukascopyBurst gives each in-flight download ~3 slots
+// of "warm" goroutines in the queue — enough to keep the pipeline saturated
+// without waste.
+const tickLoopMaxGoroutines = dukascopyBurst * 4 // 48
+
+// tickLoopSem is the shared goroutine-pool semaphore used by all ingestion /
+// validation / notfound-recheck loops.  Acquiring before spawning a goroutine
+// prevents the PROCESSED row count from growing unboundedly.
+var tickLoopSem = make(chan struct{}, tickLoopMaxGoroutines)
+
 // tickDownloadSem limits Dukascopy BI5 HTTP downloads (and API re-checks)
-// to 12 goroutines to prevent HTTP 429 rate-limit errors.
+// to dukascopyBurst goroutines to prevent connection overload.
 // Shared across all tick phases (T-0, T-1, T-2, Backfill).
-var tickDownloadSem = make(chan struct{}, 12)
+var tickDownloadSem = make(chan struct{}, dukascopyBurst)
+
+// tickDownloadRateGate is a token-bucket rate limiter for Dukascopy downloads.
+// A background goroutine (started by InitDownloadRateLimiter) refills it at
+// dukascopyMaxRPS tokens/second. Each download must receive one token before
+// acquiring tickDownloadSem, capping the actual request rate even when all
+// semaphore slots are free and requests return quickly (e.g. 503 errors).
+var tickDownloadRateGate = make(chan struct{}, dukascopyBurst)
+
+// InitDownloadRateLimiter pre-fills the token bucket and starts the background
+// goroutine that replenishes it at dukascopyMaxRPS tokens/second.
+// Must be called once at startup, before any worker goroutine is dispatched.
+func InitDownloadRateLimiter() {
+	// Pre-fill bucket so the first burst of dukascopyBurst downloads starts immediately.
+	for i := 0; i < dukascopyBurst; i++ {
+		select {
+		case tickDownloadRateGate <- struct{}{}:
+		default:
+		}
+	}
+	interval := time.Second / dukascopyMaxRPS
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			select {
+			case tickDownloadRateGate <- struct{}{}:
+			default: // bucket full — drop token (prevents stale burst after idle)
+			}
+		}
+	}()
+	log.Printf("worker: download rate limiter started — max %d req/s, burst %d, interval %s",
+		dukascopyMaxRPS, dukascopyBurst, interval)
+}
 
 // tickProcessSem limits concurrent Parquet convert+upload goroutines to 50
 // to prevent OOM spikes on high-volume instruments like EURUSD.
@@ -45,68 +106,33 @@ var tickDownloadSem = make(chan struct{}, 12)
 var tickProcessSem = make(chan struct{}, 50)
 
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
-// It acquires LockIDTick via the direct connection so that Regular and Backfill
-// modes can never run concurrently, then forks the appropriate child goroutines.
+// It holds the global advisory lock for the full duration so no other job
+// (candles, maintenance, sync) can run concurrently. If the lock is already
+// held the trigger is dropped immediately.
 //
 // Mode must be either "REGULAR" or "BACKFILL".
-func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL) {
+func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
 	ctx, span := tickTracer.Start(ctx, fmt.Sprintf("RunTickParentHandler_%s", mode))
 	defer span.End()
 
-	tx, err := d.AcquireAdvisoryLock(ctx)
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("ticks %s: acquire lock: %v", mode, err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	locked, err := tx.QueryBoolContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", dal.LockIDTick)
-	if err != nil || !locked {
-		span.AddEvent("LockIDTick already held by another instance, skipping")
-		return
-	}
-
-	// Lock health monitor: cancel all child work if the direct connection drops.
-	lockCtx, cancelETL := context.WithCancel(ctx)
-	defer cancelETL()
-
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-lockCtx.Done():
-				return
-			case <-ticker.C:
-				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				_, err := tx.QueryBoolContext(hbCtx, "SELECT true")
-				hbCancel()
-				if err != nil {
-					span.RecordError(fmt.Errorf("lock heartbeat lost: %w", err))
-					cancelETL()
-					return
-				}
-			}
+	return runWithLocks(ctx, d, "ticks/"+mode, []int64{dal.LockIDTick}, onStarted, func(lockCtx context.Context) {
+		var wg sync.WaitGroup
+		switch mode {
+		case "REGULAR":
+			wg.Add(3)
+			go runT0Phase(lockCtx, d, &wg)
+			go runT1Phase(lockCtx, d, &wg)
+			go runT2Phase(lockCtx, d, &wg)
+		case "BACKFILL":
+			wg.Add(3)
+			go runBackfillIngestionGroup(lockCtx, d, &wg)
+			go runBackfillResetGroup(lockCtx, d, &wg)
+			go runBackfillValidationGroup(lockCtx, d, &wg)
+		default:
+			log.Printf("ticks: unknown mode %q", mode)
 		}
-	}()
-
-	var wg sync.WaitGroup
-	switch mode {
-	case "REGULAR":
-		wg.Add(3)
-		go runT0Phase(lockCtx, d, &wg)
-		go runT1Phase(lockCtx, d, &wg)
-		go runT2Phase(lockCtx, d, &wg)
-	case "BACKFILL":
-		wg.Add(3)
-		go runBackfillIngestionGroup(lockCtx, d, &wg)
-		go runBackfillResetGroup(lockCtx, d, &wg)
-		go runBackfillValidationGroup(lockCtx, d, &wg)
-	default:
-		log.Printf("ticks: unknown mode %q", mode)
-	}
-	wg.Wait()
+		wg.Wait()
+	})
 }
 
 // ── T-0: current hour ingestion ───────────────────────────────────────────────
@@ -225,6 +251,16 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
+		// Acquire a goroutine-pool slot BEFORE claiming the row.
+		// This caps the number of in-flight goroutines (and therefore PROCESSED rows)
+		// to tickLoopMaxGoroutines, preventing tens-of-thousands of goroutines from
+		// piling up on the rate gate with 400+ MB of goroutine stacks.
+		select {
+		case tickLoopSem <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			query := tickActiveStateRows(q,
 				state.StatusEQ(state.StatusPENDING),
@@ -237,6 +273,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestam
 			return query
 		})
 		if err != nil {
+			<-tickLoopSem // release slot on claim error
 			if ent.IsNotFound(err) {
 				break
 			}
@@ -248,6 +285,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestam
 		loopWg.Add(1)
 		go func(r *ent.State) {
 			defer loopWg.Done()
+			defer func() { <-tickLoopSem }() // release slot when goroutine finishes
 			defer recoverGoroutine(ctx, "ticks/ingestion-row")
 			executeIngestionETL(ctx, d, r)
 		}(claimed)
@@ -314,6 +352,13 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target ti
 func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time, respectPause bool) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
+		// Acquire goroutine-pool slot before claiming (same rationale as runIngestionLoop).
+		select {
+		case tickLoopSem <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+
 		// preclaimPrev is the row's PreviousStatus column value BEFORE the claim
 		// update overwrites it. It is used by executeValidation to detect a genuine
 		// demotion: a row whose last recorded history was CONFIRMED (i.e., it was
@@ -346,6 +391,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 			return state.PreviousStatus(originalStatus), newStatus
 		})
 		if err != nil {
+			<-tickLoopSem // release slot on claim error
 			if ent.IsNotFound(err) {
 				break
 			}
@@ -357,6 +403,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
+			defer func() { <-tickLoopSem }()
 			defer recoverGoroutine(ctx, "ticks/validation-row")
 			executeValidation(ctx, d, r, prev)
 		}(claimed, preclaimPrev)
@@ -364,24 +411,98 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 	loopWg.Wait()
 }
 
-// runResetLoop is used by Backfill Reset. It claims PROCESSED/FAILED/BROKEN rows
-// and resets them: PROCESSED → PENDING, FAILED/BROKEN → PENDING (retry) or ABANDONED.
-// Processing is sequential (no goroutines) since these are fast DB-only operations.
+// runResetLoop is used by Backfill Reset. It handles three phases:
+//
+// Phase A — Batch orphan recovery (fast path):
+//
+//	PROCESSED rows with previous_status = 'PENDING' are orphaned goroutines
+//	(service restarted mid-ETL, or goroutine pool overflow from before the pool cap
+//	was introduced). These rows never had any work completed — they are safe to
+//	reset to PENDING in a single bulk UPDATE without inspecting each row.
+//
+//	A batch of 500 is used so the lock is not held for too long.
+//
+// Phase B — Row-by-row reset (slow path, for FAILED / BROKEN / stray PROCESSED):
+//
+//	Each row is claimed individually and dispatched to executeResetAction, which
+//	applies the appropriate reset rule (retry count increment, ABANDONED check, etc.).
+//
+// Phase C — Last-resort reset for ABANDONED rows:
+//
+//	Only runs when no actionable rows remain (only CONFIRMED + ABANDONED exist).
+//	Resets all ABANDONED → PENDING with RetryCount=0, giving them a full fresh
+//	retry cycle. Maintenance will then clear IsPause on its next run.
 func runResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
+	// ── Phase A: fast bulk reset for orphaned PROCESSED (prev=PENDING) ─────────
+	const batchSize = 500
+	for ctx.Err() == nil {
+		var affected int
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			// Fetch a batch of orphaned PROCESSED IDs first (no SKIP LOCKED needed —
+			// the ingestion loop only claims PENDING rows, not PROCESSED).
+			ids, e := tx.State.Query().
+				Where(
+					state.JobTypeEQ(state.JobTypeTICK),
+					state.StatusEQ(state.StatusPROCESSED),
+					state.PreviousStatusEQ(state.PreviousStatusPENDING),
+					state.HasInstrumentWith(instrument.IsActiveEQ(true)),
+					state.IsDeletedEQ(false),
+				).
+				Limit(batchSize).
+				IDs(ctx)
+			if e != nil || len(ids) == 0 {
+				affected = len(ids)
+				return e
+			}
+			affected = len(ids)
+			return tx.State.Update().
+				Where(state.IDIn(ids...)).
+				SetStatus(state.StatusPENDING).
+				SetUpdatedAt(time.Now().UTC()).
+				Exec(ctx)
+		})
+		if err != nil {
+			span.RecordError(err)
+			log.Printf("backfill batch orphan reset: %v", err)
+			break
+		}
+		if affected > 0 {
+			log.Printf("backfill: batch-reset %d orphaned PROCESSED→PENDING rows", affected)
+		}
+		if affected < batchSize {
+			break // no more orphans
+		}
+	}
+
+	// ── Phase B: row-by-row reset for FAILED / BROKEN / other PROCESSED ────────
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			return tickActiveStateRows(q,
-				state.StatusIn(
-					state.StatusPROCESSED,
-					state.StatusFAILED,
-					state.StatusBROKEN,
+				state.Or(
+					// PROCESSED+prev=PENDING rows are actively claimed by the ingestion loop.
+					// Including them starves FAILED rows (ingestion always has ~48 in flight)
+					// and resets in-progress work. Phase A already bulk-resets these at startup.
+					//
+					// PROCESSED+prev=NOT_FOUND rows are owned by the NOT_FOUND recheck loop
+					// (runNotFoundRecheckLoop). Phase B must not claim them: the recheck goroutine
+					// holds the row between its claim transaction and its handleNotFoundStreak call,
+					// and a Phase B claim would overwrite the row's state mid-flight.
+					state.And(
+						state.StatusEQ(state.StatusPROCESSED),
+						state.PreviousStatusNotIn(
+							state.PreviousStatusPENDING,
+							state.PreviousStatusNOT_FOUND,
+						),
+					),
+					state.StatusEQ(state.StatusFAILED),
+					state.StatusEQ(state.StatusBROKEN),
 				),
 			).
 				Order(
 					orderStateStatuses(
-						state.StatusPROCESSED,
 						state.StatusFAILED,
 						state.StatusBROKEN,
+						state.StatusPROCESSED,
 					),
 					state.ByTimestamp(),
 				)
@@ -397,6 +518,105 @@ func runResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 
 		executeResetAction(ctx, d, claimed)
 	}
+
+	// ── Phase C: last-resort reset for ABANDONED rows ─────────────────────────
+	runAbandonedResetPhase(ctx, d, span, state.JobTypeTICK)
+}
+
+// runAbandonedResetPhase is Phase C of the backfill reset pipeline.
+//
+// It fires at the end of runResetLoop (TICK) and runCandleResetLoop (CANDLE)
+// after all FAILED/BROKEN rows have been exhausted by Phase B.
+//
+// Condition: if every active row for jobType is either CONFIRMED or ABANDONED
+// (count of PENDING/PROCESSED/FAILED/BROKEN/NOT_FOUND/COMPLETED == 0) then
+// all ABANDONED rows are bulk-reset to PENDING with RetryCount=0.
+//
+// Why RetryCount=0: ABANDONED rows previously exhausted their 5 retries. Resetting
+// to 0 gives them a full fresh cycle rather than immediately re-abandoning them.
+// If they fail again they will naturally accumulate retries and be abandoned again.
+//
+// After the reset, the maintenance gap-fill will see freshly-updated PENDING rows
+// (UpdatedAt=now, not stale), conclude there are no stuck rows, and clear IsPause.
+// The next backfill trigger will then process them.
+func runAbandonedResetPhase(ctx context.Context, d *dal.DAL, span trace.Span, jobType state.JobType) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Count rows that still need work (everything except CONFIRMED and ABANDONED).
+	var actionable int
+	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		count, e := tx.State.Query().
+			Where(
+				state.JobTypeEQ(jobType),
+				state.StatusIn(
+					state.StatusPENDING,
+					state.StatusPROCESSED,
+					state.StatusFAILED,
+					state.StatusBROKEN,
+					state.StatusNOT_FOUND,
+					state.StatusCOMPLETED,
+				),
+				state.HasInstrumentWith(instrument.IsActiveEQ(true)),
+				state.IsDeletedEQ(false),
+			).
+			Count(ctx)
+		actionable = count
+		return e
+	}); err != nil {
+		span.RecordError(err)
+		log.Printf("backfill abandoned-check %s (traceID=%s): %v", jobType, span.SpanContext().TraceID(), err)
+		return
+	}
+
+	if actionable > 0 {
+		// Still rows to process; Phase C must not run yet.
+		return
+	}
+
+	// All non-abandoned rows are CONFIRMED. Reset ABANDONED → PENDING in batches.
+	const batchSize = 500
+	var totalReset int
+	for ctx.Err() == nil {
+		var affected int
+		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			ids, e := tx.State.Query().
+				Where(
+					state.JobTypeEQ(jobType),
+					state.StatusEQ(state.StatusABANDONED),
+					state.HasInstrumentWith(instrument.IsActiveEQ(true)),
+					state.IsDeletedEQ(false),
+				).
+				Limit(batchSize).
+				IDs(ctx)
+			if e != nil || len(ids) == 0 {
+				affected = len(ids)
+				return e
+			}
+			affected = len(ids)
+			return tx.State.Update().
+				Where(state.IDIn(ids...)).
+				SetStatus(state.StatusPENDING).
+				SetPreviousStatus(state.PreviousStatusABANDONED).
+				SetRetryCount(0).
+				SetUpdatedAt(time.Now().UTC()).
+				Exec(ctx)
+		})
+		if err != nil {
+			span.RecordError(err)
+			log.Printf("backfill abandoned-reset %s (traceID=%s): %v", jobType, span.SpanContext().TraceID(), err)
+			break
+		}
+		totalReset += affected
+		if affected < batchSize {
+			break
+		}
+	}
+
+	if totalReset > 0 {
+		log.Printf("backfill: last-resort reset %d ABANDONED→PENDING %s rows (retry_count=0); maintenance will clear IsPause on next cycle", totalReset, jobType)
+	}
 }
 
 // runNotFoundRecheckLoop (Backfill Validation only) claims every NOT_FOUND row
@@ -407,6 +627,13 @@ func runResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 func runNotFoundRecheckLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
+		// Goroutine-pool slot — same cap as ingestion/validation loops.
+		select {
+		case tickLoopSem <- struct{}{}:
+		case <-ctx.Done():
+			break
+		}
+
 		claimed, preclaimPrev, err := claimStateWithPrevious(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			return tickActiveStateRows(q,
 				state.StatusEQ(state.StatusNOT_FOUND),
@@ -417,6 +644,7 @@ func runNotFoundRecheckLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 			return state.PreviousStatusNOT_FOUND, state.StatusPROCESSED
 		})
 		if err != nil {
+			<-tickLoopSem // release slot on claim error
 			if ent.IsNotFound(err) {
 				break
 			}
@@ -428,6 +656,7 @@ func runNotFoundRecheckLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
+			defer func() { <-tickLoopSem }()
 			defer recoverGoroutine(ctx, "ticks/not-found-recheck-row")
 			executeNotFoundRecheckFull(ctx, d, r, prev)
 		}(claimed, preclaimPrev)
@@ -444,7 +673,17 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State) {
 	ctx, span := tickTracer.Start(ctx, "ticks/etl", tickSpanAttrs(row))
 	defer span.End()
 
-	// Phase 1: Download BI5 (≤12 concurrent to respect Dukascopy rate limits).
+	log.Printf("ticks: executing ETL for %s tick %s", row.Edges.Instrument.Name, row.Timestamp.Format(time.RFC3339))
+
+	// Phase 1: Download BI5 — two-layer throttle:
+	//   1. Rate gate (token bucket): caps global throughput at dukascopyMaxRPS req/s.
+	//      Prevents 503 flood when requests fail quickly (e.g. rate-limited responses).
+	//   2. Concurrency semaphore: caps simultaneous in-flight connections to dukascopyBurst.
+	select {
+	case <-tickDownloadRateGate:
+	case <-ctx.Done():
+		return
+	}
 	tickDownloadSem <- struct{}{}
 	data, err := downloadBI5(ctx, row)
 	<-tickDownloadSem
@@ -454,7 +693,21 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State) {
 			handleNotFoundStreak(ctx, d, row)
 		} else {
 			span.RecordError(err)
-			updateStateFailed(ctx, d, row)
+			// For rows that have exhausted most retries, a persistent non-404 error
+			// (e.g. 503 CDN unavailable) is treated as "data not at source".
+			// After maxRetryCount-2 failures the URL is very unlikely to ever return
+			// data; incrementing notFoundStreak lets the zero-row flow resolve the slot
+			// rather than letting retry_count exhaust and set ABANDONED.
+			//
+			// The threshold (maxRetryCount-2 = 3) gives the server 3 genuine retries
+			// before treating persistent 503s the same as 404s.
+			if row.RetryCount >= maxRetryCount-2 {
+				log.Printf("ingestion: %v for %s (retry=%d, traceID=%s) — treating persistent non-404 as not-found, incrementing streak",
+					err, row.ID, row.RetryCount, span.SpanContext().TraceID())
+				handleNotFoundStreak(ctx, d, row)
+			} else {
+				updateStateFailed(ctx, d, row)
+			}
 		}
 		return
 	}
@@ -495,6 +748,12 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck", tickSpanAttrs(row))
 	defer span.End()
 
+	// Two-layer throttle: rate gate first, then concurrency semaphore.
+	select {
+	case <-tickDownloadRateGate:
+	case <-ctx.Done():
+		return
+	}
 	tickDownloadSem <- struct{}{}
 	data, err := downloadBI5(ctx, row)
 	<-tickDownloadSem
@@ -504,20 +763,13 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 			// Still 404: increment streak (may trigger Zero-Row flow).
 			handleNotFoundStreak(ctx, d, row)
 		} else {
-			// System / network error: leave row as NOT_FOUND for the next cycle.
+			// System / network error (e.g. 503, timeout): set FAILED instead of NOT_FOUND.
+			// Reverting unconditionally to NOT_FOUND risks overwriting a CONFIRMED state
+			// that another goroutine may have already set, triggering a confirm loop.
+			// FAILED is picked up by the backfill-reset loop and retried safely.
 			span.RecordError(err)
-			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-			if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-				_, e := tx.State.UpdateOneID(row.ID).
-					SetPreviousStatus(state.PreviousStatusPROCESSED).
-					SetStatus(state.StatusNOT_FOUND).
-					SetUpdatedAt(time.Now().UTC()).
-					Save(ctx)
-				return e
-			}); e != nil {
-				span.RecordError(e)
-				log.Printf("NOT_FOUND revert for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), e)
-			}
+			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), err)
+			updateStateFailed(ctx, d, row)
 		}
 		return
 	}
@@ -539,7 +791,12 @@ func executeNotFoundRecheckFull(ctx context.Context, d *dal.DAL, row *ent.State,
 	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck-full", tickSpanAttrs(row))
 	defer span.End()
 
-	// Step 1: Download (rate-limited — same pool as BI5 downloads per §E.3).
+	// Step 1: Download — two-layer throttle (rate gate + concurrency semaphore).
+	select {
+	case <-tickDownloadRateGate:
+	case <-ctx.Done():
+		return
+	}
 	tickDownloadSem <- struct{}{}
 	data, err := downloadBI5(ctx, row)
 	<-tickDownloadSem
@@ -549,11 +806,24 @@ func executeNotFoundRecheckFull(ctx context.Context, d *dal.DAL, row *ent.State,
 			// Still 404: increment streak; may trigger Zero-Row flow.
 			handleNotFoundStreak(ctx, d, row)
 		} else {
-			// System / network error: leave row as NOT_FOUND for the next cycle.
+			// Non-404 error (503, timeout) during backfill NOT_FOUND recheck.
+			//
+			// This row was already NOT_FOUND before the recheck claim. A 503 here
+			// means the Dukascopy CDN returned a server error for a URL that was
+			// previously a 404 — the data almost certainly does not exist at source.
+			// Treating it as FAILED would consume a retry_count slot and eventually
+			// lead to ABANDONED without the zero-row flow ever firing.
+			//
+			// Instead: increment notFoundStreak (same as a 404 would do). If the
+			// streak reaches notFoundThreshold (3), commitZeroRowAndConfirm fires
+			// and the slot is permanently resolved as a market-holiday hour.
+			//
+			// Race safety: Phase B (runResetLoop) excludes PROCESSED+prev=NOT_FOUND
+			// rows from its claim filter, so no other goroutine will steal this row
+			// between the claim transaction and this handleNotFoundStreak call.
 			span.RecordError(err)
-			log.Printf("backfill NOT_FOUND recheck for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-			updateSimpleStatus(ctx, d, row,
-				state.PreviousStatusPROCESSED, state.StatusNOT_FOUND, "revert to NOT_FOUND")
+			log.Printf("backfill NOT_FOUND recheck for %s (traceID=%s): %v — treating as not-found, incrementing streak", row.ID, span.SpanContext().TraceID(), err)
+			handleNotFoundStreak(ctx, d, row)
 		}
 		return
 	}
@@ -627,6 +897,13 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 			if e != nil {
 				return e
 			}
+			var instName string
+			if row.Edges.Instrument != nil {
+				instName = row.Edges.Instrument.Name
+			} else {
+				instName = saved.InstrumentID.String()
+			}
+			log.Printf("ticks: successfully validated and CONFIRMED %s tick %s", instName, saved.Timestamp.Format(time.RFC3339))
 			return upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
 		}
 
@@ -655,14 +932,26 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 }
 
 // executeResetAction applies the Backfill Reset rule for a claimed row:
-//   - PROCESSED → PENDING (stuck worker recovery)
-//   - FAILED / BROKEN → PENDING with AddRetryCount(+1), or ABANDONED if ≥ 5
+//   - PROCESSED (prev=PENDING)  → PENDING  (orphaned ingestion goroutine — no retry increment)
+//   - PROCESSED (prev=PROCESSED)→ PENDING  (stuck validation claim — no retry increment)
+//   - FAILED / BROKEN           → PENDING  with AddRetryCount(+1), or ABANDONED if ≥ 5
+//
+// IMPORTANT: PreviousStatusPENDING MUST be handled explicitly.
+// runIngestionLoop sets previousStatus=PENDING when it claims a PENDING row.
+// Without this case, service restarts leave thousands of rows permanently stuck
+// in PROCESSED state — the reset loop would skip them forever.
 func executeResetAction(ctx context.Context, d *dal.DAL, row *ent.State) {
 	if row.PreviousStatus == nil {
 		return
 	}
 	switch *row.PreviousStatus {
+	case state.PreviousStatusPENDING:
+		// Orphaned by ingestion loop: ingestion goroutine was in-flight when the
+		// service restarted or the advisory lock expired. Reset to PENDING without
+		// incrementing RetryCount — the goroutine never completed any work.
+		resetStateToPending(ctx, d, row)
 	case state.PreviousStatusPROCESSED:
+		// Orphaned by validation loop (claimed COMPLETED → PROCESSED).
 		resetStateToPending(ctx, d, row)
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
 		handleRetryReset(ctx, d, row)
@@ -688,15 +977,23 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 // handleNotFoundStreak atomically increments NotFoundStreak.
 // If the new value reaches notFoundThreshold (3), it triggers the Zero-Row
 // Parquet commit flow. Otherwise, the row is set to NOT_FOUND.
+// Bidirectional counter rule: 404 → notFoundStreak++, retryCount-- (floor 0).
 func handleNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State) {
 	span := trace.SpanFromContext(ctx)
+
+	// 404 evidence reduces the retry penalty (floor 0).
+	newRetryCount := row.RetryCount - 1
+	if newRetryCount < 0 {
+		newRetryCount = 0
+	}
 
 	var updated *ent.State
 	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 		var e error
-		// Atomically increment and read the new streak value.
+		// Atomically increment streak and decrement retryCount.
 		updated, e = tx.State.UpdateOneID(row.ID).
 			AddNotFoundStreak(1).
+			SetRetryCount(newRetryCount).
 			SetUpdatedAt(time.Now().UTC()).
 			Save(ctx)
 		if e != nil {
@@ -720,6 +1017,9 @@ func handleNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 
 	if updated.NotFoundStreak >= notFoundThreshold {
+		// UpdateOneID.Save() does not load edges — carry the instrument edge
+		// from the original row so commitZeroRowAndConfirm can compute the R2 key.
+		updated.Edges = row.Edges
 		commitZeroRowAndConfirm(ctx, d, updated)
 	}
 }
@@ -881,11 +1181,20 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev state.PreviousStatus, next state.Status, errMsg string) {
 	span := trace.SpanFromContext(ctx)
 	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		_, e := tx.State.UpdateOneID(row.ID).
+		upd := tx.State.UpdateOneID(row.ID).
 			SetPreviousStatus(prev).
 			SetStatus(next).
-			SetUpdatedAt(time.Now().UTC()).
-			Save(ctx)
+			SetUpdatedAt(time.Now().UTC())
+		if next == state.StatusFAILED {
+			// Bidirectional counter rule: non-404 failure → notFoundStreak-- (floor 0).
+			// retryCount++ is handled by the reset loop (handleRetryReset).
+			newStreak := row.NotFoundStreak - 1
+			if newStreak < 0 {
+				newStreak = 0
+			}
+			upd = upd.SetNotFoundStreak(newStreak)
+		}
+		_, e := upd.Save(ctx)
 		return e
 	}); err != nil {
 		span.RecordError(err)
@@ -931,7 +1240,8 @@ func isNotFoundError(err error) bool { return errors.Is(err, errNotFound) }
 // downloadBI5 downloads the LZMA-compressed BI5 tick file from Dukascopy for
 // the instrument and UTC hour represented by row.  Returns errNotFound on 404.
 //
-// Uses tickDownloadSem (bounded ≤ 12) — must be called while holding a semaphore slot.
+// Must be called while holding BOTH a tickDownloadRateGate token AND a
+// tickDownloadSem slot (acquired by the callers in ticks.go).
 func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
 	ctx, span := tickTracer.Start(ctx, "ticks/download-bi5", tickSpanAttrs(row))
 	defer span.End()

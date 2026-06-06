@@ -49,6 +49,12 @@ COPY --from=builder /app/geonera-ingestion ./geonera-ingestion
 # Copy the OpenAPI spec — served at GET /openapi.yaml by the Fiber app
 COPY openapi.yaml ./openapi.yaml
 
+# Copy the SQL init script — read by EnsureSchema() at startup to bootstrap
+# the DB schema (master/ingestion schemas, tables, enum types, indexes).
+# EnsureSchema() uses os.ReadFile("database/init.sql") with a relative path,
+# so the file must be at /app/database/init.sql inside the container.
+COPY database/ ./database/
+
 # Drop privileges: run as the non-root geonera user
 USER geonera
 

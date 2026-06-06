@@ -9,15 +9,20 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/joho/godotenv"
+	"database/sql"
+
+	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/api"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/database"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
 	"github.com/sanjari-dev/geonera-ingestion/internal/mq"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
+	"github.com/sanjari-dev/geonera-ingestion/internal/runtimecollector"
 	"github.com/sanjari-dev/geonera-ingestion/internal/seed"
 	"github.com/sanjari-dev/geonera-ingestion/internal/telemetry"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
+	_ "github.com/sanjari-dev/geonera-ingestion/ent/runtime"
 )
 
 func main() {
@@ -64,6 +69,9 @@ func main() {
 	// ── DAL: enforces split-connection strategy ───────────────────────────────
 	appDAL := dal.New(dbClient, poolClient)
 
+	// ── Runtime metrics collector ─────────────────────────────────────────────
+	runtimecollector.Start()
+
 	// ── Cloudflare R2 client ──────────────────────────────────────────────────
 	r2Client, err := r2.New(r2.Config{
 		Endpoint:        os.Getenv("R2_ENDPOINT"),
@@ -86,6 +94,24 @@ func main() {
 		log.Fatalf("database migrate: %v", err)
 	}
 
+	// ── Database: ensure activity log table exists ────────────────────────────
+	if err := database.EnsureActivityLogTable(ctx); err != nil {
+		log.Fatalf("activity log migrate: %v", err)
+	}
+
+	// ── Activity Logger ───────────────────────────────────────────────────────
+	logDSN := os.Getenv("DATABASE_POOL_URL")
+	if logDSN == "" {
+		logDSN = os.Getenv("DATABASE_DIRECT_URL")
+	}
+	logDB, err := sql.Open("postgres", logDSN)
+	if err != nil {
+		log.Fatalf("activity log db: %v", err)
+	}
+	defer func() { _ = logDB.Close() }()
+	activityLogger := activitylog.New(logDB)
+	activityLogger.CloseOrphans(ctx)
+
 	// ── Seed: timeframes ──────────────────────────────────────────────────────
 	if err := seed.Timeframes(ctx, dbClient); err != nil {
 		log.Fatalf("seed timeframes: %v", err)
@@ -103,7 +129,7 @@ func main() {
 		}
 	}()
 
-	if err := mq.SetupConsumers(mqClient, appDAL); err != nil {
+	if err := mq.SetupConsumers(mqClient, appDAL, activityLogger); err != nil {
 		log.Fatalf("mq consumers: %v", err)
 	}
 
@@ -142,7 +168,7 @@ func main() {
 </html>`)
 	})
 
-	api.RegisterRoutes(app, appDAL)
+	api.RegisterRoutes(app, appDAL, activityLogger, r2Client)
 
 	port := os.Getenv("APP_PORT")
 	if port == "" {

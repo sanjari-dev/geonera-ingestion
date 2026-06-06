@@ -26,70 +26,31 @@ import (
 
 var candleTracer = otel.Tracer("worker/candles")
 
-const (
-	// language=PostgreSQL
-	candleAdvisoryLockSQL = "SELECT pg_try_advisory_xact_lock($1)"
-	// language=PostgreSQL
-	candleHeartbeatSQL = "SELECT true"
-)
 
 // RunCandleParentHandler is the single entry point for all candle-aggregation work.
-// It acquires LockIDCandle so Regular and Backfill modes cannot run concurrently.
+// It holds the global advisory lock for the full duration so no other job
+// (ticks, maintenance, sync) can run concurrently. If the lock is already
+// held the trigger is dropped immediately.
 //
 // mode must be either "REGULAR" or "BACKFILL".
-func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL) {
+func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
 	ctx, span := candleTracer.Start(ctx, fmt.Sprintf("RunCandleParentHandler_%s", mode))
 	defer span.End()
 
-	tx, err := d.AcquireAdvisoryLock(ctx)
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("candles %s: acquire lock (traceID=%s): %v", mode, span.SpanContext().TraceID(), err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	locked, err := tx.QueryBoolContext(ctx, candleAdvisoryLockSQL, dal.LockIDCandle)
-	if err != nil || !locked {
-		span.AddEvent("LockIDCandle already held by another instance, skipping")
-		return
-	}
-
-	lockCtx, cancelETL := context.WithCancel(ctx)
-	defer cancelETL()
-
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-lockCtx.Done():
-				return
-			case <-ticker.C:
-				hbCtx, hbCancel := context.WithTimeout(lockCtx, 5*time.Second)
-				_, err := tx.QueryBoolContext(hbCtx, candleHeartbeatSQL)
-				hbCancel()
-				if err != nil {
-					span.RecordError(fmt.Errorf("candle lock heartbeat lost: %w", err))
-					cancelETL()
-					return
-				}
-			}
+	return runWithLocks(ctx, d, "candles/"+mode, []int64{dal.LockIDCandle}, onStarted, func(lockCtx context.Context) {
+		var wg sync.WaitGroup
+		switch mode {
+		case "REGULAR":
+			wg.Add(1)
+			go runCandleRegular(lockCtx, d, &wg)
+		case "BACKFILL":
+			wg.Add(1)
+			go runCandleBackfill(lockCtx, d, &wg)
+		default:
+			log.Printf("candles: unknown mode %q", mode)
 		}
-	}()
-
-	var wg sync.WaitGroup
-	switch mode {
-	case "REGULAR":
-		wg.Add(1)
-		go runCandleRegular(lockCtx, d, &wg)
-	case "BACKFILL":
-		wg.Add(1)
-		go runCandleBackfill(lockCtx, d, &wg)
-	default:
-		log.Printf("candles: unknown mode %q", mode)
-	}
-	wg.Wait()
+		wg.Wait()
+	})
 }
 
 // runCandleRegular implements §4.F:
@@ -232,6 +193,8 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 //   - FAILED / BROKEN → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
 //
 // Processing is sequential (no goroutines): these are fast DB-only operations.
+// After all FAILED/BROKEN rows are exhausted, Phase C (runAbandonedResetPhase)
+// runs to give ABANDONED rows a fresh retry cycle if only CONFIRMED rows remain.
 func runCandleResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
@@ -255,6 +218,9 @@ func runCandleResetLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
 
 		executeCandleRetryReset(ctx, d, claimed)
 	}
+
+	// Phase C: last-resort reset for ABANDONED CANDLE rows.
+	runAbandonedResetPhase(ctx, d, span, state.JobTypeCANDLE)
 }
 
 func candleStateRows(q *ent.StateQuery, filters ...predicate.State) *ent.StateQuery {

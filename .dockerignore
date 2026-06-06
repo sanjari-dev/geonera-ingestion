@@ -15,8 +15,10 @@ Dockerfile
 *.md
 docs/
 
-# Database init scripts (only used by the postgres container, not the app)
-init.sql
+# Root-level init.sql is only for the PostgreSQL Docker container — not for the app.
+# The leading / ensures only the root file is excluded, NOT database/init.sql
+# which is read by EnsureSchema() at startup to bootstrap the DB schema.
+/init.sql
 
 # Editor / IDE artifacts
 .vscode/
