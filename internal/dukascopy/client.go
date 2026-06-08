@@ -65,7 +65,12 @@ func (c *Client) FetchBI5(ctx context.Context, instrument string, ts time.Time) 
 	if err != nil {
 		return nil, fmt.Errorf("dukascopy: %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			// ignore
+		}
+	}(resp.Body)
 
 	switch resp.StatusCode {
 	case http.StatusOK:

@@ -142,7 +142,12 @@ func ReadAll(data []byte) ([]Row, error) {
 	}
 	encoded := make([]parquetRow, n)
 	r := parquet.NewGenericReader[parquetRow](f)
-	defer r.Close()
+	defer func(r *parquet.GenericReader[parquetRow]) {
+		err := r.Close()
+		if err != nil {
+			// ignore
+		}
+	}(r)
 	got, err := r.Read(encoded)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("tickparquet read rows: %w", err)
@@ -178,7 +183,12 @@ func checkSchema(s *parquet.Schema) error {
 // timestamps fall within [hourStart, hourStart+1h).
 func checkBoundary(f *parquet.File, hourStart time.Time) error {
 	r := parquet.NewGenericReader[parquetRow](f)
-	defer r.Close()
+	defer func(r *parquet.GenericReader[parquetRow]) {
+		err := r.Close()
+		if err != nil {
+			// ignore
+		}
+	}(r)
 
 	rows := make([]parquetRow, f.NumRows())
 	n, err := r.Read(rows)

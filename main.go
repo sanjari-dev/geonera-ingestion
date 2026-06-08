@@ -5,12 +5,14 @@ import (
 	"log"
 	"os"
 
+	"database/sql"
+
 	"github.com/gofiber/contrib/otelfiber/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/joho/godotenv"
-	"database/sql"
 
+	_ "github.com/sanjari-dev/geonera-ingestion/ent/runtime"
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/api"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
@@ -22,7 +24,6 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/seed"
 	"github.com/sanjari-dev/geonera-ingestion/internal/telemetry"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
-	_ "github.com/sanjari-dev/geonera-ingestion/ent/runtime"
 )
 
 func main() {

@@ -37,7 +37,7 @@ FROM alpine:3.21
 # ca-certificates — for outbound HTTPS to Dukascopy datafeed and Cloudflare R2
 # tzdata          — ensures time.LoadLocation("UTC") resolves correctly
 RUN apk add --no-cache ca-certificates tzdata && \
-    # Create a dedicated non-root user/group for the process
+    # Create a dedicated non-root user/group for the process \
     addgroup -S geonera && \
     adduser  -S -G geonera -h /app -s /sbin/nologin geonera
 

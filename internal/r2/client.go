@@ -89,7 +89,12 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("r2 get %q: %w", key, err)
 	}
-	defer out.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			// ignore
+		}
+	}(out.Body)
 
 	data, err := io.ReadAll(out.Body)
 	if err != nil {

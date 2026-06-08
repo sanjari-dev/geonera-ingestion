@@ -3,8 +3,8 @@ package api
 import (
 	"context"
 
-	"github.com/google/uuid"
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
@@ -95,7 +95,7 @@ func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c 
 
 	// ── Object Storage Stats ──────────────────────────────────────────────────
 	// Returns file count and total bytes per instrument and job type.
-	// Results are cached for 5 minutes — first call may be slower on large buckets.
+	// Results are cached for 5 minutes — the first call may be slower on large buckets.
 	v1.Get("/storage", func(c *fiber.Ctx) error {
 		stats, err := r2c.StorageStats(c.Context())
 		if err != nil {
@@ -130,7 +130,7 @@ func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c 
 	})
 }
 
-// httpMeta builds the meta map stored in the activity log for HTTP triggers.
+// httpMeta builds the meta-map stored in the activity log for HTTP triggers.
 func httpMeta(c *fiber.Ctx) map[string]any {
 	return map[string]any{
 		"method":     c.Method(),
@@ -191,7 +191,7 @@ func extractOtelCtx(c *fiber.Ctx) context.Context {
 		c.UserContext(), // inherits the Fiber middleware server span
 		propagation.HeaderCarrier(c.GetReqHeaders()),
 	)
-	
+
 	// CRITICAL: Fiber's UserContext is tied to the HTTP request lifecycle.
 	// Since we return 202 Accepted immediately, Fiber will cancel this context,
 	// which would instantly kill the background worker spawned by the handler.

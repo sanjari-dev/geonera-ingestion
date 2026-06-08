@@ -187,7 +187,12 @@ func checkRows(f *parquet.File, dayStart time.Time) error {
 	}
 
 	r := parquet.NewGenericReader[parquetRow](f)
-	defer r.Close()
+	defer func(r *parquet.GenericReader[parquetRow]) {
+		err := r.Close()
+		if err != nil {
+			// ignore
+		}
+	}(r)
 
 	rows := make([]parquetRow, f.NumRows())
 	n, err := r.Read(rows)

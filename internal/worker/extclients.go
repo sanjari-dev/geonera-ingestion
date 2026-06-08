@@ -26,7 +26,7 @@ var errClientsNotInitialized = errors.New(
 )
 
 // InitClients wires up the Cloudflare R2 bucket client and the Dukascopy
-// HTTP client, and starts the download rate limiter goroutine.
+// HTTP client and starts the download rate limiter goroutine.
 // Must be called once at startup, before the HTTP server and MQ consumers are started.
 func InitClients(r2c *r2.Client, dc *dukascopy.Client) {
 	r2Client = r2c

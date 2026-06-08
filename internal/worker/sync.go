@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"entgo.io/ent/dialect/sql"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -20,7 +21,7 @@ var syncTracer = otel.Tracer("worker/sync")
 
 // RunSyncHandler processes all pending SyncTask (Outbox) events.
 // It holds the global advisory lock so sync cannot overlap with ticks,
-// candles, or maintenance. If the lock is already held the trigger is dropped.
+// candles, or maintenance. If the lock is already held, the trigger is dropped.
 func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 	ctx, span := syncTracer.Start(ctx, "RunSyncHandler")
 	defer span.End()
@@ -75,7 +76,12 @@ func claimOneSyncTaskInTx(ctx context.Context, tx *ent.Tx) (*ent.SyncTask, error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func(rows *sql.Rows) {
+		err := rows.Close()
+		if err != nil {
+			// ignore
+		}
+	}(rows)
 
 	if !rows.Next() {
 		return nil, rows.Err()
@@ -89,7 +95,7 @@ func claimOneSyncTaskInTx(ctx context.Context, tx *ent.Tx) (*ent.SyncTask, error
 	return task, rows.Err()
 }
 
-// processOneSyncTask claims one SyncTask and completes the recompute in the same
+// processOneSyncTask claims one SyncTask and completes the recomputing in the same
 // transaction scope.
 func processOneSyncTask(ctx context.Context, d *dal.DAL) (bool, error) {
 	ctx, span := syncTracer.Start(ctx, "sync/process-task")

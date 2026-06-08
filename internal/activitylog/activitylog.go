@@ -93,7 +93,7 @@ func (l *Logger) Cancel(id uuid.UUID) {
 
 // Complete updates the activity log entry with the job's finish time and
 // duration. It runs fire-and-forget in a goroutine so it never blocks the caller.
-// duration_ms is computed from triggered_at → finished_at in the database to avoid
+// Duration_ms is computed from triggered_at → finished_at in the database to avoid
 // clock skew between the INSERT goroutine and this call.
 func (l *Logger) Complete(id uuid.UUID) {
 	go func() {
@@ -120,7 +120,7 @@ type ListResult struct {
 // and/or triggerSrc. Entries are ordered newest-first.
 func (l *Logger) List(ctx context.Context, jobName, triggerSrc string, limit, offset int) (ListResult, error) {
 	where := "WHERE 1=1"
-	args := []any{}
+	var args []any
 	n := 1
 
 	if jobName != "" {
@@ -158,7 +158,12 @@ func (l *Logger) List(ctx context.Context, jobName, triggerSrc string, limit, of
 	if err != nil {
 		return ListResult{}, err
 	}
-	defer rows.Close()
+	defer func(rows *sql.Rows) {
+		err := rows.Close()
+		if err != nil {
+			// ignore
+		}
+	}(rows)
 
 	entries := make([]Entry, 0)
 	for rows.Next() {

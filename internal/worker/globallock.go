@@ -12,7 +12,7 @@ import (
 )
 
 // runWithLocks acquires one or more PostgreSQL transaction-level advisory locks
-// before calling fn. Each lock ID must be free; if any is already held the
+// before calling fn. Each lock ID must be free; if any is already held, the
 // trigger is dropped immediately (no retry — this is by design).
 //
 // onAcquired is called immediately after ALL locks are held, before fn starts.

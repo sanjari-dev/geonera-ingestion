@@ -288,8 +288,8 @@ func gapFillInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	}
 
 	// is_pause reflects whether stuck rows currently exist, not backfill completeness.
-	// A previously-paused instrument must be unpaused as soon as its stuck rows are
-	// resolved, so that forward workers can resume immediately.
+	// A previously paused instrument must be unpaused as soon as its stuck rows are
+	//  resolved so that forward workers can resume immediately.
 	newPause := hasStuck
 	if e := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(newPause).Save(ctx)
@@ -368,12 +368,12 @@ func insertStatePendingOnConflictDoNothing(
 // Returns (hasStuck=true, nil) if any hard-stuck rows exist.
 //
 // Stuck row definition:
-//   - FAILED  — persistent download error; worker cannot self-recover without intervention
-//   - BROKEN  — data integrity failure; requires manual investigation
+//   - FAILED — persistent download error; worker cannot self-recover without intervention
+//   - BROKEN — data integrity failure; requires manual investigation
 //
 // ABANDONED is intentionally excluded: it means the worker gave up after repeated "not found"
 // responses from the data source. This is semantically equivalent to NOT_FOUND — the data
-// simply does not exist at source (e.g., markets closed, public holiday) and should not
+// simply does not exist at a source (e.g., markets closed, public holiday) and should not
 // block forward processing or trigger a pause.
 //
 // PENDING and PROCESSED rows are also excluded: they are actively worked by the

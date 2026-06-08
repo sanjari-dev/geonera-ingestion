@@ -26,11 +26,11 @@ import (
 
 var candleTracer = otel.Tracer("worker/candles")
 
-
 // RunCandleParentHandler is the single entry point for all candle-aggregation work.
-// It holds the global advisory lock for the full duration so no other job
+// It holds the global advisory lock for the full duration, so no other job
 // (ticks, maintenance, sync) can run concurrently. If the lock is already
-// held the trigger is dropped immediately.
+//
+//	held, the trigger is dropped immediately.
 //
 // mode must be either "REGULAR" or "BACKFILL".
 func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
@@ -95,7 +95,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 
 // seedTodayCandleRows queries every active, unpaused instrument and attempts to insert a
 // CANDLE state row for today 00:00:00 UTC with Status=PENDING.
-// ON CONFLICT DO NOTHING means an existing row is silently skipped by PostgreSQL.
+// ON CONFLICT DO NOTHING means PostgreSQL silently skips an existing row.
 func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 

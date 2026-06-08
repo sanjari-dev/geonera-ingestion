@@ -13,7 +13,7 @@ import (
 
 // Snapshot is a point-in-time reading of the ingestion process resources.
 type Snapshot struct {
-	// CPUPercent is the process CPU utilisation percentage over the last sample
+	// CPUPercent is the process CPU utilization percentage over the last sample
 	// interval, computed from the Go scheduler's total CPU-seconds metric.
 	// Range: 0–100. Negative indicates not yet available (first sample pending).
 	CPUPercent float64 `json:"cpu_percent"`
@@ -33,7 +33,7 @@ type Snapshot struct {
 	// NumCPU is the number of logical CPUs usable by the process.
 	NumCPU int `json:"num_cpu"`
 
-	// GCCycles is the cumulative number of completed GC cycles since startup.
+	// GCCycles have been the cumulative number of completed GC cycles since startup.
 	GCCycles uint32 `json:"gc_cycles"`
 
 	// AvgGCPauseMs is the average stop-the-world GC pause in milliseconds,

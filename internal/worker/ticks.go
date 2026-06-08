@@ -35,17 +35,17 @@ const (
 
 	// dukascopyMaxRPS is the global maximum requests-per-second sent to Dukascopy.
 	// Aligned with dukascopyBurst (= concurrency cap) so every semaphore slot can
-	// fire once per second in steady state.  This prevents 503 thundering-herd
+	// fire once per second in a steady state.  This prevents 503 thundering-herds
 	// without slowing down the pipeline: a fresh worker saturates all 12 slots in
 	// the first second, then sustains 12 downloads/s.
 	dukascopyMaxRPS = 12
 
-	// dukascopyBurst is the token-bucket burst capacity — equals the concurrency cap
+	// dukascopyBurst is the token-bucket burst capacity — equals the concurrency cap,
 	// so the burst and sustained rate are identical (12 per second).
 	dukascopyBurst = dukascopyMaxRPS
 
 	// backfillMasterClaimLimit is the batch size for the Backfill "Master
-	// Bulk-Claim" (Mapping State.md §2): one FOR UPDATE SKIP LOCKED query locks
+	// Bulk-Claim" (Mapping State.md §2): a one FOR UPDATE SKIP LOCKED query locks
 	// up to this many rows per cycle, ordered oldest-Timestamp-first, and the
 	// program routes them in memory to the Ingestion / Reset / Validation
 	// layers based on each row's pre-claim status.
@@ -62,7 +62,7 @@ const (
 
 	// backfillExclusionHours is the "Zona Eksklusif" boundary (Mapping
 	// State.md §2): Backfill only ever claims rows timestamped at or before
-	// (current hour − this many hours) — i.e. T-3 and older — leaving the
+	// (current hour − this many hours) — i.e., T-3 and older — leaving the
 	// most recent hours to the T-0/T-1/T-2 Regular pipeline.
 	backfillExclusionHours = 3
 )
@@ -76,7 +76,7 @@ var tickDownloadSem = make(chan struct{}, dukascopyBurst)
 // A background goroutine (started by InitDownloadRateLimiter) refills it at
 // dukascopyMaxRPS tokens/second. Each download must receive one token before
 // acquiring tickDownloadSem, capping the actual request rate even when all
-// semaphore slots are free and requests return quickly (e.g. 503 errors).
+// semaphore slots are free and requests return quickly (e.g., 503 errors).
 var tickDownloadRateGate = make(chan struct{}, dukascopyBurst)
 
 // InitDownloadRateLimiter pre-fills the token bucket and starts the background
@@ -110,9 +110,10 @@ func InitDownloadRateLimiter() {
 var tickProcessSem = make(chan struct{}, 50)
 
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
-// It holds the global advisory lock for the full duration so no other job
+// It holds the global advisory lock for the full duration, so no other job
 // (candles, maintenance, sync) can run concurrently. If the lock is already
-// held the trigger is dropped immediately.
+//
+//	held, the trigger is dropped immediately.
 //
 // Mode must be either "REGULAR" or "BACKFILL".
 func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
@@ -176,15 +177,15 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	// T-2 Regular: only the IsActive filter — paused instruments still get validated.
 	// Per Mapping State.md §1.C, T-2 also claims NOT_FOUND rows for its hour and
 	// re-checks them against the API (data released → CONFIRMED, still empty →
-	// streak handling / Zero-Row at threshold) — not just COMPLETED rows.
+	// streak handling / Zero-Row at a threshold) — not just COMPLETED rows.
 	runValidationLoop(ctx, d, span, &target, false)
 }
 
 // ── Backfill: Master Bulk-Claim ───────────────────────────────────────────────
 //
 // Per Mapping State.md §2, Backfill no longer runs three independent claim
-// loops competing for rows under a shared goroutine-pool cap. Instead it
-// performs ONE master claim per cycle — FOR UPDATE SKIP LOCKED, oldest
+// loops competing for rows under a shared goroutine-pool cap. Instead, it
+// performs ONE master claim per cycle — FOR UPDATE SKIP LOCKED, the oldest
 // Timestamp first, limited to backfillMasterClaimLimit (120) rows, restricted
 // to the "Zona Eksklusif" (Timestamp <= T-3) — and routes the claimed batch to
 // the Ingestion / Reset / Validation layers entirely in memory.
@@ -206,7 +207,7 @@ const (
 	// full single-pass recheck (download → convert → upload → validate → CONFIRMED).
 	backfillLayerRecheck
 	// backfillLayerNone: the row was fully resolved inside the claim transaction
-	// itself (e.g. PROCESSED zombie or NOT_FOUND-with-low-streak → PENDING) —
+	// itself (e.g., PROCESSED zombie or NOT_FOUND-with-low streak → PENDING) —
 	// no further dispatch needed.
 	backfillLayerNone
 )
@@ -235,8 +236,8 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	ctx, span := tickTracer.Start(ctx, "runBackfillMasterLoop")
 	defer span.End()
 
-	// Phase A: fast bulk reset for orphaned PROCESSED (prev=PENDING) — cheap
-	// up-front sweep so the master claim below isn't spent one-row-at-a-time
+	// Phase A: fast bulk reset for orphaned PROCESSED (prev=PENDING) — inexpensive
+	// up-front sweep, so the master claim below isn't spent one-row-at-a-time
 	// on rows whose outcome is already known (see runBackfillBulkOrphanReset).
 	runBackfillBulkOrphanReset(ctx, d, span)
 
@@ -247,8 +248,8 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	runAbandonedResetPhase(ctx, d, span, state.JobTypeTICK)
 }
 
-// runBackfillBulkOrphanReset is Phase A of the backfill sweep: a fast bulk
-// UPDATE that resets orphaned PROCESSED rows (previous_status = PENDING — i.e.
+// runBackfillBulkOrphanReset is Phased A of the backfill sweep: a fast bulk
+// UPDATE that resets orphaned PROCESSED rows (previous_status = PENDING — i.e.,
 // an ingestion goroutine was in-flight when the service restarted or the
 // advisory lock expired) back to PENDING in batches of 500, without spending a
 // master-claim slot on each one individually.
@@ -294,7 +295,7 @@ func runBackfillBulkOrphanReset(ctx context.Context, d *dal.DAL, span trace.Span
 
 // runBackfillMasterClaimLoop implements the documented "Master Bulk-Claim"
 // strategy (Mapping State.md §2): repeatedly lock up to backfillMasterClaimLimit
-// rows in a single FOR UPDATE SKIP LOCKED query (oldest Timestamp first, Timestamp
+// rows in a single FOR UPDATE SKIP LOCKED query (the oldest Timestamp first, Timestamp
 // <= T-3), apply the per-row claim transition based on each row's pre-claim
 // status, and dispatch the routed batch to its handler — all without an
 // artificial goroutine-pool cap. The only real throttles are the download
@@ -383,7 +384,7 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 			case state.StatusPROCESSED:
 				// Zombie row from a previous in-flight attempt. Per Mapping
 				// State.md §2.B, PROCESSED zombies go straight back to PENDING
-				// with no counter mutation — resolved entirely at claim time.
+				// with no counter-mutation — resolved entirely at claim time.
 				newPrev, newStatus, layer = state.PreviousStatusPROCESSED, state.StatusPENDING, backfillLayerNone
 
 			case state.StatusFAILED:
@@ -404,8 +405,8 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 					newPrev, newStatus, layer = state.PreviousStatusNOT_FOUND, state.StatusPROCESSED, backfillLayerRecheck
 				} else {
 					// Layer B: streak still below threshold — simply requeue for
-					// a fresh download attempt next cycle. No counter mutation
-					// (Mapping State.md §2.B: "Kembalikan antrean ... PENDING").
+					// a fresh download attempt next cycle. No counter-mutation
+					// (Mapping State.md §2.B: "... PENDING").
 					newPrev, newStatus, layer = state.PreviousStatusNOT_FOUND, state.StatusPENDING, backfillLayerNone
 				}
 
@@ -488,7 +489,7 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 //
 // Used by T-0 (current-hour ingestion) with a non-nil timestamp — at most one
 // row per active instrument, so the natural fan-out is small. Backfill no
-// longer drives this loop; its PENDING rows are claimed and dispatched as part
+// longer drives this loop; it is PENDING rows are claimed and dispatched as part
 // of the Master Bulk-Claim (see runBackfillMasterClaimLoop / claimBackfillMasterBatch).
 //
 // Concurrency is bounded by the real bottlenecks deeper in the pipeline —
@@ -648,7 +649,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 	loopWg.Wait()
 }
 
-// runAbandonedResetPhase is Phase C — the absolute last resort — of the
+// runAbandonedResetPhase is a Phase C — the absolute last resort — of the
 // backfill reset pipeline.
 //
 // It fires at the end of runBackfillMasterLoop (TICK) and runCandleResetLoop
@@ -659,7 +660,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 // work that still has a normal recovery path.
 //
 // Condition: if every active row for jobType is either CONFIRMED or ABANDONED
-// (count of PENDING/PROCESSED/FAILED/BROKEN/NOT_FOUND/COMPLETED == 0) — i.e.
+// (count of PENDING/PROCESSED/FAILED/BROKEN/NOT_FOUND/COMPLETED == 0) — i.e.,
 // the master claim above found nothing left to do — then ABANDONED rows are
 // reset to PENDING with RetryCount=0, in batches of backfillMasterClaimLimit
 // (120) so the reset moves in the same 120-row increments as the rest of the
@@ -667,9 +668,9 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 //
 // Why RetryCount=0: ABANDONED rows previously exhausted their 5 retries. Resetting
 // to 0 gives them a full fresh cycle rather than immediately re-abandoning them.
-// If they fail again they will naturally accumulate retries and be abandoned again.
+// If they fail again, they will naturally accumulate retries and be abandoned again.
 //
-// After the reset, the maintenance gap-fill will see freshly-updated PENDING rows
+// After the reset, the maintenance gap-fill will see freshly updated PENDING rows
 // (UpdatedAt=now, not stale), conclude there are no stuck rows, and clear IsPause.
 // The next backfill trigger will then process them.
 func runAbandonedResetPhase(ctx context.Context, d *dal.DAL, span trace.Span, jobType state.JobType) {
@@ -711,7 +712,7 @@ func runAbandonedResetPhase(ctx context.Context, d *dal.DAL, span trace.Span, jo
 	// All non-abandoned rows are CONFIRMED. Reset ABANDONED → PENDING in batches
 	// of backfillMasterClaimLimit (120) — the same unit the master-claim uses
 	// for its main sweep, so the whole backfill pipeline moves in consistent
-	// 120-row increments end to end (Mapping State.md: "...sebanyak 120 task").
+	// 120-row increments end to end (Mapping State.md: "...as much 120 task").
 	const batchSize = backfillMasterClaimLimit
 	var totalReset int
 	for ctx.Err() == nil {
@@ -768,7 +769,7 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State) {
 
 	// Phase 1: Download BI5 — two-layer throttle:
 	//   1. Rate gate (token bucket): caps global throughput at dukascopyMaxRPS req/s.
-	//      Prevents 503 flood when requests fail quickly (e.g. rate-limited responses).
+	//      Prevents 503 flood when requests fail quickly (e.g., rate-limited responses).
 	//   2. Concurrency semaphore: caps simultaneous in-flight connections to dukascopyBurst.
 	select {
 	case <-tickDownloadRateGate:
@@ -785,8 +786,8 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State) {
 		} else {
 			span.RecordError(err)
 			// For rows that have exhausted most retries, a persistent non-404 error
-			// (e.g. 503 CDN unavailable) is treated as "data not at source".
-			// After maxRetryCount-2 failures the URL is very unlikely to ever return
+			// (e.g., 503 CDN unavailable) is treated as "data not at source".
+			// After maxRetryCount-2 failures, the URL is very unlikely to ever return
 			// data; incrementing notFoundStreak lets the zero-row flow resolve the slot
 			// rather than letting retry_count exhaust and set ABANDONED.
 			//
@@ -854,9 +855,9 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 			// Still 404: increment streak (may trigger Zero-Row flow).
 			handleNotFoundStreak(ctx, d, row)
 		} else {
-			// System / network error (e.g. 503, timeout): set FAILED instead of NOT_FOUND.
+			// System / network error (e.g., 503, timeout): set FAILED instead of NOT_FOUND.
 			// Reverting unconditionally to NOT_FOUND risks overwriting a CONFIRMED state
-			// that another goroutine may have already set, triggering a confirm loop.
+			// that another goroutine may have already set, triggering a confirmation loop.
 			// FAILED is picked up by the backfill-reset loop and retried safely.
 			span.RecordError(err)
 			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), err)
@@ -901,7 +902,7 @@ func executeNotFoundRecheckFull(ctx context.Context, d *dal.DAL, row *ent.State,
 			//
 			// This row was already NOT_FOUND before the recheck claim. A 503 here
 			// means the Dukascopy CDN returned a server error for a URL that was
-			// previously a 404 — the data almost certainly does not exist at source.
+			// previously a 404 — the data almost certainly does not exist at a source.
 			// Treating it as FAILED would consume a retry_count slot and eventually
 			// lead to ABANDONED without the zero-row flow ever firing.
 			//
@@ -912,7 +913,7 @@ func executeNotFoundRecheckFull(ctx context.Context, d *dal.DAL, row *ent.State,
 			// Race safety: the master-claim transaction already flipped this row's
 			// Status to PROCESSED (see claimBackfillMasterBatch's "recheck" routing),
 			// so it no longer matches any claim filter — T-0/T-1/T-2 target different
-			// timestamp windows and the next backfill master-claim only matches the
+			// timestamp windows, and the next backfill master-claim only matches the
 			// status set IN (PENDING, PROCESSED, FAILED, BROKEN, COMPLETED, NOT_FOUND)
 			// with PreviousStatus left untouched here. No other goroutine can steal
 			// this row between the claim transaction and this handleNotFoundStreak call.
@@ -1045,7 +1046,7 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 // handleNotFoundStreak atomically increments NotFoundStreak.
 // If the new value reaches notFoundThreshold (3), it triggers the Zero-Row
 // Parquet commit flow. Otherwise, the row is set to NOT_FOUND.
-// Bidirectional counter rule: 404 → notFoundStreak++, retryCount-- (floor 0).
+// Bidirectional counter-rule: 404 → notFoundStreak++, retryCount-- (floor 0).
 func handleNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State) {
 	span := trace.SpanFromContext(ctx)
 
@@ -1086,7 +1087,7 @@ func handleNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State) {
 
 	if updated.NotFoundStreak >= notFoundThreshold {
 		// UpdateOneID.Save() does not load edges — carry the instrument edge
-		// from the original row so commitZeroRowAndConfirm can compute the R2 key.
+		// from the original row, so commitZeroRowAndConfirm can compute the R2 key.
 		updated.Edges = row.Edges
 		commitZeroRowAndConfirm(ctx, d, updated)
 	}
@@ -1154,11 +1155,11 @@ func commitZeroRowAndConfirm(ctx context.Context, d *dal.DAL, row *ent.State) {
 // the same atomic transaction (floor 0), mirroring how handleNotFoundStreak
 // decrements RetryCount whenever NotFoundStreak is incremented. This keeps the
 // two error counters from accumulating independently across overlapping
-// failure modes (e.g. a row that alternates between 404s and 503s).
+// failure modes (e.g., a row that alternates between 404s and 503s).
 func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 	span := trace.SpanFromContext(ctx)
 	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		// Bidirectional counter rule: retry penalty reduces the not-found credit (floor 0).
+		// Bidirectional counter-rule: retry penalty reduces the not-found credit (floor 0).
 		newStreak := row.NotFoundStreak - 1
 		if newStreak < 0 {
 			newStreak = 0
@@ -1268,7 +1269,7 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 			SetStatus(next).
 			SetUpdatedAt(time.Now().UTC())
 		if next == state.StatusFAILED {
-			// Bidirectional counter rule: non-404 failure → notFoundStreak-- (floor 0).
+			// Bidirectional counter-rule: non-404 failure → notFoundStreak-- (floor 0).
 			// retryCount++ is handled by the reset loop (handleRetryReset).
 			newStreak := row.NotFoundStreak - 1
 			if newStreak < 0 {

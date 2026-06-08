@@ -9,11 +9,11 @@ import (
 
 // Advisory lock IDs for the smart-lock compatibility matrix.
 //
-//	Ticks       (1001) — held by ticks/regular and ticks/backfill
-//	Candle      (1002) — held by candles/regular and candles/backfill
-//	Sync        (1004) — held by sync only (prevents sync+sync overlap)
+//	Ticks (1001) — held by ticks/regular and ticks/backfill
+//	Candle (1002) — held by candles/regular and candles/backfill
+//	Sync (1004) — held by sync only (prevents sync+sync overlap)
 //	Maintenance acquires BOTH LockIDTick + LockIDCandle, which means it can
-//	   only run when no ticks AND no candles job is running, and vice-versa.
+//	   only run when no ticks AND no candles job is running, and vice versa.
 //
 // Ticks and Candles can run simultaneously (different lock IDs).
 // Sync is independent of ticks/candles and may overlap with them.
@@ -25,7 +25,7 @@ const (
 
 // DAL enforces the split-connection strategy.
 //
-// lock is a direct TCP connection to PostgreSQL that bypasses PgBouncer.
+// Lock is a direct TCP connection to PostgreSQL that bypasses PgBouncer.
 // It is used exclusively by Parent Handlers to hold a transaction-level
 // advisory lock for the full duration of an ETL run.
 //
