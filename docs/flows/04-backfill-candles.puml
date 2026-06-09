@@ -1,0 +1,129 @@
+@startuml 04-backfill-candles
+title Geonera Ingestion — 4. Backfill Candles (Sweeper, every 20 minutes)
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontColor #1B1B1B
+skinparam ArrowColor #546E7A
+skinparam ArrowFontColor #37474F
+
+skinparam activity {
+  BackgroundColor #FAFAFA
+  BorderColor #546E7A
+  FontColor #1B1B1B
+  FontSize 13
+
+  BackgroundColor<<lock>> #EF6C00
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #A34B00
+
+  BackgroundColor<<db>> #1565C0
+  FontColor<<db>> #FFFFFF
+  BorderColor<<db>> #0B3C78
+
+  BackgroundColor<<r2>> #2E7D32
+  FontColor<<r2>> #FFFFFF
+  BorderColor<<r2>> #1B5E20
+
+  BackgroundColor<<api>> #AD1457
+  FontColor<<api>> #FFFFFF
+  BorderColor<<api>> #6A0F38
+}
+
+skinparam activityDiamond {
+  BackgroundColor #FFF3CD
+  BorderColor #C79100
+  FontColor #5D4037
+}
+
+skinparam legend {
+  BackgroundColor #FFFFFF
+  BorderColor #90A4AE
+  FontColor #1B1B1B
+  FontSize 12
+  EntrySeparatorColor #CFD8DC
+}
+
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9A227
+  FontColor #3E3E3E
+}
+
+legend right
+  |= Tag |= Meaning |
+  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
+  |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
+  |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+endlegend
+
+start
+:runCandleParentHandler(ctx, "BACKFILL", dal);<<lock>>
+note right
+  Triggered by queue jobs.candles.backfill
+  (ideally every 20 minutes, starting at minute :04 — i.e. :04, :24, :44).
+  Acquires LockIDCandle (1002); mutually exclusive with Candles Regular.
+  Acts as background sweeper for failed/lagging CANDLE aggregation jobs.
+end note
+
+:Claim CANDLE rows belonging to instruments
+where IsActive = true & IsPause = false, matching:
+ (a) Status IN (FAILED, BROKEN, PROCESSED) — claimed
+     immediately, no UpdatedAt staleness check, OR
+ (b) Status = PENDING **and** ResolvedTickCount = 24
+     (a lagging-but-ready aggregation job);
+
+if (Which category was claimed?) then (a — FAILED / BROKEN / PROCESSED: needs reset)
+  :**Reset path**;
+  note right
+    *** Important CANDLE-specific exception ***
+    On the generic TICK flow, PROCESSED -> PENDING
+    recovery does NOT bump RetryCount.
+    For CANDLE, a stuck PROCESSED row indicates a
+    daily aggregation that got interrupted, so
+    RetryCount IS incremented even for this transition.
+  end note
+  :AddRetryCount(+1) — atomic SQL increment
+  (applies uniformly to FAILED, BROKEN,
+  and stuck PROCESSED -> PENDING for CANDLE);
+  if (RetryCount >= 5 ?) then (yes)
+    :Status -> ABANDONED
+    (stop the infinite retry loop,
+    requires manual engineer intervention);
+  else (no, still under the limit)
+    :Status -> PENDING
+    (will be picked up again on a
+    future Backfill or Regular pass);
+  endif
+
+else (b — PENDING & ResolvedTickCount = 24: ready for catch-up)
+  :**Catch-up execution path**;
+  note right
+    Runs the exact same aggregation routine
+    as the Regular 05:08 UTC run — see
+    03-candles-regular.puml ("Stage B").
+  end note
+  :Claim -> Update Status = PROCESSED;
+  :Stream-based Aggregation (O(1) memory):
+  read 24 hourly Tick Parquet files from R2,
+  one at a time, accumulate OHLCV for
+  19 timeframes, then drop raw rows;<<r2>>
+  :Build & upload 1 daily Parquet file
+  to the Candles folder in R2;<<r2>>
+
+  if (Outcome?) then (Success)
+    :Status -> COMPLETED -> instantly
+    verified -> CONFIRMED;
+  elseif () then (Failure — Overwrite Policy applies on retry)
+    :Status -> FAILED
+    (re-evaluated again on the
+    next Backfill Candles pass);
+  else (Storage anomaly: NoSuchKey + IsDeleted=false)
+    :Status -> BROKEN;
+  endif
+endif
+
+:wg.Done() — join point
+(Parent Handler releases LockIDCandle);
+stop
+
+@enduml

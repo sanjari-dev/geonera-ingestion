@@ -1,0 +1,159 @@
+@startuml 05-maintenance
+title Geonera Ingestion — 5. Maintenance: Auto-Seeder, Gap-Fill & Pruning
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontColor #1B1B1B
+skinparam ArrowColor #546E7A
+skinparam ArrowFontColor #37474F
+
+skinparam activity {
+  BackgroundColor #FAFAFA
+  BorderColor #546E7A
+  FontColor #1B1B1B
+  FontSize 13
+
+  BackgroundColor<<lock>> #EF6C00
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #A34B00
+
+  BackgroundColor<<db>> #1565C0
+  FontColor<<db>> #FFFFFF
+  BorderColor<<db>> #0B3C78
+
+  BackgroundColor<<r2>> #2E7D32
+  FontColor<<r2>> #FFFFFF
+  BorderColor<<r2>> #1B5E20
+
+  BackgroundColor<<api>> #AD1457
+  FontColor<<api>> #FFFFFF
+  BorderColor<<api>> #6A0F38
+}
+
+skinparam activityDiamond {
+  BackgroundColor #FFF3CD
+  BorderColor #C79100
+  FontColor #5D4037
+}
+
+skinparam legend {
+  BackgroundColor #FFFFFF
+  BorderColor #90A4AE
+  FontColor #1B1B1B
+  FontSize 12
+  EntrySeparatorColor #CFD8DC
+}
+
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9A227
+  FontColor #3E3E3E
+}
+
+legend right
+  |= Tag |= Meaning |
+  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
+  |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
+  |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+endlegend
+
+start
+:runMaintenanceHandler(ctx, dal);<<lock>>
+note right
+  Triggered by queue jobs.maintenance
+  (ideally every 5 minutes, starting at minute :02).
+  Acquires LockIDMaintenance (1003) via Direct Connection.
+  Idempotent, batched, and processed strictly per-instrument
+  to avoid timeouts, OOM, and long table locks.
+end note
+
+split
+  ' ============== Forward Seeding ==============
+  :**A. Forward Seeding (Batched)**
+  Iterate over each Active instrument, per JobType;
+  :Find MAX(timestamp) for that
+  (instrument_id, job_type) pair
+  — the job_type filter is MANDATORY
+  to avoid TICK/CANDLE ambiguity;
+  :Build a forward chunk of new rows,
+  capped at e.g. **30 days (720 hours)**
+  per single iteration;
+  :Upsert (INSERT ... ON CONFLICT DO NOTHING)
+  until the chunk limit or time.Now().UTC()
+  is reached;<<db>>
+  note right: Remaining days are picked up\nautomatically on the next 5-minute trigger
+
+split again
+  ' ============== Historical Sync & Gap Detection ==============
+  :**B. Historical Sync & Gap Detection (Batched)**
+  Compare MIN(timestamp) WHERE job_type='TICK'
+  AND status='CONFIRMED' against
+  Instrument.StartDate;
+
+  if (Is MIN(timestamp) NULL?) then (yes — brand-new instrument)
+    :Edge case: instrument has never been
+    ingested at all. Keep seeding forward
+    from StartDate toward "now" gradually,
+    **WITHOUT** ever enabling IsPause;
+  elseif (MIN(timestamp) > StartDate ?) then (yes — a gap exists)
+    :Backward batched insertion — gradually
+    Upsert empty rows toward the past
+    to close the gap;
+    :Run the deterministic check
+    **isBackfillComplete(instrumentID, startDate, minConfirmedTime)**:
+    1. Compute the Expected Hours Count
+       between StartDate and MIN(timestamp)
+    2. Count rows in that range that are
+       genuinely *stuck*: FAILED, BROKEN,
+       ABANDONED, or PROCESSED/PENDING with
+       UpdatedAt older than 24h.
+       (NOT_FOUND rows still within their
+       normal wait cycle — NotFoundStreak < 3 —
+       are explicitly EXCLUDED from this count);
+    if (Stuck/error rows are blocking MIN from\nregressing toward StartDate?) then (yes — persistent upstream corruption)
+      :**Set Instrument.IsPause = true**
+      (stop wasting retries on a
+      jammed instrument, isolates it
+      for engineer review);
+    else (no blocking rows found)
+      :Gap will continue to close
+      naturally over future iterations;
+    endif
+  else (MIN(timestamp) <= StartDate — already complete)
+  endif
+
+  if (Is MIN(timestamp WHERE CONFIRMED) now\nstable and reaching StartDate?) then (yes)
+    :**Resume: set Instrument.IsPause = false**;
+  endif
+
+split again
+  ' ============== Pruning ==============
+  :**C. Pruning — Mark & Sweep (2-Phase Commit, Batched)**;
+  note right
+    DB delete + R2 delete cannot be made atomic
+    together — a 2-phase Mark & Sweep avoids
+    permanently orphaned objects in storage.
+  end note
+  :**Phase 1 — Mark (Soft Delete)**
+  UPDATE a batch of rows SET IsDeleted = true
+  WHERE timestamp < Instrument.StartDate
+  AND IsDeleted = false;<<db>>
+  note right: Marked rows are immediately\nignored by every ETL worker
+  :**Phase 2 — Sweep (Hard Delete)**
+  Fetch a batch of rows WHERE IsDeleted = true;
+  :For each row, request object deletion
+  from Cloudflare R2 first;<<r2>>
+  if (R2 responded success or NoSuchKey\n(object already gone)?) then (yes)
+    :ONLY THEN issue the physical
+    DELETE in PostgreSQL (hard-delete);<<db>>
+  else (R2 timeout / error)
+    :Leave the row as IsDeleted = true,
+    it will be retried automatically
+    on the next Pruning cycle (idempotent);
+  endif
+end split
+
+:wg.Done() x3 — join point
+(Parent Handler releases LockIDMaintenance);
+stop
+
+@enduml

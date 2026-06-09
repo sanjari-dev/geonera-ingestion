@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Geonera Ingestion — Flow Diagram Viewer</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+
+    <!-- ===================== Sidebar ===================== -->
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <div>
+          <h1>Geonera Ingestion</h1>
+          <p>Flow diagram viewer</p>
+        </div>
+      </div>
+
+      <input id="search" class="search" type="search" placeholder="Search diagrams…" autocomplete="off" />
+
+      <nav id="diagram-list" class="diagram-list"><!-- populated by app.js --></nav>
+
+      <div class="sidebar-footer">
+        <button id="toggle-theme" class="ghost-btn" title="Toggle light / dark UI chrome">
+          <span id="theme-icon">🌙</span> <span id="theme-label">Dark UI</span>
+        </button>
+        <details class="settings">
+          <summary>Render settings</summary>
+          <label class="field">
+            <span>PlantUML server</span>
+            <input id="server-url" type="text" spellcheck="false"
+                   placeholder="https://www.plantuml.com/plantuml" />
+          </label>
+          <p class="hint">
+            Point this at your own local PlantUML server
+            (e.g. <code>http://localhost:8080</code> running the
+            <code>plantuml/plantuml-server</code> Docker image) to render
+            fully offline / privately. Leave as-is to use the public server.
+          </p>
+          <label class="field row">
+            <span>Output format</span>
+            <select id="format-select">
+              <option value="svg">SVG (crisp, recommended)</option>
+              <option value="png">PNG</option>
+            </select>
+          </label>
+          <button id="reset-server" class="ghost-btn small">Reset to default</button>
+        </details>
+      </div>
+    </aside>
+
+    <!-- ===================== Main viewer ===================== -->
+    <main class="viewer">
+      <header class="toolbar">
+        <div class="toolbar-title">
+          <h2 id="diagram-title">Select a diagram</h2>
+          <p id="diagram-subtitle"></p>
+        </div>
+        <div class="toolbar-actions">
+          <button id="zoom-out"  class="icon-btn" title="Zoom out">−</button>
+          <span id="zoom-level" class="zoom-level">100%</span>
+          <button id="zoom-in"   class="icon-btn" title="Zoom in">+</button>
+          <button id="zoom-fit"  class="icon-btn" title="Fit to screen">⤢</button>
+          <button id="zoom-reset" class="icon-btn" title="Reset zoom (100%)">1:1</button>
+          <span class="sep"></span>
+          <button id="toggle-source" class="icon-btn" title="Show / hide PlantUML source">{ }</button>
+          <a id="open-raw" class="icon-btn" title="Open raw .puml file" target="_blank" rel="noopener">↗</a>
+          <a id="download-image" class="icon-btn" title="Download rendered diagram" download>⬇</a>
+        </div>
+      </header>
+
+      <div class="stage-wrap">
+        <div id="stage" class="stage">
+          <div id="pan-zoom" class="pan-zoom">
+            <img id="diagram-img" alt="Rendered PlantUML diagram" draggable="false" />
+          </div>
+          <div id="empty-state" class="empty-state">
+            <p>👈 Pick a process from the list to render it here.</p>
+            <p class="muted">Diagrams are rendered live from the <code>.puml</code> sources —
+               no need to copy/paste into editor.plantuml.com.</p>
+          </div>
+          <div id="loading" class="loading hidden">Rendering…</div>
+          <div id="error" class="error hidden"></div>
+        </div>
+
+        <pre id="source-pane" class="source-pane hidden"><code id="source-code"></code></pre>
+      </div>
+
+      <footer class="status-bar">
+        <span id="status-text">Drag to pan • Scroll / pinch to zoom • Double-click to fit</span>
+      </footer>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,136 @@
+@startuml 06-sync-outbox
+title Geonera Ingestion — 6. Sync: Outbox Worker (SyncTask drain)
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontColor #1B1B1B
+skinparam ArrowColor #546E7A
+skinparam ArrowFontColor #37474F
+
+skinparam activity {
+  BackgroundColor #FAFAFA
+  BorderColor #546E7A
+  FontColor #1B1B1B
+  FontSize 13
+
+  BackgroundColor<<lock>> #EF6C00
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #A34B00
+
+  BackgroundColor<<db>> #1565C0
+  FontColor<<db>> #FFFFFF
+  BorderColor<<db>> #0B3C78
+
+  BackgroundColor<<r2>> #2E7D32
+  FontColor<<r2>> #FFFFFF
+  BorderColor<<r2>> #1B5E20
+
+  BackgroundColor<<api>> #AD1457
+  FontColor<<api>> #FFFFFF
+  BorderColor<<api>> #6A0F38
+}
+
+skinparam activityDiamond {
+  BackgroundColor #FFF3CD
+  BorderColor #C79100
+  FontColor #5D4037
+}
+
+skinparam legend {
+  BackgroundColor #FFFFFF
+  BorderColor #90A4AE
+  FontColor #1B1B1B
+  FontSize 12
+  EntrySeparatorColor #CFD8DC
+}
+
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9A227
+  FontColor #3E3E3E
+}
+
+legend right
+  |= Tag |= Meaning |
+  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
+  |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
+  |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+endlegend
+
+start
+:runSyncHandler(ctx, dal);<<lock>>
+note right
+  Triggered by queue jobs.sync (every 5 minutes).
+  Acquires LockIDSync (1004) via Direct Connection.
+  Implements the consumer side of the
+  **Transactional Outbox Pattern** (see 6.1) —
+  guarantees ResolvedTickCount is recomputed
+  reliably even across crashes / lost updates.
+end note
+
+note right
+  ** Reminder — how SyncTask rows get created (publish side, NOT this process): **
+  Whenever a TICK row reaches a terminal/demoted state
+  (-> CONFIRMED, or CONFIRMED -> BROKEN demotion) inside
+  the T-2 / Backfill-Validate workers, an
+  "INSERT ... ON CONFLICT (instrument_id, target_date)
+  DO UPDATE SET status = EXCLUDED.status" is executed
+  in the SAME DB transaction as the status change —
+  this both records the event AND resurrects/ resets
+  any existing task for that day back to PENDING.
+end note
+
+:processSyncTask(ctx, dal)
+via dal.ExecuteInPool (PgBouncer connection);
+:**Atomic claim using a CTE**:
+"SELECT ... FROM sync_tasks
+ WHERE status='PENDING'
+ FOR UPDATE SKIP LOCKED ...
+ then UPDATE status='PROCESSED'"
+executed as a single statement
+(no read-after-read, no race window);<<db>>
+
+if (Did the claim return a task?) then (no PENDING task available)
+  :Nothing to do this cycle — return nil;
+else (yes — task claimed & marked PROCESSED)
+  :Derive the day window:
+  startOfDay = task.TargetDate
+  endOfDay   = startOfDay + 24h;
+  :**Idempotent Recompute** —
+  COUNT(*) State WHERE
+   JobType = TICK,
+   InstrumentID = task.InstrumentID,
+   Timestamp IN [startOfDay, endOfDay),
+   Status = CONFIRMED
+  (the ONLY status counted as "resolved");<<db>>
+  :UPDATE the matching CANDLE State row
+  (JobType=CANDLE, same instrument & day):
+  SET ResolvedTickCount = actualCount,
+      UpdatedAt = time.Now().UTC();<<db>>
+  if (actualCount < 24 ?) then (yes — incomplete day)
+    :Also SET Status = PENDING
+    on that CANDLE row — prevents a
+    stale/corrupt Candle aggregation
+    after an upstream Tick demotion;
+  else (== 24, day fully resolved)
+    :Candle row remains eligible for
+    aggregation (ResolvedTickCount = 24
+    is exactly what 03-candles-regular.puml checks for);
+  endif
+  :**Conditional DELETE** of the SyncTask:
+  WHERE id = task.ID AND status = 'PROCESSED';<<db>>
+  note right
+    ** Lost-Update mitigation **
+    If, while steps 3-4 were running, a NEW
+    TICK event re-upserted this same task back
+    to PENDING (publish side), this DELETE's
+    WHERE clause matches zero rows — so the
+    task safely survives for reprocessing on
+    the very next Sync cycle. No event is lost.
+  end note
+endif
+
+:wg.Done() — join point
+(Parent Handler releases LockIDSync);
+stop
+
+@enduml

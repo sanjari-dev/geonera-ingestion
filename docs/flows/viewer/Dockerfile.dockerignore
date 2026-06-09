@@ -1,0 +1,27 @@
+# Named `Dockerfile.dockerignore` (not plain `.dockerignore`) on purpose:
+# the build CONTEXT for this image is `docs/flows/` (the parent of this
+# `viewer/` folder — the server needs both the viewer app and the sibling
+# `.puml` sources in one image), but a plain `.dockerignore` is only read
+# from the context root. BuildKit (the default builder since Docker 23.0)
+# additionally honors a Dockerfile-adjacent `<dockerfile>.dockerignore`,
+# which is exactly what this file is — kept right next to the Dockerfile
+# it governs, regardless of where the build context root happens to be.
+
+# VCS / editor / OS cruft
+**/.git
+**/.gitignore
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+
+# Node (none of this exists here today, but keep the image lean if it ever does)
+**/node_modules
+**/npm-debug.log*
+
+# Docker meta files themselves
+**/Dockerfile
+**/docker-compose*.yml
+**/.dockerignore
+
+# Docs not needed at runtime (kept in source control, not in the image)
+**/README.md

@@ -1,0 +1,53 @@
+##
+## Geonera Ingestion — Flow Diagram Viewer (deploy from published image)
+##
+## Unlike docker-compose.yml (which BUILDS the image locally from ./Dockerfile),
+## this file just RUNS the already-published image — mirrors the pattern used
+## by the main stack's docker-compose.portainer.yml (pulling
+## `sansalfian/geonera-*` images rather than building on the host).
+##
+## Use this to deploy the viewer on a server (incl. via Portainer → Stacks →
+## Web editor) without checking out the source at all.
+##
+## Stack-level env vars you may override before deploying:
+##   IMAGE_TAG   default: latest
+##   PORT        default: 4040   (host port the viewer is published on)
+##
+## Network: attaches to `geonera_geonera` — the network created by the main
+## stack (docker-compose.portainer.yml defines `networks.geonera`, which
+## Portainer prefixes with the stack name "geonera", yielding
+## `geonera_geonera`). Joining it lets this viewer reach / be reached by the
+## ingestion stack's services directly by container name (e.g. `ingestion`,
+## `admin-backend`) over the internal Docker network — useful if you ever
+## want to point "Render settings" at an internal PlantUML server, or front
+## everything with a shared reverse proxy container on that same network.
+## It is declared `external: true` because the main stack must already be
+## deployed (and therefore own/create that network) before this one joins it.
+##
+
+services:
+  flow-viewer:
+    image: "sansalfian/geonera-ingestion-docs:${IMAGE_TAG:-latest}"
+    container_name: geonera-docs
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4040}:4040"
+    environment:
+      PORT: "4040"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4040/viewer/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - geonera_geonera
+
+networks:
+  geonera_geonera:
+    external: true

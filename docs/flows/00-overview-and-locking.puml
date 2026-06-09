@@ -1,0 +1,144 @@
+@startuml 00-overview-and-locking
+title Geonera Ingestion — 0. Overview: Trigger, Parent Handler & Advisory Lock
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontColor #1B1B1B
+skinparam ArrowColor #546E7A
+skinparam ArrowFontColor #37474F
+
+skinparam activity {
+  BackgroundColor #FAFAFA
+  BorderColor #546E7A
+  FontColor #1B1B1B
+  FontSize 13
+
+  BackgroundColor<<lock>> #EF6C00
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #A34B00
+
+  BackgroundColor<<db>> #1565C0
+  FontColor<<db>> #FFFFFF
+  BorderColor<<db>> #0B3C78
+
+  BackgroundColor<<r2>> #2E7D32
+  FontColor<<r2>> #FFFFFF
+  BorderColor<<r2>> #1B5E20
+
+  BackgroundColor<<api>> #AD1457
+  FontColor<<api>> #FFFFFF
+  BorderColor<<api>> #6A0F38
+}
+
+skinparam activityDiamond {
+  BackgroundColor #FFF3CD
+  BorderColor #C79100
+  FontColor #5D4037
+}
+
+skinparam legend {
+  BackgroundColor #FFFFFF
+  BorderColor #90A4AE
+  FontColor #1B1B1B
+  FontSize 12
+  EntrySeparatorColor #CFD8DC
+}
+
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9A227
+  FontColor #3E3E3E
+}
+
+legend right
+  |= Tag |= Meaning |
+  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
+  |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
+  |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+endlegend
+
+|#E8EAF6|MQ / Trigger|
+|#FFF3E0|Parent Handler (Lock Layer)|
+|#ECF6EF|Worker Group (Pool Connection)|
+
+start
+
+|MQ / Trigger|
+:Message received from one of the queues;
+note right
+  6 Main Queues -> 6 Main Processes:
+  1) jobs.ticks.regular     -> Ticks Regular        (every hour, minute :05)
+  2) jobs.ticks.backfill    -> Backfill Ticks       (every 10 minutes)
+  3) jobs.candles.regular   -> Candles Regular      (seed 00:00 UTC, aggregate 05:08 UTC)
+  4) jobs.candles.backfill  -> Backfill Candles     (every 20 minutes, from minute :04)
+  5) jobs.maintenance       -> Maintenance          (every 5 minutes, from minute :02)
+  6) jobs.sync              -> Sync (Outbox Worker) (every 5 minutes)
+
+  See the detailed flow of each process in:
+   01-ticks-regular.puml
+   02-backfill-ticks.puml
+   03-candles-regular.puml
+   04-backfill-candles.puml
+   05-maintenance.puml
+   06-sync-outbox.puml
+end note
+
+switch (Which queue triggered it?)
+case ( jobs.ticks.regular / jobs.ticks.backfill )
+  :runTickParentHandler(mode);<<lock>>
+  note right: mode = REGULAR or BACKFILL
+case ( jobs.candles.regular / jobs.candles.backfill )
+  :runCandleParentHandler(mode);<<lock>>
+  note right: mode = REGULAR or BACKFILL
+case ( jobs.maintenance )
+  :runMaintenanceHandler();<<lock>>
+case ( jobs.sync )
+  :runSyncHandler();<<lock>>
+endswitch
+
+|Parent Handler (Lock Layer)|
+:dal.AcquireAdvisoryLock(ctx)
+**Direct Connection** (bypass PgBouncer);
+:pg_try_advisory_xact_lock(LockID);
+note right
+  Lock ID constants (avoid magic numbers):
+  LockIDTick        = 1001  -> Ticks Regular & Backfill
+  LockIDCandle      = 1002  -> Candles Regular & Backfill
+  LockIDMaintenance = 1003  -> Auto-Seeder & Pruning
+  LockIDSync        = 1004  -> Outbox Worker
+end note
+
+if (Lock acquired?) then (no / already held by another instance)
+  :Record span event "lock already acquired,
+  skipping execution";
+  stop
+else (yes, exclusive lock obtained)
+endif
+
+:Start Lock Health Monitor goroutine
+(heartbeat 'SELECT true' every 30s via lockCtx,
+cancels the whole ETL context if the
+direct connection drops — HA failover safety);
+:Fork child goroutines (wg.Add + go func),
+each carrying lockCtx (OTel trace) & DAL.pool
+(PgBouncer connection for fast claim/update);
+
+note right
+  REGULAR mode forks 3 goroutines: T-0, T-1, T-2
+  BACKFILL mode forks 3 goroutines: Ingest, Reset, Validate
+  MAINTENANCE forks 3 goroutines: Seeder, Gap-Fill, Pruning
+  Each child MUST register deferred panic-recovery
+  + defer wg.Done() so the lock is never held hostage.
+end note
+
+:wg.Wait() — wait for all forked
+sub-processes to finish (Fork-Join);
+
+|Parent Handler (Lock Layer)|
+:cancelETL() — stop the Lock Health Monitor;
+:tx.Rollback() — release
+pg_try_advisory_xact_lock (defer guarantee,
+runs even on panic / context cancel);
+stop
+
+@enduml

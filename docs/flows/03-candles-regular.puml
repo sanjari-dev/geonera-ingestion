@@ -1,0 +1,143 @@
+@startuml 03-candles-regular
+title Geonera Ingestion — 3. Candles Regular (Daily Seeding & Main Aggregation)
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontColor #1B1B1B
+skinparam ArrowColor #546E7A
+skinparam ArrowFontColor #37474F
+
+skinparam activity {
+  BackgroundColor #FAFAFA
+  BorderColor #546E7A
+  FontColor #1B1B1B
+  FontSize 13
+
+  BackgroundColor<<lock>> #EF6C00
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #A34B00
+
+  BackgroundColor<<db>> #1565C0
+  FontColor<<db>> #FFFFFF
+  BorderColor<<db>> #0B3C78
+
+  BackgroundColor<<r2>> #2E7D32
+  FontColor<<r2>> #FFFFFF
+  BorderColor<<r2>> #1B5E20
+
+  BackgroundColor<<api>> #AD1457
+  FontColor<<api>> #FFFFFF
+  BorderColor<<api>> #6A0F38
+}
+
+skinparam activityDiamond {
+  BackgroundColor #FFF3CD
+  BorderColor #C79100
+  FontColor #5D4037
+}
+
+skinparam legend {
+  BackgroundColor #FFFFFF
+  BorderColor #90A4AE
+  FontColor #1B1B1B
+  FontSize 12
+  EntrySeparatorColor #CFD8DC
+}
+
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9A227
+  FontColor #3E3E3E
+}
+
+legend right
+  |= Tag |= Meaning |
+  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
+  |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
+  |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+endlegend
+
+start
+:runCandleParentHandler(ctx, "REGULAR", dal);<<lock>>
+note right
+  Acquires LockIDCandle (1002) via Direct Connection.
+  This process is the final link in the chain — it never
+  contacts Dukascopy; it only aggregates already-CONFIRMED
+  Tick Parquet files from R2 into 19-timeframe daily Candles.
+end note
+
+split
+  ' ============== Daily Seeding ==============
+  :**Stage A — Daily Seeding (Initialize PENDING)**
+  Triggered once per day at 00:00 UTC;
+  :Iterate over instruments where
+  IsActive = true & IsPause = false;
+  :Upsert (INSERT ... ON CONFLICT DO NOTHING):
+  JobType = CANDLE, timestamp = 00:00:00 of that day,
+  Status = PENDING, ResolvedTickCount = 0;
+  :Booking row ready — waiting for the
+  Sync Outbox Worker to fill ResolvedTickCount
+  as the day's Ticks become CONFIRMED;
+
+split again
+  ' ============== Main Aggregation ==============
+  :**Stage B — Main Aggregation Run (05:08 UTC)**
+  The extra ~5h08m delay gives the previous day's
+  24 hourly Tick rows time to fully reach CONFIRMED;
+  :Claim: JobType=CANDLE, Status=PENDING,
+  Instrument Active & !Paused, AND
+  **ResolvedTickCount = 24** (mandatory —
+  all 24 hours of that day reached terminal CONFIRMED);
+  :Update -> PROCESSED (atomic claim);
+
+  :**Stream-based Aggregation — O(1) memory footprint**
+  Read the 24 hourly Tick Parquet files from
+  R2 ONE AT A TIME (never bulk-download or stage to disk);<<r2>>
+  repeat
+    :Parse the file's rows and accumulate
+    Open/High/Low/Close/VWAP/Spread/Volume
+    into in-memory OHLCV accumulators
+    for all 19 standard timeframes;
+    if (Is this a Zero-Row (holiday) file?) then (yes)
+      :Skip price computation for this hour,
+      continue the streaming loop;
+    elseif (R2 returned NoSuchKey?) then (yes)
+      if (Related Tick State.IsDeleted == true?) then (yes — pruning side-effect)
+        :Safe to skip — file was
+        intentionally removed by Pruning;
+      else (no — IsDeleted == false)
+        :Genuine storage anomaly!
+        Mark this Candle job -> BROKEN
+        (a CONFIRMED tick MUST have a physical file);
+      endif
+    endif
+    :Drop this hour's raw rows from memory
+    before moving to the next file
+    (guarantees O(1) footprint);
+  repeat while (More of the 24 hours remain?) is (yes) not (no, all processed)
+
+  :Build exactly **1 daily Parquet file**
+  covering all 19 timeframes
+  (flat/empty content if the whole day was a holiday);
+  :Upload the aggregated file to
+  R2 candles/{instrument}/{YYYY}/candles-...-{date}.parquet;<<r2>>
+
+  if (Outcome?) then (Upload succeeded)
+    :Status -> COMPLETED;
+    :Run an instant verification pass
+    -> promote Status -> CONFIRMED;
+  elseif () then (Storage anomaly: valid NoSuchKey on a non-deleted Tick)
+    :Status -> BROKEN
+    (queued for the Backfill Candles
+    reset/retry cycle);
+  else (Other aggregation / upload failure)
+    :Status -> FAILED
+    (will be retried by Backfill Candles,
+    AddRetryCount(+1) on each retry pass);
+  endif
+end split
+
+:wg.Done() — join point
+(Parent Handler releases LockIDCandle);
+stop
+
+@enduml

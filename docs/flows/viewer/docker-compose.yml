@@ -1,0 +1,31 @@
+# Geonera Ingestion — Flow Diagram Viewer
+#
+# One-liner to build & run the containerized viewer:
+#
+#   cd docs/flows/viewer
+#   docker compose up -d --build
+#
+# Then open http://localhost:4040/viewer/
+#
+# `context: ..` is intentional — see Dockerfile's header comment: the image
+# needs both this `viewer/` app AND the sibling `../*.puml` sources, so the
+# build context must be `docs/flows/` (this file's parent directory).
+
+services:
+  flow-viewer:
+    build:
+      context: ..
+      dockerfile: viewer/Dockerfile
+    image: geonera-flow-viewer:latest
+    container_name: geonera-flow-viewer
+    restart: unless-stopped
+    ports:
+      - "4040:4040"
+    environment:
+      PORT: "4040"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4040/viewer/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3

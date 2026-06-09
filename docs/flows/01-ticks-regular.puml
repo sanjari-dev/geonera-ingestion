@@ -1,0 +1,195 @@
+@startuml 01-ticks-regular
+title Geonera Ingestion — 1. Ticks Regular (T-0 / T-1 / T-2)
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontColor #1B1B1B
+skinparam ArrowColor #546E7A
+skinparam ArrowFontColor #37474F
+
+skinparam activity {
+  BackgroundColor #FAFAFA
+  BorderColor #546E7A
+  FontColor #1B1B1B
+  FontSize 13
+
+  BackgroundColor<<lock>> #EF6C00
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #A34B00
+
+  BackgroundColor<<db>> #1565C0
+  FontColor<<db>> #FFFFFF
+  BorderColor<<db>> #0B3C78
+
+  BackgroundColor<<r2>> #2E7D32
+  FontColor<<r2>> #FFFFFF
+  BorderColor<<r2>> #1B5E20
+
+  BackgroundColor<<api>> #AD1457
+  FontColor<<api>> #FFFFFF
+  BorderColor<<api>> #6A0F38
+}
+
+skinparam activityDiamond {
+  BackgroundColor #FFF3CD
+  BorderColor #C79100
+  FontColor #5D4037
+}
+
+skinparam legend {
+  BackgroundColor #FFFFFF
+  BorderColor #90A4AE
+  FontColor #1B1B1B
+  FontSize 12
+  EntrySeparatorColor #CFD8DC
+}
+
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #C9A227
+  FontColor #3E3E3E
+}
+
+legend right
+  |= Tag |= Meaning |
+  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
+  |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
+  |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+endlegend
+
+start
+:runTickParentHandler(ctx, "REGULAR", dal);<<lock>>
+note right
+  Triggered by queue jobs.ticks.regular,
+  expected to fire every hour at minute :05 (e.g. 10:05 UTC).
+  Runs only after LockIDTick (1001) is acquired
+  via the Direct Connection (see 00-overview-and-locking.puml).
+end note
+
+split
+  ' ===================== T-0 =====================
+  :**T-0 — Current Hour (Real-time Ingestion)**
+  Target timestamp = current running hour
+  (e.g. run at 10:05 -> target 10:00:00 UTC);
+  :Claim: JobType=TICK, Status=PENDING,
+  Instrument.IsPause=false & IsActive=true
+  (FOR UPDATE SKIP LOCKED via DAL.ExecuteInPool);
+  :Update -> PROCESSED
+  (SetPreviousStatus = old status, atomic);
+  :Download raw BI5 file from Dukascopy API;<<api>>
+  note right: Bounded Semaphore — hard cap **12** concurrent goroutines\n(primary defense against HTTP 429 Too Many Requests)
+  :Convert BI5 integer format -> Parquet
+  (Decimal/BigInt, using Instrument.Divider);
+  note right: CPU-bound; runs outside the 12-slot limiter\nbut still guarded by a **separate** Bounded Semaphore (e.g. max 50)
+  :Upload the resulting Parquet file to
+  Cloudflare R2 (ticks/{instrument}/{YYYY}/{MM}/...);<<r2>>
+  note right: I/O-bound; shares the same 50-slot semaphore\nas the convert step to keep RAM usage stable
+
+  if (ETL Result?) then (Success)
+    :Status -> COMPLETED;
+  elseif () then (Source returns 404 / no data)
+    :AddNotFoundStreak(+1) — atomic SQL increment
+    (never read-modify-write in Go memory);
+    if (NotFoundStreak >= 3 ?) then (yes)
+      :Build Zero-Row Parquet in memory;
+      :Atomically update DB: IsHoliday = true
+      **(must commit BEFORE uploading to R2)**;
+      :Upload Zero-Row Parquet to R2;<<r2>>
+      :Status -> CONFIRMED;
+    else (not yet)
+      :Status -> NOT_FOUND;
+    endif
+  elseif () then (Handled error: network/system)
+    :Status -> FAILED;
+  else (Unhandled panic / crash mid-flight)
+    :Row stays PROCESSED (stuck);
+    note right: Will be swept up later by\nT-1 (Regular) or Backfill Reset Group
+  endif
+
+split again
+  ' ===================== T-1 =====================
+  :**T-1 — Previous Hour (Recovery & Retry / Safety Net)**
+  Target timestamp = one hour before current
+  (e.g. run at 10:05 -> target 09:00:00 UTC);
+  :Claim: Status IN (PENDING, PROCESSED, FAILED, NOT_FOUND),
+  Instrument.IsPause=false & IsActive=true;
+
+  if (Claimed row's status?) then (PROCESSED — stuck/zombie worker)
+    :Sweep & reset directly -> PENDING
+    (no RetryCount change for TICK);
+  elseif () then (PENDING)
+    :Refresh / remains PENDING;
+  elseif () then (FAILED)
+    :AddRetryCount(+1) — atomic;
+    if (RetryCount >= 5 ?) then (yes)
+      :Status -> ABANDONED
+      (prevents infinite retry loop,
+      requires manual engineer intervention);
+    else (no)
+      :Status -> PENDING (will be retried);
+    endif
+  else (NOT_FOUND)
+    if (Re-checking source: data now available?) then (yes — was just delayed)
+      :Reset NotFoundStreak = 0 — atomic;
+      :Status -> PENDING (re-attempt ingestion);
+    else (still empty)
+      :AddNotFoundStreak(+1) — atomic;
+      if (NotFoundStreak >= 3 ?) then (yes — confirmed permanent holiday)
+        :**Strict ordered Zero-Row procedure**
+        (T-1 takes over autonomously to avoid
+        partial-failure loops):
+        1. Build Zero-Row Parquet in memory
+        2. Update DB IsHoliday=true FIRST (atomic commit)
+        3. Upload Zero-Row Parquet to R2
+        4. Read back & physically validate (6.3)
+        5. Status -> CONFIRMED + insert SyncTask (outbox);<<db>>
+      else (still within tolerance)
+        :Status remains NOT_FOUND;
+      endif
+    endif
+  endif
+
+split again
+  ' ===================== T-2 =====================
+  :**T-2 — Two Hours Ago (Physical Validation & Promotion)**
+  Target timestamp = two hours before current
+  (e.g. run at 10:05 -> target 08:00:00 UTC);
+  :Claim: Status = COMPLETED,
+  Instrument.IsActive = true;
+  note right
+    T-2 ONLY validates already-uploaded files —
+    it never downloads from Dukascopy, and it
+    never touches stray PROCESSED rows
+    (that is exclusively Reset/Backfill's job).
+  end note
+  :Read the Parquet object directly from
+  Cloudflare R2 (no re-download from source);<<r2>>
+  :Run **Physical Parquet Validation** (criteria 6.3):
+  - File existence & size > 0
+  - Magic number PAR1 + footer integrity
+  - Schema matching (columns, types, precision)
+  - Data continuity & 1-hour boundary check
+    (zero-row rows are valid only if IsHoliday=true);
+
+  if (Validation result?) then (PASSED)
+    :Status -> CONFIRMED (terminal / final);
+    :Insert SyncTask (outbox event) in the
+    **same DB transaction** as the status update,
+    to keep ResolvedTickCount in sync;<<db>>
+  else (FAILED — corrupt / schema mismatch / bad boundary)
+    :Status -> BROKEN
+    (queued for re-ingestion via Backfill,
+    Overwrite Policy applies on retry);
+    if (PreviousStatus == CONFIRMED ?) then (yes — demotion case)
+      :Also insert a demotion SyncTask
+      transactionally, to trigger
+      ResolvedTickCount recompute;<<db>>
+    endif
+  endif
+end split
+
+:wg.Done() x3 — join point
+(Parent Handler's wg.Wait() can now
+proceed to release the advisory lock);
+stop
+
+@enduml
