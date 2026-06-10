@@ -70,6 +70,16 @@ split
   :**T-0 — Current Hour (Real-time Ingestion)**
   Target timestamp = current running hour
   (e.g. run at 10:05 -> target 10:00:00 UTC);
+  :Query all instruments WHERE IsActive=true AND IsPause=false;<<db>>
+  :For each instrument: INSERT PENDING row at target
+  using INSERT ... ON CONFLICT DO NOTHING;<<db>>
+  note right
+    Safety-net seed — guarantees every eligible
+    instrument has a PENDING task for this hour
+    even if the maintenance worker has not yet
+    seeded it (brand-new or just reactivated).
+    Rows that already exist are silently skipped.
+  end note
   :Claim: JobType=TICK, Status=PENDING,
   Instrument.IsPause=false & IsActive=true
   (FOR UPDATE SKIP LOCKED via DAL.ExecuteInPool);
@@ -77,28 +87,27 @@ split
   (SetPreviousStatus = old status, atomic);
   :Download raw BI5 file from Dukascopy API;<<api>>
   note right: Bounded Semaphore — hard cap **12** concurrent goroutines\n(primary defense against HTTP 429 Too Many Requests)
-  :Convert BI5 integer format -> Parquet
-  (Decimal/BigInt, using Instrument.Divider);
-  note right: CPU-bound; runs outside the 12-slot limiter\nbut still guarded by a **separate** Bounded Semaphore (e.g. max 50)
-  :Upload the resulting Parquet file to
-  Cloudflare R2 (ticks/{instrument}/{YYYY}/{MM}/...);<<r2>>
-  note right: I/O-bound; shares the same 50-slot semaphore\nas the convert step to keep RAM usage stable
 
-  if (ETL Result?) then (Success)
+  if (Download result?) then (2xx — data received)
+    :Reset NotFoundStreak = 0 (if non-zero);<<db>>
+    :Convert BI5 integer format -> Parquet
+    (Decimal/BigInt, using Instrument.Divider);
+    note right: CPU-bound; semaphore capped at **runtime.NumCPU()**\n(saturates all cores without over-subscribing)
+    :Upload the resulting Parquet file to
+    Cloudflare R2 (ticks/{instrument}/{YYYY}/{MM}/...);<<r2>>
+    note right: I/O-bound; shares the same NumCPU-slot semaphore\nas the convert step
     :Status -> COMPLETED;
-  elseif () then (Source returns 404 / no data)
-    :AddNotFoundStreak(+1) — atomic SQL increment
-    (never read-modify-write in Go memory);
-    if (NotFoundStreak >= 3 ?) then (yes)
-      :Build Zero-Row Parquet in memory;
-      :Atomically update DB: IsHoliday = true
-      **(must commit BEFORE uploading to R2)**;
-      :Upload Zero-Row Parquet to R2;<<r2>>
-      :Status -> CONFIRMED;
-    else (not yet)
-      :Status -> NOT_FOUND;
-    endif
-  elseif () then (Handled error: network/system)
+  elseif () then (404 — no data at source)
+    :SetNotFoundStreak = 1
+    (T-0 PENDING rows are always freshly seeded —
+    streak is guaranteed 0, so set to 1 is exact);<<db>>
+    :Status -> NOT_FOUND;
+    note right
+      Zero-Row Parquet is NOT committed in T-0.
+      T-1 uploads Zero-Row at streak=2 (no validation).
+      T-2 validates the existing file at streak=3 → CONFIRMED.
+    end note
+  elseif () then (non-2xx / non-404 — system error)
     :Status -> FAILED;
   else (Unhandled panic / crash mid-flight)
     :Row stays PROCESSED (stuck);
@@ -110,80 +119,106 @@ split again
   :**T-1 — Previous Hour (Recovery & Retry / Safety Net)**
   Target timestamp = one hour before current
   (e.g. run at 10:05 -> target 09:00:00 UTC);
-  :Claim: Status IN (PENDING, PROCESSED, FAILED, NOT_FOUND),
+  :Claim: Status IN (PENDING, PROCESSED, FAILED, **BROKEN**, NOT_FOUND),
   Instrument.IsPause=false & IsActive=true;
+  note right
+    "Claim" di sini berarti pengambilan task untuk diproses.
+    PreviousStatus dicatat sebagai record status sebelum di-claim —
+    bukan sebagai logic routing.
+  end note
 
-  if (Claimed row's status?) then (PROCESSED — stuck/zombie worker)
+  if (Status sebelum di-claim?) then (PROCESSED — stuck/zombie worker)
     :Sweep & reset directly -> PENDING
     (no RetryCount change for TICK);
   elseif () then (PENDING)
     :Refresh / remains PENDING;
-  elseif () then (FAILED)
-    :AddRetryCount(+1) — atomic;
-    if (RetryCount >= 5 ?) then (yes)
-      :Status -> ABANDONED
-      (prevents infinite retry loop,
-      requires manual engineer intervention);
-    else (no)
-      :Status -> PENDING (will be retried);
-    endif
+  elseif () then (FAILED or BROKEN)
+    :AddRetryCount(+1), SetNotFoundStreak(-1 min 0) — atomic;<<db>>
+    :Status -> PENDING;
+    note right
+      No ABANDONED cap — retry is unbounded
+      for T-1 recovery. RetryCount keeps
+      growing but never triggers ABANDONED.
+    end note
   else (NOT_FOUND)
-    if (Re-checking source: data now available?) then (yes — was just delayed)
-      :Reset NotFoundStreak = 0 — atomic;
-      :Status -> PENDING (re-attempt ingestion);
-    else (still empty)
-      :AddNotFoundStreak(+1) — atomic;
-      if (NotFoundStreak >= 3 ?) then (yes — confirmed permanent holiday)
-        :**Strict ordered Zero-Row procedure**
-        (T-1 takes over autonomously to avoid
-        partial-failure loops):
-        1. Build Zero-Row Parquet in memory
-        2. Update DB IsHoliday=true FIRST (atomic commit)
-        3. Upload Zero-Row Parquet to R2
-        4. Read back & physically validate (6.3)
-        5. Status -> CONFIRMED + insert SyncTask (outbox);<<db>>
-      else (still within tolerance)
-        :Status remains NOT_FOUND;
-      endif
+    :Download raw BI5 file from Dukascopy API;<<api>>
+    note right: Rate gate + Semaphore (same throttle as T-0)
+    if (Download result?) then (2xx — data now available)
+      :SetNotFoundStreak = 0 — atomic;<<db>>
+      :Status -> PENDING (re-attempt on next cycle);
+    elseif () then (404 — still empty)
+      :AddNotFoundStreak(+1) — streak: 1 → 2
+      Set IsHoliday = true
+      **DB commit BEFORE R2 upload**;<<db>>
+      :Build Zero-Row Parquet in memory;
+      :Upload Zero-Row Parquet to R2;<<r2>>
+      :Status -> NOT_FOUND;
+      note right
+        No validation at T-1.
+        T-2 re-downloads; at streak=3
+        executeValidation (reads R2) → CONFIRMED.
+      end note
+    else (non-2xx / non-404 error)
+      :Status -> FAILED;
     endif
   endif
 
 split again
   ' ===================== T-2 =====================
-  :**T-2 — Two Hours Ago (Physical Validation & Promotion)**
+  :**T-2 — Two Hours Ago (Cross-Validation & Promotion)**
   Target timestamp = two hours before current
   (e.g. run at 10:05 -> target 08:00:00 UTC);
-  :Claim: Status = COMPLETED,
+  :Claim: Status IN (COMPLETED, NOT_FOUND),
   Instrument.IsActive = true;
-  note right
-    T-2 ONLY validates already-uploaded files —
-    it never downloads from Dukascopy, and it
-    never touches stray PROCESSED rows
-    (that is exclusively Reset/Backfill's job).
-  end note
-  :Read the Parquet object directly from
-  Cloudflare R2 (no re-download from source);<<r2>>
-  :Run **Physical Parquet Validation** (criteria 6.3):
-  - File existence & size > 0
-  - Magic number PAR1 + footer integrity
-  - Schema matching (columns, types, precision)
-  - Data continuity & 1-hour boundary check
-    (zero-row rows are valid only if IsHoliday=true);
+  :Download raw BI5 file from Dukascopy API;<<api>>
+  note right: Rate gate + Semaphore (same throttle as T-0)
 
-  if (Validation result?) then (PASSED)
-    :Status -> CONFIRMED (terminal / final);
-    :Insert SyncTask (outbox event) in the
-    **same DB transaction** as the status update,
-    to keep ResolvedTickCount in sync;<<db>>
-  else (FAILED — corrupt / schema mismatch / bad boundary)
-    :Status -> BROKEN
-    (queued for re-ingestion via Backfill,
-    Overwrite Policy applies on retry);
-    if (PreviousStatus == CONFIRMED ?) then (yes — demotion case)
-      :Also insert a demotion SyncTask
-      transactionally, to trigger
-      ResolvedTickCount recompute;<<db>>
+  if (Claimed status + Download result?) then (COMPLETED + 2xx)
+    note right: Re-download matches T-0 source — cross-validation
+    :Reset NotFoundStreak = 0 (if non-zero);<<db>>
+    :Convert BI5 → Parquet;
+    :Upload (overwrite) to Cloudflare R2;<<r2>>
+    :Run **Physical Parquet Validation** (criteria 6.3):
+    - File existence & size > 0
+    - Magic number PAR1 + footer integrity
+    - Schema matching (columns, types, precision)
+    - Data continuity & 1-hour boundary check;
+    if (Validation result?) then (PASSED)
+      :Status -> CONFIRMED;
+      :Insert SyncTask (outbox) in same transaction;<<db>>
+    else (FAILED)
+      :Status -> BROKEN;
     endif
+  elseif () then (NOT_FOUND + 2xx — data now available)
+    :SetNotFoundStreak = 0 — atomic;<<db>>
+    :Status -> PENDING (re-attempt on next cycle);
+  elseif () then (NOT_FOUND + 404 — still empty)
+    :AddNotFoundStreak(+1), RetryCount(-1 min 0) — atomic;<<db>>
+    if (NotFoundStreak >= 3 ?) then (yes — confirmed holiday)
+      note right
+        Zero-Row Parquet already in R2 from T-1.
+        Validate the existing file — no re-upload needed.
+      end note
+      :Read Zero-Row Parquet from Cloudflare R2;<<r2>>
+      :Run **Physical Parquet Validation** (criteria 6.3):
+      - File existence & size > 0
+      - Magic number PAR1 + footer integrity
+      - Schema matching (columns, types, precision)
+      - Zero-row boundary check (IsHoliday=true);
+      if (Validation result?) then (PASSED)
+        :Status -> CONFIRMED;
+        :Insert SyncTask (outbox) in same transaction;<<db>>
+      else (FAILED)
+        :Status -> BROKEN;
+      endif
+    else (streak < 3)
+      :Status -> NOT_FOUND;
+    endif
+  elseif () then (COMPLETED + 404 — anomaly)
+    :Status -> BROKEN;
+    note right: Data was present at T-0 but\nis now missing — investigate manually
+  else (non-2xx / non-404 error)
+    :Status -> FAILED;
   endif
 end split
 

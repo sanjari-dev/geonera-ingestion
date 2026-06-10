@@ -92,6 +92,7 @@ const els = {
   zoomOut: $("zoom-out"),
   zoomFit: $("zoom-fit"),
   zoomReset: $("zoom-reset"),
+  refresh: $("refresh-btn"),
   toggleSource: $("toggle-source"),
   sourcePane: $("source-pane"),
   sourceCode: $("source-code"),
@@ -381,6 +382,32 @@ els.zoomFit.addEventListener("click", fitToScreen);
 els.zoomReset.addEventListener("click", resetZoom);
 
 window.addEventListener("resize", () => state.current && fitToScreen());
+
+// ---------------------------------------------------------------------------
+// Refresh
+// ---------------------------------------------------------------------------
+async function refreshCurrent() {
+  if (!state.current || els.refresh.disabled) return;
+  els.refresh.classList.add("spinning");
+  els.refresh.disabled = true;
+  try {
+    await selectDiagram(state.current);
+  } finally {
+    els.refresh.classList.remove("spinning");
+    els.refresh.disabled = false;
+  }
+}
+
+els.refresh.addEventListener("click", refreshCurrent);
+
+document.addEventListener("keydown", (e) => {
+  const tag = document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if (e.key === "r" || e.key === "R") {
+    e.preventDefault();
+    refreshCurrent();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Source pane toggle

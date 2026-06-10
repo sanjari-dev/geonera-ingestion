@@ -57,80 +57,110 @@ legend right
 endlegend
 
 start
-:runSyncHandler(ctx, dal);<<lock>>
+:RunSyncHandler(ctx, dal);
 note right
   Triggered by queue jobs.sync (every 5 minutes).
-  Acquires LockIDSync (1004) via Direct Connection.
-  Implements the consumer side of the
-  **Transactional Outbox Pattern** (see 6.1) —
-  guarantees ResolvedTickCount is recomputed
-  reliably even across crashes / lost updates.
+  **NO global advisory lock** — fire & forget design.
+  Concurrent triggers are allowed; no trigger is dropped.
+
+  ** How SyncTask rows are created (publish side, NOT this process): **
+  Whenever a TICK row reaches a terminal state (→ CONFIRMED,
+  or CONFIRMED → BROKEN demotion) inside T-2 / Backfill-Validate,
+  an "INSERT ... ON CONFLICT (instrument_id, target_date)
+  DO UPDATE SET status = 'PENDING'" is executed in the SAME
+  DB transaction as the status change — atomically publishing
+  or resurrecting the outbox event.
 end note
 
+:**claimBatchSyncTasks** — single FOR UPDATE SKIP LOCKED transaction
+Claim up to **12** PENDING rows:
+ORDER BY hours_count DESC (nearest to 24 first), created_at ASC
+→ SET status = 'PROCESSED' for each claimed row;<<db>>
 note right
-  ** Reminder — how SyncTask rows get created (publish side, NOT this process): **
-  Whenever a TICK row reaches a terminal/demoted state
-  (-> CONFIRMED, or CONFIRMED -> BROKEN demotion) inside
-  the T-2 / Backfill-Validate workers, an
-  "INSERT ... ON CONFLICT (instrument_id, target_date)
-  DO UPDATE SET status = EXCLUDED.status" is executed
-  in the SAME DB transaction as the status change —
-  this both records the event AND resurrects/ resets
-  any existing task for that day back to PENDING.
+  hours_count tracks the last known count of
+  CONFIRMED TICK rows for this instrument/day.
+  Ordering DESC ensures rows close to completion
+  are processed ahead of newly created ones.
+  SKIP LOCKED prevents claim contention between
+  concurrent triggers.
 end note
 
-:processSyncTask(ctx, dal)
-via dal.ExecuteInPool (PgBouncer connection);
-:**Atomic claim using a CTE**:
-"SELECT ... FROM sync_tasks
- WHERE status='PENDING'
- FOR UPDATE SKIP LOCKED ...
- then UPDATE status='PROCESSED'"
-executed as a single statement
-(no read-after-read, no race window);<<db>>
-
-if (Did the claim return a task?) then (no PENDING task available)
-  :Nothing to do this cycle — return nil;
-else (yes — task claimed & marked PROCESSED)
-  :Derive the day window:
-  startOfDay = task.TargetDate
-  endOfDay   = startOfDay + 24h;
-  :**Idempotent Recompute** —
-  COUNT(*) State WHERE
-   JobType = TICK,
-   InstrumentID = task.InstrumentID,
-   Timestamp IN [startOfDay, endOfDay),
-   Status = CONFIRMED
-  (the ONLY status counted as "resolved");<<db>>
-  :UPDATE the matching CANDLE State row
-  (JobType=CANDLE, same instrument & day):
-  SET ResolvedTickCount = actualCount,
-      UpdatedAt = time.Now().UTC();<<db>>
-  if (actualCount < 24 ?) then (yes — incomplete day)
-    :Also SET Status = PENDING
-    on that CANDLE row — prevents a
-    stale/corrupt Candle aggregation
-    after an upstream Tick demotion;
-  else (== 24, day fully resolved)
-    :Candle row remains eligible for
-    aggregation (ResolvedTickCount = 24
-    is exactly what 03-candles-regular.puml checks for);
-  endif
-  :**Conditional DELETE** of the SyncTask:
-  WHERE id = task.ID AND status = 'PROCESSED';<<db>>
+if (Any PENDING tasks found?) then (none)
+  :return true — nothing to do this cycle;
+  stop
+else (N tasks claimed, 1 ≤ N ≤ 12)
+  :Launch N goroutines (fire & forget)
+  RunSyncHandler returns immediately;
   note right
-    ** Lost-Update mitigation **
-    If, while steps 3-4 were running, a NEW
-    TICK event re-upserted this same task back
-    to PENDING (publish side), this DELETE's
-    WHERE clause matches zero rows — so the
-    task safely survives for reprocessing on
-    the very next Sync cycle. No event is lost.
+    Each goroutine runs processSyncTaskWorker
+    independently with context.Background() —
+    not bound to the trigger's context.
+    Subsequent triggers can claim more rows
+    without waiting for these goroutines.
   end note
 endif
 
-:wg.Done() — join point
-(Parent Handler releases LockIDSync);
-stop
+' ─────────────────────────────────────────────────────────────
+' GOROUTINE BODY — processSyncTaskWorker (one per claimed task)
+' ─────────────────────────────────────────────────────────────
+
+partition "processSyncTaskWorker (per goroutine)" {
+
+  :Derive the day window:
+  windowStart = task.TargetDate
+  windowEnd   = windowStart + 24h;
+
+  ' ── Step 1: count (no advisory lock needed) ──
+  :COUNT(*) State
+  WHERE JobType = TICK
+    AND InstrumentID = task.InstrumentID
+    AND Timestamp IN [windowStart, windowEnd)
+    AND Status = CONFIRMED;<<db>>
+
+  if (actualCount < 24?) then (yes — day not yet complete)
+    :UPDATE ingestion.sync_tasks
+    SET hours_count = actualCount,
+        status = 'PENDING'
+    WHERE id = task.ID;<<db>>
+    note right
+      Task re-queued for next trigger.
+      hours_count is persisted so the next
+      claim round can still prioritise this
+      row correctly (ORDER BY hours_count DESC).
+    end note
+    stop
+  else (== 24 — all hours confirmed)
+    ' ── Step 2: management lock + candle finalisation ──
+    :Acquire LockIDSync (1004) via Direct Connection
+    pg_advisory_xact_lock — **blocking wait**
+    (serialises concurrent goroutines that also
+    reach count == 24 at the same time);<<lock>>
+
+    :UPDATE State (CANDLE row)
+    SET resolved_tick_count = 24,
+        updated_at = now()
+    WHERE InstrumentID = task.InstrumentID
+      AND JobType = CANDLE
+      AND Timestamp = windowStart;<<db>>
+
+    :**Conditional DELETE** of the SyncTask:
+    DELETE FROM ingestion.sync_tasks
+    WHERE id = task.ID
+      AND status = 'PROCESSED';<<db>>
+    note right
+      ** Lost-Update mitigation **
+      If a concurrent TICK event reset the task
+      to PENDING while this goroutine was running
+      (publish side), the WHERE clause matches
+      zero rows — the task survives for reprocessing
+      on the next cycle. No event is lost.
+    end note
+
+    :Release LockIDSync
+    (lockTx.Rollback() in defer);<<lock>>
+    stop
+  endif
+
+}
 
 @enduml

@@ -25,6 +25,8 @@ type SyncTask struct {
 	TargetDate time.Time `json:"target_date,omitempty"`
 	// Status holds the value of the "status" field.
 	Status synctask.Status `json:"status,omitempty"`
+	// HoursCount holds the last computed count of CONFIRMED TICK rows for this instrument/date window.
+	HoursCount int `json:"hours_count,omitempty"`
 	// CreatedAt holds the value of the "created_at" field.
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
@@ -64,6 +66,8 @@ func (*SyncTask) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullTime)
 		case synctask.FieldID, synctask.FieldInstrumentID:
 			values[i] = new(uuid.UUID)
+		case synctask.FieldHoursCount:
+			values[i] = new(sql.NullInt64)
 		default:
 			values[i] = new(sql.UnknownType)
 		}
@@ -102,6 +106,12 @@ func (_m *SyncTask) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field status", values[i])
 			} else if value.Valid {
 				_m.Status = synctask.Status(value.String)
+			}
+		case synctask.FieldHoursCount:
+			if value, ok := values[i].(*sql.NullInt64); !ok {
+				return fmt.Errorf("unexpected type %T for field hours_count", values[i])
+			} else if value.Valid {
+				_m.HoursCount = int(value.Int64)
 			}
 		case synctask.FieldCreatedAt:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -158,6 +168,9 @@ func (_m *SyncTask) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("status=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Status))
+	builder.WriteString(", ")
+	builder.WriteString("hours_count=")
+	builder.WriteString(fmt.Sprintf("%v", _m.HoursCount))
 	builder.WriteString(", ")
 	builder.WriteString("created_at=")
 	builder.WriteString(_m.CreatedAt.Format(time.ANSIC))

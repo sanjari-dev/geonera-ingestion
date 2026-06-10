@@ -42,6 +42,11 @@ func (SyncTask) Fields() []ent.Field {
 			SchemaType(map[string]string{
 				dialect.Postgres: "ingestion.sync_status_enum",
 			}),
+		// Last computed count of CONFIRMED TICK rows for this instrument/date window.
+		// Updated every processing cycle; tasks are ordered DESC by this value so
+		// those closest to 24 are processed first.
+		field.Int("hours_count").
+			Default(0),
 		field.Time("created_at").
 			Default(time.Now).
 			Immutable().

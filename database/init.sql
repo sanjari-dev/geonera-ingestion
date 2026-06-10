@@ -253,6 +253,12 @@ CREATE TABLE IF NOT EXISTS ingestion.sync_tasks (
     target_date   TIMESTAMPTZ                 NOT NULL,
 
     status        ingestion.sync_status_enum  NOT NULL DEFAULT 'PENDING',
+
+    -- Last computed count of CONFIRMED TICK rows for this instrument/date window.
+    -- Updated each processing cycle; tasks are claimed DESC by this column so those
+    -- nearest completion (-> 24) are processed first.
+    hours_count   INTEGER                     NOT NULL DEFAULT 0,
+
     created_at    TIMESTAMPTZ                 NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT sync_tasks_pkey PRIMARY KEY (id),
@@ -274,8 +280,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uidx_sync_tasks_instrument_target_date
 CREATE INDEX IF NOT EXISTS idx_sync_tasks_status
     ON ingestion.sync_tasks (status);
 
-COMMENT ON TABLE  ingestion.sync_tasks             IS 'Transactional Outbox events for recomputing resolved_tick_count on CANDLE states. Consumed by the Outbox Worker.';
-COMMENT ON COLUMN ingestion.sync_tasks.target_date IS 'Calendar day (00:00:00 UTC) of the TICK slot that triggered this sync event.';
+-- Composite index: claim query filters PENDING and sorts by hours_count DESC, created_at ASC.
+CREATE INDEX IF NOT EXISTS idx_sync_tasks_status_hours_count
+    ON ingestion.sync_tasks (status, hours_count DESC, created_at ASC);
+
+COMMENT ON TABLE  ingestion.sync_tasks                IS 'Transactional Outbox events for recomputing resolved_tick_count on CANDLE states. Consumed by the Outbox Worker.';
+COMMENT ON COLUMN ingestion.sync_tasks.target_date    IS 'Calendar day (00:00:00 UTC) of the TICK slot that triggered this sync event.';
+COMMENT ON COLUMN ingestion.sync_tasks.hours_count    IS 'Last computed count of CONFIRMED TICK rows. Tasks are processed in DESC order; when this reaches 24 the CANDLE is finalised and the row is deleted.';
 
 
 -- =============================================================================

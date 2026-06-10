@@ -22,6 +22,8 @@ const (
 	FieldTargetDate = "target_date"
 	// FieldStatus holds the string denoting the status field in the database.
 	FieldStatus = "status"
+	// FieldHoursCount holds the string denoting the hours_count field in the database.
+	FieldHoursCount = "hours_count"
 	// FieldCreatedAt holds the string denoting the created_at field in the database.
 	FieldCreatedAt = "created_at"
 	// EdgeInstrument holds the string denoting the instrument edge name in mutations.
@@ -43,6 +45,7 @@ var Columns = []string{
 	FieldInstrumentID,
 	FieldTargetDate,
 	FieldStatus,
+	FieldHoursCount,
 	FieldCreatedAt,
 }
 
