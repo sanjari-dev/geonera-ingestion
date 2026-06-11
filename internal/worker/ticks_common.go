@@ -122,11 +122,7 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	ctx, span := tickTracer.Start(ctx, fmt.Sprintf("RunTickParentHandler_%s", mode))
 	defer span.End()
 
-	lockID := dal.LockIDTick
-	if mode == "BACKFILL" {
-		lockID = dal.LockIDTickBackfill
-	}
-	return runWithLocks(ctx, d, "ticks/"+mode, []int64{lockID}, onStarted, func(lockCtx context.Context) {
+	return runWithLocks(ctx, d, "ticks/"+mode, []int64{dal.LockIDTick}, onStarted, func(lockCtx context.Context) {
 		var wg sync.WaitGroup
 		switch mode {
 		case "REGULAR":
