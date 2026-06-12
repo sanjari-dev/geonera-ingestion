@@ -72,6 +72,13 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 	return runWithLocks(ctx, d, "maintenance", []int64{dal.LockIDMaintenance}, onStarted, func(lockCtx context.Context) {
 		log.Printf("maintenance: lock acquired, running!")
 
+		// Enforce 7-day retention on job activity logs before proceeding with
+		// instrument-level work. Runs every maintenance cycle (~5 min) but is
+		// a fast no-op when nothing qualifies for deletion.
+		if actLogger != nil {
+			actLogger.Purge(lockCtx)
+		}
+
 		var instruments []*ent.Instrument
 		if err := d.ExecuteInPool(lockCtx, func(tx *ent.Tx) error {
 			var e error

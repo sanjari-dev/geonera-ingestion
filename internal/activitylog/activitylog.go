@@ -60,6 +60,27 @@ func (l *Logger) Record(ctx context.Context, src TriggerSrc, jobName string, met
 	return id
 }
 
+// retentionDays is the number of days after which completed job activity log
+// entries are permanently deleted by Purge.
+const retentionDays = 7
+
+// Purge hard-deletes activity log entries whose triggered_at is older than
+// retentionDays. Safe to call repeatedly — it is a no-op when nothing qualifies.
+// Logged only when at least one row is deleted.
+func (l *Logger) Purge(ctx context.Context) {
+	result, err := l.db.ExecContext(ctx, `
+		DELETE FROM ingestion.job_activity_logs
+		WHERE triggered_at < NOW() - ($1 || ' days')::INTERVAL
+	`, retentionDays)
+	if err != nil {
+		log.Printf("activitylog: purge: %v", err)
+		return
+	}
+	if n, _ := result.RowsAffected(); n > 0 {
+		log.Printf("activitylog: purged %d entries older than %d days", n, retentionDays)
+	}
+}
+
 // CloseOrphans marks any open activity log entries older than 5 minutes as
 // finished (finished_at = NOW(), duration_ms left NULL to signal interrupted).
 // Called once at service startup to clean up entries left open by a previous crash.

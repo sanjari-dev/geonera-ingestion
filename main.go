@@ -112,6 +112,7 @@ func main() {
 	defer func() { _ = logDB.Close() }()
 	activityLogger := activitylog.New(logDB)
 	activityLogger.CloseOrphans(ctx)
+	worker.InitActivityLogger(activityLogger)
 
 	// ── Seed: timeframes ──────────────────────────────────────────────────────
 	if err := seed.Timeframes(ctx, dbClient); err != nil {

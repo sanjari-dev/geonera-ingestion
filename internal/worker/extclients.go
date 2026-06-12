@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 
+	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 )
@@ -17,6 +18,7 @@ var errNotImplemented = errors.New("not implemented")
 var (
 	r2Client  *r2.Client
 	dukClient *dukascopy.Client
+	actLogger *activitylog.Logger
 )
 
 // errClientsNotInitialized is returned by any external operation
@@ -32,4 +34,11 @@ func InitClients(r2c *r2.Client, dc *dukascopy.Client) {
 	r2Client = r2c
 	dukClient = dc
 	InitDownloadRateLimiter()
+}
+
+// InitActivityLogger wires up the activity log logger so that RunMaintenanceHandler
+// can call Purge to enforce the 7-day retention policy.
+// Must be called once at startup, before MQ consumers are started.
+func InitActivityLogger(l *activitylog.Logger) {
+	actLogger = l
 }
