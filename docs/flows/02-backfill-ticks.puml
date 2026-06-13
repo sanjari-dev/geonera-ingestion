@@ -62,8 +62,8 @@ note right
   Triggered by queue jobs.ticks.backfill.
   Mutually exclusive with Ticks Regular — both share LockIDTick (1001).
   Instrument filter for all operations: IsActive=true & IsPause=false.
-  Download is globally capped at **12** concurrent goroutines
-  (rate gate + semaphore — shared across all groups in a batch).
+  Download is gated through a **12-worker pool** with a token-bucket
+  rate limiter (12 req/s) — context-cancellation-safe, shared across all groups in a batch.
 end note
 
 ' ── Phase A: fast bulk orphan reset ──────────────────────────────────────────
@@ -98,11 +98,11 @@ end note
       transitioned: PENDING → PROCESSED.
     end note
     :Download raw BI5 file from Dukascopy API;<<api>>
-    note right: Rate gate + Semaphore — hard cap **12** concurrent
+    note right: Download gate — same 12-worker pool (RequestDownload)
 
     if (Download result?) then (2xx — data received)
       :Reset NotFoundStreak = 0 (if non-zero);<<db>>
-      :Convert BI5 → Parquet (Decimal/BigInt,\nusing Instrument.Divider);
+      :Convert BI5 → Parquet (Decimal/BigInt,\n using Instrument.Divider);
       :Upload to Cloudflare R2;<<r2>>
       :Status → COMPLETED;
     elseif () then (404 — no data at source)
@@ -113,6 +113,9 @@ end note
         (reclaimed from NOT_FOUND path) — must use +1.
       end note
       :Status → NOT_FOUND;
+    elseif () then (429 — rate limited)
+      :Status → FAILED;
+      note right: Transient rate limit — retried by\n next backfill cycle
     else (non-2xx / non-404 error)
       :Status → FAILED;
     endif
@@ -150,7 +153,7 @@ end note
       endif
     else (NOT_FOUND, streak < 3)
       :Download raw BI5 file from Dukascopy API;<<api>>
-      note right: Rate gate + Semaphore — same 12-slot cap
+      note right: Download gate — same 12-worker pool (RequestDownload)
       if (Download result?) then (2xx — data now available)
         :SetNotFoundStreak = 0 — atomic;<<db>>
         :Status → PENDING (Group 1 handles ETL on next cycle);
@@ -162,15 +165,26 @@ end note
         :Upload Zero-Row Parquet to R2;<<r2>>
         :Status → NOT_FOUND;
         note right
-          Group 2 tidak menjalankan validasi konsistensi parquet —
-          hanya mengecek ketersediaan data (seperti T-1).
-          Begitu NotFoundStreak mencapai 3, klaim berikutnya
-          masuk ke Group 3 yang wajib menjalankan Physical
-          Parquet Validation untuk semua kasus (COMPLETED
-          maupun NOT_FOUND).
+          Group 2 does not run Parquet consistency validation —
+          it only checks data availability (same as T-1).
+          Once NotFoundStreak reaches 3, the next claim enters
+          Group 3, which always runs Physical Parquet Validation
+          for all cases (COMPLETED and NOT_FOUND alike).
         end note
-      else (non-2xx / non-404 error)
+      elseif () then (429 — rate limited)
         :Status → FAILED;
+        note right
+          Transient rate limit — not evidence of data absence.
+          Does not increment notFoundStreak.
+          Retried by the next backfill cycle.
+        end note
+      else (non-2xx / non-404 error — 503, timeout)
+        :Status → FAILED;
+        note right
+          Non-404 errors are not evidence of absence.
+          Row lands in FAILED; Backfill retries and increments
+          RetryCount — ABANDONED at RetryCount > 5.
+        end note
       endif
     endif
 
@@ -180,7 +194,7 @@ end note
     Rows with original status: **COMPLETED**,
     or **NOT_FOUND** (NotFoundStreak >= 3);
     :Download raw BI5 file from Dukascopy API;<<api>>
-    note right: Rate gate + Semaphore — same 12-slot cap
+    note right: Download gate — same 12-worker pool (RequestDownload)
 
     if (Claimed status + Download result?) then (COMPLETED + 2xx)
       note right: Re-download matches source — cross-validation
@@ -226,6 +240,8 @@ end note
     elseif () then (COMPLETED + 404 — anomaly)
       :Status → BROKEN;
       note right: Data was present at T-0 but\nis now missing — investigate manually
+    elseif () then (429 — rate limited)
+      :Status → FAILED;
     else (non-2xx / non-404 error)
       :Status → FAILED;
     endif

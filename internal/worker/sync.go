@@ -22,6 +22,13 @@ var syncTracer = otel.Tracer("worker/sync")
 // syncBatchSize is the maximum number of SyncTask rows claimed per trigger.
 const syncBatchSize = 12
 
+// syncWorkerTimeout is the maximum lifetime of a per-task sync goroutine.
+// It bounds the time spent waiting for pg_advisory_xact_lock (LockIDSync) —
+// if the lock holder crashes via SIGKILL, the lock is released immediately by
+// PostgreSQL, but if the goroutine itself hangs for any other reason, this
+// timeout ensures it eventually exits rather than leaking forever.
+const syncWorkerTimeout = 5 * time.Minute
+
 // RunSyncHandler claims up to syncBatchSize PENDING SyncTask rows ordered by
 // hours_count DESC (closest to 24 processed first) and dispatches one goroutine
 // per row as fire-and-forget. The handler returns immediately after launching
@@ -49,7 +56,16 @@ func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 
 	for _, task := range tasks {
 		task := task
-		go processSyncTaskWorker(context.Background(), d, task)
+		// Each worker gets its own deadline, so a stuck pg_advisory_xact_lock wait
+		// (e.g., lock holder hung, not crashed) cannot leak the goroutine forever.
+		// lib/pq cancels the blocking query via the PostgreSQL cancel protocol when
+		// the context deadline fires, so WaitAndAcquireAdvisoryLock returns an error
+		// rather than blocking indefinitely.
+		workerCtx, cancel := context.WithTimeout(ctx, syncWorkerTimeout)
+		go func() {
+			defer cancel()
+			processSyncTaskWorker(workerCtx, d, task)
+		}()
 	}
 
 	return true
@@ -107,12 +123,12 @@ func claimBatchSyncTasks(ctx context.Context, d *dal.DAL) ([]*ent.SyncTask, erro
 //
 // Step 1 (no lock): COUNT CONFIRMED TICK rows for the task's 24-hour window.
 //   - If count < 24: update hours_count and reset the task to PENDING so the
-//     next trigger re-evaluates it (prioritised by hours_count DESC).
+//     next trigger re-evaluates it (prioritized by hours_count DESC).
 //   - If count == 24: proceed to Step 2.
 //
 // Step 2 (LockIDSync held): acquire the advisory lock, then in ONE pool
-// transaction update the CANDLE's resolved_tick_count and hard-delete the
-// SyncTask row. The advisory lock serialises concurrent goroutines that
+// transaction update the CANDLE's resolved_tick_count, and hard-delete the
+// SyncTask row. The advisory lock serializes concurrent goroutines that
 // simultaneously reach count == 24.
 func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) {
 	defer recoverGoroutine(ctx, "processSyncTaskWorker")
@@ -154,7 +170,7 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 			if qErr != nil {
 				return fmt.Errorf("sync reset task %s: %w", task.ID, qErr)
 			}
-			rows.Close()
+			_ = rows.Close()
 		}
 		return nil
 	}); err != nil {
@@ -170,7 +186,7 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		return
 	}
 
-	// Step 2: all 24 hours confirmed — acquire LockIDSync then finalise the candle.
+	// Step 2: all 24 hours confirmed — acquire LockIDSync then finalize the candle.
 	lockTx, err := d.WaitAndAcquireAdvisoryLock(ctx, dal.LockIDSync)
 	if err != nil {
 		span.RecordError(err)
@@ -194,7 +210,7 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 				task.InstrumentID, task.TargetDate.Format(time.DateOnly), err)
 		}
 
-		// Conditional delete — only removes the row while it is still PROCESSED.
+		// Conditionally delete it — only removes the row while it is still PROCESSED.
 		// If a concurrent TICK event has already reset it to PENDING, this predicate
 		// matches zero rows and the task survives for the next cycle.
 		if _, err := tx.SyncTask.Delete().

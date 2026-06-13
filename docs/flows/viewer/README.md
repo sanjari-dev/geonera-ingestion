@@ -1,14 +1,14 @@
 # Flow Diagram Viewer
 
 An interactive, web-based viewer for the PlantUML flow diagrams in
-`docs/flows/*.puml` — render, zoom, pan, and browse all 7 processes of the
+`docs/flows/*.puml` — render, zoom, pan, and browse all seven processes of the
 Geonera Ingestion pipeline directly in your browser, **without** pasting
 anything into https://editor.plantuml.com/.
 
 ## How it works
 
 The viewer is a static HTML/CSS/JS app (no build step, no npm dependencies).
-At runtime it:
+At runtime, it:
 
 1. Fetches the raw `.puml` source of the selected diagram (`../<file>.puml`).
 2. Encodes it using PlantUML's **standard transport**: raw-deflate the UTF-8
@@ -28,7 +28,7 @@ At runtime it:
 > `plantuml.com` server's CDN/WAF rejects them outright with `HTTP 403`. The
 > deflate-based encoding above keeps URLs in the ~2,000–4,000 character range,
 > which renders fine. (As a last-resort fallback, browsers without
-> `CompressionStream` support — very old ones — automatically drop back to hex,
+> `CompressionStream` support — ancient ones — automatically drop back to hex,
 > with a note in the status bar; this mainly matters if you're pointing at a
 > self-hosted server with no URL-length restriction.)
 
@@ -68,7 +68,7 @@ Then browse to `http://localhost:4040/viewer/`.
 ## Running it with Docker (for online / shared access)
 
 A `Dockerfile`, `Dockerfile.dockerignore` and `docker-compose.yml` are
-included so you can build, ship and host the viewer anywhere Docker runs
+included so you can build, ship, and host the viewer anywhere Docker runs
 (a VPS, internal server, Kubernetes, Cloud Run, etc.) — no Node/Python
 install required on the host, just Docker.
 
@@ -113,7 +113,7 @@ The container:
 > nothing — diagram rendering still happens client-side, by the *visitor's*
 > browser talking to the configured PlantUML server (public by default; see
 > *Render settings* in the sidebar to point it elsewhere). So all you need to
-> expose is this container's HTTP port — e.g. behind your existing reverse
+> expose is this container's HTTP port — e.g., behind your existing reverse
 > proxy / TLS termination (nginx, Caddy, Traefik, a cloud load balancer, …).
 
 ## Deploying from the published image (no source checkout needed)
@@ -163,7 +163,7 @@ docker compose -f docker-compose.deploy.yml up -d
 IMAGE_TAG=1.0 PORT=8080 docker compose -f docker-compose.deploy.yml up -d
 ```
 
-> 🔌 **Network requirement:** this compose file attaches the viewer to
+> 🔌 **Network requirement:** this composition file attaches the viewer to
 > **`geonera_geonera`** — the Docker network created by the main stack
 > (`docker-compose.portainer.yml` declares `networks.geonera`; Portainer
 > prefixes it with the stack name `geonera`, yielding `geonera_geonera`). It's
@@ -175,7 +175,7 @@ IMAGE_TAG=1.0 PORT=8080 docker compose -f docker-compose.deploy.yml up -d
 > PlantUML server, or front everything with a shared reverse-proxy container
 > on the same network.
 >
-> If you deploy the viewer standalone (main stack not present, or its network
+> If you deploy the viewer standalone (main stacks not present, or its network
 > uses a different name/prefix), either create the network first
 > (`docker network create geonera_geonera`) or remove the `networks:` /
 > `external:` blocks from `docker-compose.deploy.yml` to fall back to a
@@ -186,16 +186,16 @@ Web editor**, optionally setting `IMAGE_TAG` / `PORT` as stack-level env vars.
 
 ## Features
 
-- **Live rendering** of all 7 processes (`00-overview-and-locking.puml` …
+- **Live rendering** of all seven processes (`00-overview-and-locking.puml` …
   `06-sync-outbox.puml`) — picked straight from the sidebar.
 - **Zoom & pan** — scroll/pinch to zoom toward the cursor, drag to pan,
   "fit to screen", and "reset to 100%" buttons. Double-click also fits.
 - **Source viewer** — toggle a side panel (`{ }` button) showing the raw
   `.puml` text for the selected diagram.
 - **SVG or PNG** output — SVG is recommended (crisp at any zoom level).
-- **Bring-your-own render server** — by default the viewer uses the public
+- **Bring-your-own render server** — by default, the viewer uses the public
   `https://www.plantuml.com/plantuml`. Open *Render settings* in the sidebar
-  to point it at a local/self-hosted instance instead, e.g. the official
+  to point it at a local/self-hosted instance instead, e.g., the official
   Docker image, for fully offline / private rendering:
 
   ```bash
@@ -213,14 +213,14 @@ Web editor**, optionally setting `IMAGE_TAG` / `PORT` as stack-level env vars.
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `index.html` | App shell: sidebar, toolbar, viewer canvas |
-| `style.css` | Styling (light/dark themes for the UI chrome) |
-| `app.js` | Diagram list, PlantUML URL encoding, rendering, zoom/pan, settings |
-| `server.js` | Zero-dependency static file server (`node server.js [port]`) |
-| `Dockerfile` | Container image definition (build context = `docs/flows/`) |
-| `Dockerfile.dockerignore` | Build-context exclusions for the image (BuildKit-adjacent ignore file) |
-| `docker-compose.yml` | Build the image locally & run it (`docker compose up -d --build`) |
-| `docker-compose.deploy.yml` | Run the **published** `sansalfian/geonera-ingestion-docs` image — no build, no source checkout |
-| `run.sh` / `run.ps1` | One-shot create/recreate-container scripts that pull & run the published image (Linux/macOS/WSL and Windows respectively) |
+| File                        | Purpose                                                                                                                   |
+|-----------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `index.html`                | App shell: sidebar, toolbar, viewer canvas                                                                                |
+| `style.css`                 | Styling (light/dark themes for the UI chrome)                                                                             |
+| `app.js`                    | Diagram list, PlantUML URL encoding, rendering, zoom/pan, settings                                                        |
+| `server.js`                 | Zero-dependency static file server (`node server.js [port]`)                                                              |
+| `Dockerfile`                | Container image definition (build context = `docs/flows/`)                                                                |
+| `Dockerfile.dockerignore`   | Build-context exclusions for the image (BuildKit-adjacent ignore file)                                                    |
+| `docker-compose.yml`        | Build the image locally & run it (`docker compose up -d --build`)                                                         |
+| `docker-compose.deploy.yml` | Run the **published** `sansalfian/geonera-ingestion-docs` image — no build, no source checkout                            |
+| `run.sh` / `run.ps1`        | One-shot create/recreate-container scripts that pull & run the published image (Linux/macOS/WSL and Windows respectively) |

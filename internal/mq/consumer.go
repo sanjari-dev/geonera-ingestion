@@ -35,7 +35,7 @@ const (
 
 // jobNameFromQueue strips the "jobs." prefix from a queue name so that MQ
 // and HTTP triggers share the same job_name in the activity log.
-// e.g. "jobs.ticks.regular" → "ticks.regular", "jobs.maintenance" → "maintenance".
+// e.g., "jobs.ticks.regular" → "ticks.regular", "jobs.maintenance" → "maintenance".
 func jobNameFromQueue(queue string) string {
 	return strings.TrimPrefix(queue, "jobs.")
 }

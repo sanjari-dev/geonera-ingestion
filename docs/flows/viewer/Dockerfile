@@ -49,8 +49,8 @@ EXPOSE 4040
 # Hit the viewer's own index page to confirm the server is alive and able
 # to read from disk (busybox wget ships with node:alpine).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/viewer/" || exit 1
+  CMD wget -q -O /dev/null "http://127.0.0.1:4040/viewer/" || exit 1
 
-# `sh -c` so $PORT (e.g. injected by the platform at runtime) is honored;
+# `sh -c` so $PORT (e.g., injected by the platform at runtime) is honored;
 # server.js itself also falls back to $PORT if no CLI arg is given.
 CMD ["sh", "-c", "node viewer/server.js \"$PORT\""]

@@ -9,7 +9,7 @@ info:
     immediately. The actual ETL work runs asynchronously.
 
     The primary dispatch mechanism is RabbitMQ; these HTTP endpoints act as
-    an alternative / fallback trigger (e.g. for manual invocation or testing).
+    an alternative / fallback trigger (e.g., for manual invocation or testing).
   version: 1.0.0
 servers:
   - url: http://localhost:3000
@@ -77,7 +77,7 @@ paths:
         - **T-2** — physical Parquet validation for two-hours-ago COMPLETED rows;
           promote to CONFIRMED or demote to BROKEN; insert SyncTask transactionally.
 
-        Expected trigger time: **minute :05 of each hour** (e.g. 10:05 UTC).
+        Expected trigger time: **minute :05 of each hour** (e.g., 10:05 UTC).
       operationId: triggerTicksRegular
       responses:
         "202":
@@ -154,7 +154,7 @@ paths:
 
         For each event the worker idempotently recomputes `ResolvedTickCount`
         on the corresponding CANDLE row by counting CONFIRMED TICK states for
-        that instrument-day. If the count drops below 24 (e.g. due to a BROKEN
+        that instrument-day. If the count drops below 24 (e.g., due to a BROKEN
         demotion), the CANDLE row is reset to PENDING. The SyncTask record is
         deleted only after the recompute succeeds, preventing lost updates on
         concurrent writes.

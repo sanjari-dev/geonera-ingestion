@@ -21,7 +21,7 @@ const decimalScale = 100_000
 // Architecture §3.B schema (14 columns):
 //   - timestamp: int64, microseconds since Unix epoch, UTC (period start)
 //   - instrument: string
-//   - timeframe: string, e.g. "m1", "h1", "d1"
+//   - Timeframe: string, e.g., "m1", "h1", "d1"
 //   - open, high, low, close, volume_weighted_average_price: float64
 //   - min_spread, max_spread, avg_spread: float64
 //   - tick_count: int64

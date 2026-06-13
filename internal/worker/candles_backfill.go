@@ -27,7 +27,7 @@ const (
 	candleLayerNone       candleBackfillLayer = iota
 	candleLayerAggregate                      // Layer 1: full aggregation pipeline
 	candleLayerReset                          // Layer 2: retry-reset (FAILED/BROKEN)
-	candleLayerValidation                     // Layer 3: read-back + validate orphaned COMPLETED
+	candleLayerValidation                     // Layer 3: read-back and validate orphaned COMPLETED
 )
 
 type candleRoutedRow struct {
@@ -79,7 +79,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // Backfill: Timestamp must be <= midnight of (today − 2 days) so that D-1 and D
 // are never touched by Backfill (those belong to Candles Regular at 05:08 UTC).
 func backfillCandleBoundary() time.Time {
-	return time.Now().UTC().Truncate(24 * time.Hour).AddDate(0, 0, -candleBackfillExclusionDays)
+	return time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -candleBackfillExclusionDays)
 }
 
 // claimCandleBackfillBatch is the single master claim for Candle Backfill.
@@ -254,8 +254,8 @@ func resetCandleAbandonedRows(ctx context.Context, d *dal.DAL, span trace.Span, 
 }
 
 // executeCandleRetryReset applies the Backfill Reset rule for a claimed CANDLE row:
-//   - PROCESSED → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
-//   - FAILED / BROKEN → PENDING + AddRetryCount(+1), or ABANDONED at ≥ maxRetryCount
+//   - PROCESSED → PENDING + AddRetryCount(+1), or ABANDONED at ≥ 5
+//   - FAILED / BROKEN → PENDING + AddRetryCount(+1), or ABANDONED at ≥ 5
 func executeCandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 	if row.PreviousStatus == nil {
 		return

@@ -7,7 +7,7 @@
 #
 # Then open http://localhost:4040/viewer/
 #
-# `context: ..` is intentional — see Dockerfile's header comment: the image
+# `context:` is intentional — see Dockerfile's header comment: the image
 # needs both this `viewer/` app AND the sibling `../*.puml` sources, so the
 # build context must be `docs/flows/` (this file's parent directory).
 

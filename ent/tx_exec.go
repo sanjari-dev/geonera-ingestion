@@ -7,13 +7,13 @@ import (
 	entsql "entgo.io/ent/dialect/sql"
 )
 
-// ExecContext executes raw SQL on the current ent transaction.
+// ExecContext executes raw SQL on the current transaction.
 // Use this sparingly for SQL features not exposed by the generated builders.
 func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) error {
 	return tx.config.driver.Exec(ctx, query, args, nil)
 }
 
-// QueryContext executes raw SQL on the current ent transaction and returns rows.
+// QueryContext executes raw SQL on the current transaction and returns rows.
 // The caller is responsible for closing the returned rows.
 func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*entsql.Rows, error) {
 	var rows entsql.Rows
@@ -29,7 +29,7 @@ func (tx *Tx) QueryBoolContext(ctx context.Context, query string, args ...any) (
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
 		return false, sql.ErrNoRows
 	}

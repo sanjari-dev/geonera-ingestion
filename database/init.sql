@@ -255,7 +255,7 @@ CREATE TABLE IF NOT EXISTS ingestion.sync_tasks (
     status        ingestion.sync_status_enum  NOT NULL DEFAULT 'PENDING',
 
     -- Last computed count of CONFIRMED TICK rows for this instrument/date window.
-    -- Updated each processing cycle; tasks are claimed DESC by this column so those
+    -- Updated each processing cycle; tasks are claimed DESC by this column, so those
     -- nearest completion (-> 24) are processed first.
     hours_count   INTEGER                     NOT NULL DEFAULT 0,
 

@@ -23,8 +23,6 @@ import (
 
 var maintenanceTracer = otel.Tracer("worker/maintenance")
 
-var errR2NotFound = r2.ErrNotFound
-
 func isR2NotFound(err error) bool { return errors.Is(err, r2.ErrNotFound) }
 
 // maintenanceSeedBatchSize is the maximum number of rows inserted per DB
@@ -62,7 +60,7 @@ func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
 // ── RunMaintenanceHandler ─────────────────────────────────────────────────────
 
 // RunMaintenanceHandler acquires LockIDMaintenance and iterates over every
-// instrument (active and inactive). Per instrument it either bootstraps a
+// instrument (active and inactive). Per instrument, it either bootstraps a
 // brand-new states table (Group 1) or runs the four normal-maintenance phases
 // A/B/C/D in parallel (Group 2).
 func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
@@ -101,7 +99,7 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 	})
 }
 
-// runMaintenanceForInstrument dispatches Group 1 (bootstrap) when the states
+// runMaintenanceForInstrument dispatches Group 1 (bootstrap) when the state
 // table is empty for this instrument, or Group 2 (A + B + C + D in parallel)
 // when rows already exist.
 func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
@@ -152,7 +150,7 @@ func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (boo
 // instrument. IsPause is set to true during seeding so that Tick/Candle workers
 // skip this instrument while rows are being inserted. IsActive is never touched
 // here — that flag is managed exclusively by engineers. All inserts use
-// ON CONFLICT DO NOTHING so the function is safe to retry after a partial run.
+// ON CONFLICT DO NOTHING, so the function is safe to retry after a partial run.
 func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/bootstrap")
 
@@ -216,29 +214,14 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		}
 		interval := jobTypeInterval(jobType)
 
-		var maxTS time.Time
-		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			row, e := tx.State.Query().
-				Where(
-					state.InstrumentID(inst.ID),
-					state.JobTypeEQ(jobType),
-					state.IsDeletedEQ(false),
-				).
-				Order(state.ByTimestamp(sql.OrderDesc())).
-				First(ctx)
-			if e != nil {
-				if ent.IsNotFound(e) {
-					maxTS = normalizeTS(inst.StartDate.UTC(), jobType)
-					return nil
-				}
-				return e
-			}
-			maxTS = normalizeTS(row.Timestamp.UTC(), jobType)
-			return nil
-		}); err != nil {
+		maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
+		if err != nil {
 			span.RecordError(err)
 			log.Printf("forward seeding %s %s: query max (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
 			continue
+		}
+		if maxTS.IsZero() {
+			maxTS = normalizeTS(inst.StartDate.UTC(), jobType)
 		}
 
 		nowNorm := normalizeTS(time.Now().UTC(), jobType)
@@ -277,25 +260,8 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		interval := jobTypeInterval(jobType)
 		startNorm := normalizeTS(startDate, jobType)
 
-		var minTS time.Time
-		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			row, e := tx.State.Query().
-				Where(
-					state.InstrumentID(inst.ID),
-					state.JobTypeEQ(jobType),
-					state.IsDeletedEQ(false),
-				).
-				Order(state.ByTimestamp()).
-				First(ctx)
-			if e != nil {
-				if ent.IsNotFound(e) {
-					return nil
-				}
-				return e
-			}
-			minTS = normalizeTS(row.Timestamp.UTC(), jobType)
-			return nil
-		}); err != nil {
+		minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
+		if err != nil {
 			span.RecordError(err)
 			log.Printf("backward gap fill %s %s: query min (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
 			continue
@@ -317,35 +283,18 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 
 // managePauseFlag sets Instrument.IsPause based on whether the TICK historical
 // range has been fully seeded back to StartDate. It finds the earliest TICK row
-// (any status) and compares against Instrument.StartDate:
+// (any status) and compares it against Instrument.StartDate:
 //   - MIN > StartDate → gaps remain → IsPause = true
 //   - MIN <= StartDate → range fully covered → IsPause = false
 //
-// Status is intentionally ignored — the backward gap fill already inserted
-// PENDING rows for every missing slot; whether those rows have been processed
+// Status is intentionally ignored — the backward gap fills already inserted
+// PENDING rows for every missing slot; whether those rows haven't been processed
 // yet is irrelevant to the pause decision.
 func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	span := trace.SpanFromContext(ctx)
 
-	var minTS time.Time
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		row, e := tx.State.Query().
-			Where(
-				state.InstrumentID(inst.ID),
-				state.JobTypeEQ(state.JobTypeTICK),
-				state.IsDeletedEQ(false),
-			).
-			Order(state.ByTimestamp()).
-			First(ctx)
-		if e != nil {
-			if ent.IsNotFound(e) {
-				return nil
-			}
-			return e
-		}
-		minTS = normalizeTS(row.Timestamp.UTC(), state.JobTypeTICK)
-		return nil
-	}); err != nil {
+	minTS, err := queryStateMinTS(ctx, d, inst.ID, state.JobTypeTICK)
+	if err != nil {
 		span.RecordError(err)
 		log.Printf("manage pause %s: query min tick (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
 		return
@@ -430,10 +379,10 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 // runPruningPhase2Sweep implements the two-phase R2 + DB cleanup:
 //
 // Phase 2 — R2 Sweep: load all is_deleted=true rows, attempt to delete each
-// R2 object, and split results into succeeded (deleted or NoSuchKey) vs failed
+// R2 object, and split results into succeeded (deleted or NoSuchKey) vs. failed
 // (transient R2 error — left is_deleted=true for retry on the next cycle).
 //
-// Phase 3 — DB Hard Delete: bulk-delete only the succeeded group from the DB.
+// Phase 3 — DB Hard Delete: bulk-delete only the succeeding group from the DB.
 // Failed rows remain is_deleted=true and are retried automatically.
 func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	_, span := maintenanceTracer.Start(ctx, "maintenance/pruning/phase2-sweep",
@@ -529,43 +478,19 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	span := trace.SpanFromContext(ctx)
 	interval := jobTypeInterval(jobType)
 
-	var minTS, maxTS time.Time
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		rowMin, e := tx.State.Query().
-			Where(
-				state.InstrumentID(inst.ID),
-				state.JobTypeEQ(jobType),
-				state.IsDeletedEQ(false),
-			).
-			Order(state.ByTimestamp()).
-			First(ctx)
-		if e != nil {
-			if ent.IsNotFound(e) {
-				return nil
-			}
-			return e
-		}
-		minTS = normalizeTS(rowMin.Timestamp.UTC(), jobType)
-
-		rowMax, e := tx.State.Query().
-			Where(
-				state.InstrumentID(inst.ID),
-				state.JobTypeEQ(jobType),
-				state.IsDeletedEQ(false),
-			).
-			Order(state.ByTimestamp(sql.OrderDesc())).
-			First(ctx)
-		if e != nil {
-			return e
-		}
-		maxTS = normalizeTS(rowMax.Timestamp.UTC(), jobType)
-		return nil
-	}); err != nil {
+	minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
+	if err != nil {
 		span.RecordError(err)
-		log.Printf("consistency check %s %s: query min/max (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+		log.Printf("consistency check %s %s: query min (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
 		return
 	}
 	if minTS.IsZero() {
+		return
+	}
+	maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
+	if err != nil {
+		span.RecordError(err)
+		log.Printf("consistency check %s %s: query max (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
 		return
 	}
 
@@ -710,3 +635,52 @@ func insertStatePendingOnConflictDoNothing(
 	)
 }
 
+// queryStateMinTS returns the earliest normalized timestamp for the given
+// instrument/jobType. Returns zero time when no rows exist.
+func queryStateMinTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType) (time.Time, error) {
+	var minTS time.Time
+	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		row, e := tx.State.Query().
+			Where(
+				state.InstrumentID(instrumentID),
+				state.JobTypeEQ(jobType),
+				state.IsDeletedEQ(false),
+			).
+			Order(state.ByTimestamp()).
+			First(ctx)
+		if e != nil {
+			if ent.IsNotFound(e) {
+				return nil
+			}
+			return e
+		}
+		minTS = normalizeTS(row.Timestamp.UTC(), jobType)
+		return nil
+	})
+	return minTS, err
+}
+
+// queryStateMaxTS returns the latest normalized timestamp for the given
+// instrument/jobType. Returns zero time when no rows exist.
+func queryStateMaxTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType) (time.Time, error) {
+	var maxTS time.Time
+	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		row, e := tx.State.Query().
+			Where(
+				state.InstrumentID(instrumentID),
+				state.JobTypeEQ(jobType),
+				state.IsDeletedEQ(false),
+			).
+			Order(state.ByTimestamp(sql.OrderDesc())).
+			First(ctx)
+		if e != nil {
+			if ent.IsNotFound(e) {
+				return nil
+			}
+			return e
+		}
+		maxTS = normalizeTS(row.Timestamp.UTC(), jobType)
+		return nil
+	})
+	return maxTS, err
+}

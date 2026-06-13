@@ -31,9 +31,6 @@ var tickTracer = otel.Tracer("worker/ticks")
 const (
 	// notFoundThreshold is the consecutive-404 count that triggers a Zero-Row Parquet commit.
 	notFoundThreshold = 3
-	// maxRetryCount is the ceiling for RetryCount before a row is ABANDONED.
-	maxRetryCount = 5
-
 	// dukascopyMaxRPS is the global maximum requests-per-second sent to Dukascopy.
 	// Aligned with dukascopyBurst (= concurrency cap) so every semaphore slot can
 	// fire once per second in a steady state.  This prevents 503 thundering-herds
@@ -55,7 +52,7 @@ const (
 	// tickLoopMaxGoroutines / tickLoopSem = 48 design) on top of this: every
 	// claimed row is dispatched immediately, and the real bottleneck —
 	// Dukascopy BI5 downloads — is already throttled to dukascopyBurst (12)
-	// concurrent requests via tickDownloadSem / tickDownloadRateGate, with
+	// concurrent workers via the download gate (download_gate.go), with
 	// tickProcessSem (runtime.NumCPU()) bounding convert+upload. Capping the
 	// claim batch at 120 (rather than leaving it unbounded) is what keeps the
 	// in-flight PROCESSED-row count, and therefore goroutine/memory growth, predictable.
@@ -68,16 +65,11 @@ const (
 	backfillExclusionHours = 3
 )
 
-// tickDownloadSem limits Dukascopy BI5 HTTP downloads (and API re-checks)
-// to dukascopyBurst goroutines to prevent connection overload.
-// Shared across all tick phases (T-0, T-1, T-2, Backfill).
-var tickDownloadSem = make(chan struct{}, dukascopyBurst)
-
 // tickDownloadRateGate is a token-bucket rate limiter for Dukascopy downloads.
 // A background goroutine (started by InitDownloadRateLimiter) refills it at
-// dukascopyMaxRPS tokens/second. Each download must receive one token before
-// acquiring tickDownloadSem, capping the actual request rate even when all
-// semaphore slots are free and requests return quickly (e.g., 503 errors).
+// dukascopyMaxRPS tokens/second. Each download worker consumes one token before
+// sending the HTTP request, capping the global request rate even when responses
+// return quickly (e.g., 503 errors).
 var tickDownloadRateGate = make(chan struct{}, dukascopyBurst)
 
 // InitDownloadRateLimiter pre-fills the token bucket and starts the background
@@ -101,13 +93,16 @@ func InitDownloadRateLimiter() {
 			}
 		}
 	}()
+	// Start fixed pool of download worker goroutines.
+	startDownloadWorkers()
+
 	log.Printf("worker: download rate limiter started — max %d req/s, burst %d, interval %s",
 		dukascopyMaxRPS, dukascopyBurst, interval)
 }
 
 // tickProcessSem limits concurrent Parquet convert+upload goroutines to
 // runtime.NumCPU() so the convert stage (CPU-bound) saturates all available
-// cores without over-subscribing. Initialised once at package load time.
+// cores without oversubscribing. Initialized once at package load time.
 // Shared across all tick phases.
 var tickProcessSem = make(chan struct{}, runtime.NumCPU())
 
@@ -168,48 +163,6 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 	}
 }
 
-// runAbandonedResetPhase is the last-resort reset shared by the Candle and any
-// future job-type backfill paths. After all FAILED/BROKEN rows are exhausted it
-// iterates over every ABANDONED row for the given job type and resets it to
-// PENDING with RetryCount=0, giving the row a fresh retry budget.
-//
-// Processing is sequential (FOR UPDATE SKIP LOCKED, one row per transaction)
-// because this phase runs only after all higher-priority work is done — there is
-// no concurrency to exploit and serialising avoids lock contention.
-func runAbandonedResetPhase(ctx context.Context, d *dal.DAL, span trace.Span, jobType state.JobType) {
-	for ctx.Err() == nil {
-		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			row, err := tx.State.Query().Where(
-				state.JobTypeEQ(jobType),
-				state.StatusEQ(state.StatusABANDONED),
-				state.HasInstrumentWith(
-					instrument.IsActiveEQ(true),
-					instrument.IsPauseEQ(false),
-				),
-				state.IsDeletedEQ(false),
-			).Order(state.ByTimestamp()).FirstForUpdateSkipLocked(ctx)
-			if err != nil {
-				return err
-			}
-			_, err = tx.State.UpdateOneID(row.ID).
-				SetPreviousStatus(state.PreviousStatusABANDONED).
-				SetStatus(state.StatusPENDING).
-				SetRetryCount(0).
-				SetUpdatedAt(time.Now().UTC()).
-				Save(ctx)
-			return err
-		})
-		if err != nil {
-			if ent.IsNotFound(err) {
-				break
-			}
-			span.RecordError(err)
-			log.Printf("abandoned reset (%s, traceID=%s): %v", jobType, span.SpanContext().TraceID(), err)
-			break
-		}
-	}
-}
-
 // ── ETL execution ─────────────────────────────────────────────────────────────
 
 // executeIngestionETL runs the download → convert → upload pipeline for a row
@@ -225,26 +178,20 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 
 	log.Printf("ticks: executing ETL for %s tick %s", row.Edges.Instrument.Name, row.Timestamp.Format(time.RFC3339))
 
-	// Phase 1: Download BI5 — two-layer throttle:
-	//   1. Rate gate (token bucket): caps global throughput at dukascopyMaxRPS req/s.
-	//      Prevents 503 flood when requests fail quickly (e.g., rate-limited responses).
-	//   2. Concurrency semaphore: caps simultaneous in-flight connections to dukascopyBurst.
-	select {
-	case <-tickDownloadRateGate:
-	case <-ctx.Done():
+	// Phase 1: Download BI5 — submitted to the download gate worker pool.
+	// The gate manages concurrency (dukascopyBurst workers) and rate limiting
+	// (dukascopyMaxRPS tokens/s). The call respects ctx cancellation at every
+	// blocking point: enqueue, rate-gate wait, and result wait.
+	dl := RequestDownload(ctx, row)
+	switch dl.Status {
+	case DownloadNotFound:
+		onNotFound(ctx, d, row)
 		return
-	}
-	tickDownloadSem <- struct{}{}
-	data, err := downloadBI5(ctx, row)
-	<-tickDownloadSem
-
-	if err != nil {
-		if isNotFoundError(err) {
-			onNotFound(ctx, d, row)
-		} else {
-			span.RecordError(err)
-			updateStateFailed(ctx, d, row)
-		}
+	case DownloadOK:
+		// fall through to Phase 2
+	default: // DownloadRateLimited, DownloadError, or ctx canceled
+		span.RecordError(dl.Err)
+		updateStateFailed(ctx, d, row)
 		return
 	}
 
@@ -254,34 +201,25 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	}
 
 	// Phase 2: Convert + Upload — semaphore capped at runtime.NumCPU().
-	executeConvertUpload(ctx, d, row, data)
+	executeConvertUpload(ctx, d, row, dl.Data)
 }
 
 // executeNotFoundRecheck re-checks the Dukascopy API for a claimed NOT_FOUND row.
 // Used exclusively by T-1 recovery (executeRecoveryAction).
 //
-// Data found  → SetNotFoundStreak=0, Status=PENDING (ETL on the next cycle).
-// Still 404   → AddNotFoundStreak(+1, streak=2), IsHoliday=true, upload Zero-Row Parquet, Status=NOT_FOUND.
+// Data found → SetNotFoundStreak=0, Status=PENDING (ETL on the next cycle).
+// Still 404 → AddNotFoundStreak(+1, streak=2), IsHoliday=true, upload Zero-Row Parquet, Status=NOT_FOUND.
 // Other error → FAILED (handled by backfill-reset on retry).
 func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck", tickSpanAttrs(row))
 	defer span.End()
 
-	// Two-layer throttle: rate gate first, then concurrency semaphore.
-	select {
-	case <-tickDownloadRateGate:
-	case <-ctx.Done():
-		return
-	}
-	tickDownloadSem <- struct{}{}
-	data, err := downloadBI5(ctx, row)
-	<-tickDownloadSem
-
-	if err != nil {
-		if isNotFoundError(err) {
+	dl := RequestDownload(ctx, row)
+	if dl.Status != DownloadOK {
+		if dl.Status == DownloadNotFound {
 			// Still 404: increment streak, mark holiday, upload Zero-Row Parquet.
-			// DB commit happens before R2 upload so IsHoliday flag persists even on
-			// upload failure. If the upload fails the row is set to FAILED so that
+			// DB commit happens before R2 upload, so IsHoliday flag persists even on
+			// upload failure. If the upload fails, the row is set to FAILED so that
 			// T-1/Backfill can retry the full pipeline on the next cycle.
 			if dbErr := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 				_, e := tx.State.UpdateOneID(row.ID).
@@ -304,8 +242,8 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 				updateStateFailed(ctx, d, row)
 			}
 		} else {
-			span.RecordError(err)
-			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), err)
+			span.RecordError(dl.Err)
+			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), dl.Err)
 			updateStateFailed(ctx, d, row)
 		}
 		return
@@ -313,7 +251,6 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 
 	// Data is available again: reset streak to 0, set PENDING.
 	// The row will be picked up for a full ETL pass on the next cycle.
-	_ = data
 	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
@@ -331,28 +268,20 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 // executeT2Action implements the T-2 cross-validation pipeline.
 // Both COMPLETED and NOT_FOUND rows are re-downloaded from Dukascopy for verification.
 //
-//	COMPLETED + 2xx  → convert + upload (overwrite) + validate → CONFIRMED or BROKEN.
-//	NOT_FOUND + 2xx  → SetNotFoundStreak=0, Status=PENDING (ETL deferred to next cycle).
-//	NOT_FOUND + 404  → AddNotFoundStreak(+1); streak≥3 → commitZeroRowAndConfirm → CONFIRMED.
-//	COMPLETED + 404  → BROKEN (data was present at T-0 but is now missing — anomaly).
-//	Non-404 error    → FAILED.
+//	COMPLETED + 2xx → convert + upload (overwrite) + validate → CONFIRMED or BROKEN.
+//	NOT_FOUND + 2xx → SetNotFoundStreak=0, Status=PENDING (ETL deferred to next cycle).
+//	NOT_FOUND + 404 → AddNotFoundStreak(+1); streak≥3 → executeValidation → CONFIRMED.
+//	COMPLETED + 404 → BROKEN (data was present at T-0 but is now missing — anomaly).
+//	Non-404 error → FAILED.
 func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
 	ctx, span := tickTracer.Start(ctx, "ticks/T2-action", tickSpanAttrs(row))
 	defer span.End()
 
-	select {
-	case <-tickDownloadRateGate:
-	case <-ctx.Done():
-		return
-	}
-	tickDownloadSem <- struct{}{}
-	data, err := downloadBI5(ctx, row)
-	<-tickDownloadSem
-
+	dl := RequestDownload(ctx, row)
 	wasNotFound := row.PreviousStatus != nil && *row.PreviousStatus == state.PreviousStatusNOT_FOUND
 
-	if err != nil {
-		if isNotFoundError(err) {
+	if dl.Status != DownloadOK {
+		if dl.Status == DownloadNotFound {
 			if wasNotFound {
 				// NOT_FOUND + 404: increment streak.
 				// At ≥ notFoundThreshold: validate the Zero-Row Parquet that T-1 already
@@ -395,13 +324,13 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 				}
 			} else {
 				// COMPLETED + unexpected 404: data was there at T-0 time — mark as anomaly.
-				span.RecordError(err)
+				span.RecordError(dl.Err)
 				log.Printf("T2: COMPLETED got 404 for %s (traceID=%s) — setting BROKEN", row.ID, span.SpanContext().TraceID())
 				updateStateBroken(ctx, d, row)
 			}
 		} else {
-			span.RecordError(err)
-			log.Printf("T2: download error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), err)
+			span.RecordError(dl.Err)
+			log.Printf("T2: download error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), dl.Err)
 			updateStateFailed(ctx, d, row)
 		}
 		return
@@ -432,7 +361,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 	func() {
 		tickProcessSem <- struct{}{}
 		defer func() { <-tickProcessSem }()
-		parquet, convErr := convertBI5ToParquet(data, row)
+		parquet, convErr := convertBI5ToParquet(dl.Data, row)
 		if convErr != nil {
 			span.RecordError(convErr)
 			uploadErr = convErr
@@ -447,90 +376,6 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 		updateStateFailed(ctx, d, row)
 		return
 	}
-	executeValidation(ctx, d, row, preclaimPrev)
-}
-
-// executeNotFoundRecheckFull is the Backfill-Validation variant of the NOT_FOUND
-// recheck. Unlike the T-1 variant (executeNotFoundRecheck) which stops at COMPLETED
-// and lets T-2 validate later, this function performs the full pipeline in one pass:
-// Download → streak-reset → convert → upload → validate → CONFIRMED + SyncTask.
-//
-// preclaimPrev is the row's PreviousStatus before the current claim, forwarded to
-// executeValidation so a genuine demotion from CONFIRMED can trigger a SyncTask.
-func executeNotFoundRecheckFull(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
-	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck-full", tickSpanAttrs(row))
-	defer span.End()
-
-	// Step 1: Download — two-layer throttle (rate gate + concurrency semaphore).
-	select {
-	case <-tickDownloadRateGate:
-	case <-ctx.Done():
-		return
-	}
-	tickDownloadSem <- struct{}{}
-	data, err := downloadBI5(ctx, row)
-	<-tickDownloadSem
-
-	if err != nil {
-		if isNotFoundError(err) {
-			// Still 404: increment streak; may trigger Zero-Row flow.
-			handleNotFoundStreak(ctx, d, row)
-		} else {
-			// Non-404 error (503, timeout) during backfill NOT_FOUND recheck.
-			//
-			// This row was already NOT_FOUND before the recheck claim. A 503 here
-			// means the Dukascopy CDN returned a server error for a URL that was
-			// previously a 404 — the data almost certainly does not exist at a source.
-			// Treating it as FAILED would consume a retry_count slot and eventually
-			// lead to ABANDONED without the zero-row flow ever firing.
-			//
-			// Instead: increment notFoundStreak (same as a 404 would do). If the
-			// streak reaches notFoundThreshold (3), commitZeroRowAndConfirm fires
-			// and the slot is permanently resolved as a market-holiday hour.
-			//
-			// Race safety: the master-claim transaction already flipped this row's
-			// Status to PROCESSED (see claimBackfillMasterBatch's "recheck" routing),
-			// so it no longer matches any claim filter — T-0/T-1/T-2 target different
-			// timestamp windows, and the next backfill master-claim only matches the
-			// status set IN (PENDING, PROCESSED, FAILED, BROKEN, COMPLETED, NOT_FOUND)
-			// with PreviousStatus left untouched here. No other goroutine can steal
-			// this row between the claim transaction and this handleNotFoundStreak call.
-			span.RecordError(err)
-			log.Printf("backfill NOT_FOUND recheck for %s (traceID=%s): %v — treating as not-found, incrementing streak", row.ID, span.SpanContext().TraceID(), err)
-			handleNotFoundStreak(ctx, d, row)
-		}
-		return
-	}
-
-	// Data found: atomically reset NotFoundStreak to 0 before processing.
-	resetNotFoundStreak(ctx, d, row, "reset streak")
-
-	// Step 2: Convert + Upload (rate-limited). Do NOT set status to COMPLETED here;
-	// executeValidation (Step 3) will write the final CONFIRMED or BROKEN status.
-	var uploadErr error
-	func() {
-		tickProcessSem <- struct{}{}
-		defer func() { <-tickProcessSem }()
-
-		parquet, convErr := convertBI5ToParquet(data, row)
-		if convErr != nil {
-			span.RecordError(convErr)
-			uploadErr = convErr
-			return
-		}
-		if upErr := uploadToR2(ctx, row, parquet); upErr != nil {
-			span.RecordError(upErr)
-			uploadErr = upErr
-		}
-	}()
-
-	if uploadErr != nil {
-		updateStateFailed(ctx, d, row)
-		return
-	}
-
-	// Step 3: Validate the just-uploaded file and promote directly to CONFIRMED.
-	// The row is still in the PROCESSED state; executeValidation finalizes it.
 	executeValidation(ctx, d, row, preclaimPrev)
 }
 
@@ -625,8 +470,7 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 // Used exclusively by T-0: a PENDING row in T-0 is always freshly seeded,
 // so its streak is guaranteed to be 0. Setting to 1 is equivalent to +1
 // and makes the first-attempt intent explicit.
-// Unlike handleNotFoundStreak, it never touches RetryCount and never triggers
-// the Zero-Row / commitZeroRowAndConfirm flow.
+// It never touches RetryCount and never triggers the Zero-Row Parquet flow.
 func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 	span := trace.SpanFromContext(ctx)
 	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
@@ -646,7 +490,7 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 // handleNotFoundIncrement increments NotFoundStreak by 1 and sets status = NOT_FOUND.
 // Used by Backfill Group 1: a PENDING row in backfill may have been reclaimed from
 // a NOT_FOUND path (streak > 0), so Add is required instead of Set.
-// Like handleNotFoundSimple, it never touches RetryCount and never triggers Zero-Row.
+// Like the handleNotFoundSimple, it never touches RetryCount and never triggers Zero-Row.
 func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 	span := trace.SpanFromContext(ctx)
 	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
@@ -663,123 +507,13 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 }
 
-// handleNotFoundStreak atomically increments NotFoundStreak.
-// If the new value reaches notFoundThreshold (3), it triggers the Zero-Row
-// Parquet commit flow. Otherwise, the row is set to NOT_FOUND.
-// Bidirectional counter-rule: 404 → notFoundStreak++, retryCount-- (floor 0).
-func handleNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State) {
-	span := trace.SpanFromContext(ctx)
-
-	// 404 evidence reduces the retry penalty (floor 0).
-	newRetryCount := row.RetryCount - 1
-	if newRetryCount < 0 {
-		newRetryCount = 0
-	}
-
-	var updated *ent.State
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		var e error
-		// Atomically increment streak and decrement retryCount.
-		updated, e = tx.State.UpdateOneID(row.ID).
-			AddNotFoundStreak(1).
-			SetRetryCount(newRetryCount).
-			SetUpdatedAt(time.Now().UTC()).
-			Save(ctx)
-		if e != nil {
-			return e
-		}
-		if updated.NotFoundStreak < notFoundThreshold {
-			// Simple NOT_FOUND: streak below threshold.
-			updated, e = tx.State.UpdateOneID(row.ID).
-				SetPreviousStatus(state.PreviousStatusPROCESSED).
-				SetStatus(state.StatusNOT_FOUND).
-				SetUpdatedAt(time.Now().UTC()).
-				Save(ctx)
-		}
-		// else: row stays PROCESSED; commitZeroRowAndConfirm will finalize it.
-		return e
-	})
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("streak increment for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-		return
-	}
-
-	if updated.NotFoundStreak >= notFoundThreshold {
-		// UpdateOneID.Save() does not load edges — carry the instrument edge
-		// from the original row, so commitZeroRowAndConfirm can compute the R2 key.
-		updated.Edges = row.Edges
-		commitZeroRowAndConfirm(ctx, d, updated)
-	}
-}
-
-// commitZeroRowAndConfirm implements the Zero-Row Parquet commit protocol:
-//  1. Build a zero-row Parquet file in memory.
-//  2. Set IsHoliday=true in DB atomically — must happen BEFORE the R2 upload.
-//  3. Upload the file to R2 only after the DB commit.
-//  4. Read back and physically validate.
-//  5. Promote to CONFIRMED + SyncTask (or BROKEN on validation failure).
-func commitZeroRowAndConfirm(ctx context.Context, d *dal.DAL, row *ent.State) {
-	ctx, span := tickTracer.Start(ctx, "ticks/commit-zero-row", tickSpanAttrs(row))
-	defer span.End()
-
-	// 1. Build a zero-row Parquet file in memory.
-	zeroRowData := buildZeroRowParquet()
-
-	// 2. Set IsHoliday=true before uploading.
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-		_, e := tx.State.UpdateOneID(row.ID).
-			SetIsHoliday(true).
-			SetUpdatedAt(time.Now().UTC()).
-			Save(ctx)
-		return e
-	}); err != nil {
-		span.RecordError(fmt.Errorf("set IsHoliday for %s: %w", row.ID, err))
-		log.Printf("set IsHoliday for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-		return
-	}
-
-	// Build a local copy with IsHoliday=true so the R2 path helpers and
-	// validator see the correct state without an extra DB round-trip.
-	rowWithHoliday := *row
-	rowWithHoliday.IsHoliday = true
-
-	// 3. Upload to R2 — only because the DB commit above succeeded.
-	if err := uploadToR2(ctx, &rowWithHoliday, zeroRowData); err != nil {
-		span.RecordError(fmt.Errorf("upload zero-row for %s: %w", row.ID, err))
-		log.Printf("upload zero-row for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), err)
-		updateStateFailed(ctx, d, row)
-		return
-	}
-
-	// 4. Read back and validate.
-	fileBytes, err := readFromR2(ctx, &rowWithHoliday)
-	if err != nil {
-		span.RecordError(fmt.Errorf("read zero-row from R2 for %s: %w", row.ID, err))
-		log.Printf("read zero-row from R2 for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-		return
-	}
-	validationErr := validateParquetFile(ctx, &rowWithHoliday, fileBytes)
-
-	// 5. Finalize status.
-	if err := updateValidatedTickStatus(ctx, d, row, validationErr, nil); err != nil {
-		span.RecordError(err)
-		log.Printf("confirm/break zero-row for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
-	}
-}
-
 // handleRetryReset increments RetryCount atomically and either resets the row
-// to PENDING (for another attempt) or transitions it to ABANDONED (≥ maxRetryCount).
+// to PENDING (for another attempt) or transitions it to ABANDONED (≥ 5).
 //
-// Mutual Exclusive Mutator (Mapping State.md Aturan Global #3 — WAJIB):
-// whenever RetryCount is incremented, NotFoundStreak MUST be decremented in
-// the same atomic transaction (floor 0), mirroring how handleNotFoundStreak
-// decrements RetryCount whenever NotFoundStreak is incremented. This keeps the
-// two error counters from accumulating independently across overlapping
-// failure modes (e.g., a row that alternates between 404s and 503s).
-// handleRetryReset increments RetryCount and resets the row to PENDING.
-// Bidirectional counter-rule: retry penalty reduces NotFoundStreak (floor 0),
-// mirroring how handleNotFoundStreak decrements RetryCount on 404 evidence.
+// Mutual Exclusive Mutator: whenever RetryCount is incremented, NotFoundStreak
+// MUST be decremented in the same atomic transaction (floor 0), keeping the two
+// error counters from accumulating independently across overlapping failure modes
+// (e.g., a row that alternates between 404s and 503s).
 // T-1 recovery never transitions to ABANDONED — retry is unbounded.
 func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 	span := trace.SpanFromContext(ctx)
@@ -928,11 +662,16 @@ var errNotFound = errors.New("tick source: 404 not found")
 
 func isNotFoundError(err error) bool { return errors.Is(err, errNotFound) }
 
+// errRateLimited is returned by downloadBI5 when Dukascopy responds with HTTP 429.
+var errRateLimited = errors.New("tick source: 429 rate limited")
+
+func isRateLimitedError(err error) bool { return errors.Is(err, errRateLimited) }
+
 // downloadBI5 downloads the LZMA-compressed BI5 tick file from Dukascopy for
 // the instrument and UTC hour represented by row.  Returns errNotFound on 404.
 //
-// Must be called while holding BOTH a tickDownloadRateGate token AND a
-// tickDownloadSem slot (acquired by the callers in ticks.go).
+// Must only be called from a download gate worker (runDownloadWorker) after a
+// rate-gate token has been consumed. Direct calls bypass the concurrency budget.
 func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
 	ctx, span := tickTracer.Start(ctx, "ticks/download-bi5", tickSpanAttrs(row))
 	defer span.End()
@@ -951,6 +690,10 @@ func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
 	if errors.Is(err, dukascopy.ErrNotFound) {
 		span.AddEvent("404: no data for this hour")
 		return nil, errNotFound
+	}
+	if errors.Is(err, dukascopy.ErrTooManyRequests) {
+		span.AddEvent("429: rate limited")
+		return nil, errRateLimited
 	}
 	if err != nil {
 		span.RecordError(err)

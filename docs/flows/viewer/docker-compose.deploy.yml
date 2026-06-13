@@ -10,14 +10,14 @@
 ## Web editor) without checking out the source at all.
 ##
 ## Stack-level env vars you may override before deploying:
-##   IMAGE_TAG   default: latest
-##   PORT        default: 4040   (host port the viewer is published on)
+##   IMAGE_TAG default: latest
+##   PORT default: 4040 (host port the viewer is published on)
 ##
 ## Network: attaches to `geonera_geonera` — the network created by the main
 ## stack (docker-compose.portainer.yml defines `networks.geonera`, which
 ## Portainer prefixes with the stack name "geonera", yielding
 ## `geonera_geonera`). Joining it lets this viewer reach / be reached by the
-## ingestion stack's services directly by container name (e.g. `ingestion`,
+## ingestion stack's services directly by container name (e.g., `ingestion`,
 ## `admin-backend`) over the internal Docker network — useful if you ever
 ## want to point "Render settings" at an internal PlantUML server, or front
 ## everything with a shared reverse proxy container on that same network.

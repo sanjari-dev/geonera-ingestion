@@ -8,11 +8,6 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 )
 
-// errNotImplemented is returned by external operations whose client code has
-// not yet been wired up (e.g., candle Parquet builder, candle R2 paths).
-// Claimed rows will land in FAILED (recoverable by Backfill).
-var errNotImplemented = errors.New("not implemented")
-
 // Package-level singleton clients shared by all tick (and candle) workers.
 // Both must be set via InitClients before any worker goroutine is dispatched.
 var (

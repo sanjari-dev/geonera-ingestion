@@ -60,7 +60,7 @@ start
 :runTickParentHandler(ctx, "REGULAR", dal);<<lock>>
 note right
   Triggered by queue jobs.ticks.regular,
-  expected to fire every hour at minute :05 (e.g. 10:05 UTC).
+  expected to fire every hour at minute :05 (e.g., 10:05 UTC).
   Runs only after LockIDTick (1001) is acquired
   via the Direct Connection (see 00-overview-and-locking.puml).
 end note
@@ -69,7 +69,7 @@ split
   ' ===================== T-0 =====================
   :**T-0 — Current Hour (Real-time Ingestion)**
   Target timestamp = current running hour
-  (e.g. run at 10:05 -> target 10:00:00 UTC);
+  (e.g., run at 10:05 -> target 10:00:00 UTC);
   :Query all instruments WHERE IsActive=true AND IsPause=false;<<db>>
   :For each instrument: INSERT PENDING row at target
   using INSERT ... ON CONFLICT DO NOTHING;<<db>>
@@ -86,7 +86,13 @@ split
   :Update -> PROCESSED
   (SetPreviousStatus = old status, atomic);
   :Download raw BI5 file from Dukascopy API;<<api>>
-  note right: Bounded Semaphore — hard cap **12** concurrent goroutines\n(primary defense against HTTP 429 Too Many Requests)
+  note right
+    **Download gate** — RequestDownload(ctx, row) submits to a
+    fixed pool of **12** worker goroutines. Each worker waits for
+    a token-bucket token (12 req/s) before sending the HTTP request.
+    Context-cancellation-safe at every blocking point:
+    enqueue wait, rate-gate wait, and result wait.
+  end note
 
   if (Download result?) then (2xx — data received)
     :Reset NotFoundStreak = 0 (if non-zero);<<db>>
@@ -107,6 +113,9 @@ split
       T-1 uploads Zero-Row at streak=2 (no validation).
       T-2 validates the existing file at streak=3 → CONFIRMED.
     end note
+  elseif () then (429 — rate limited)
+    :Status -> FAILED;
+    note right: Transient rate limit — not evidence\nof data absence. Retried by T-1 / Backfill.
   elseif () then (non-2xx / non-404 — system error)
     :Status -> FAILED;
   else (Unhandled panic / crash mid-flight)
@@ -118,16 +127,15 @@ split again
   ' ===================== T-1 =====================
   :**T-1 — Previous Hour (Recovery & Retry / Safety Net)**
   Target timestamp = one hour before current
-  (e.g. run at 10:05 -> target 09:00:00 UTC);
+  (e.g., run at 10:05 -> target 09:00:00 UTC);
   :Claim: Status IN (PENDING, PROCESSED, FAILED, **BROKEN**, NOT_FOUND),
   Instrument.IsPause=false & IsActive=true;
   note right
-    "Claim" di sini berarti pengambilan task untuk diproses.
-    PreviousStatus dicatat sebagai record status sebelum di-claim —
-    bukan sebagai logic routing.
+    "Claim" here refers to the task being claimed for processing.
+    PreviousStatus is recorded as the status record before it was claimed, not as routing logic.
   end note
 
-  if (Status sebelum di-claim?) then (PROCESSED — stuck/zombie worker)
+  if (Status before claim?) then (PROCESSED — stuck/zombie worker)
     :Sweep & reset directly -> PENDING
     (no RetryCount change for TICK);
   elseif () then (PENDING)
@@ -142,7 +150,7 @@ split again
     end note
   else (NOT_FOUND)
     :Download raw BI5 file from Dukascopy API;<<api>>
-    note right: Rate gate + Semaphore (same throttle as T-0)
+    note right: Download gate — same 12-worker pool as T-0
     if (Download result?) then (2xx — data now available)
       :SetNotFoundStreak = 0 — atomic;<<db>>
       :Status -> PENDING (re-attempt on next cycle);
@@ -158,6 +166,8 @@ split again
         T-2 re-downloads; at streak=3
         executeValidation (reads R2) → CONFIRMED.
       end note
+    elseif () then (429 — rate limited)
+      :Status -> FAILED;
     else (non-2xx / non-404 error)
       :Status -> FAILED;
     endif
@@ -167,11 +177,11 @@ split again
   ' ===================== T-2 =====================
   :**T-2 — Two Hours Ago (Cross-Validation & Promotion)**
   Target timestamp = two hours before current
-  (e.g. run at 10:05 -> target 08:00:00 UTC);
+  (e.g., run at 10:05 -> target 08:00:00 UTC);
   :Claim: Status IN (COMPLETED, NOT_FOUND),
   Instrument.IsActive = true;
   :Download raw BI5 file from Dukascopy API;<<api>>
-  note right: Rate gate + Semaphore (same throttle as T-0)
+  note right: Download gate — same 12-worker pool as T-0
 
   if (Claimed status + Download result?) then (COMPLETED + 2xx)
     note right: Re-download matches T-0 source — cross-validation
@@ -217,6 +227,8 @@ split again
   elseif () then (COMPLETED + 404 — anomaly)
     :Status -> BROKEN;
     note right: Data was present at T-0 but\nis now missing — investigate manually
+  elseif () then (429 — rate limited)
+    :Status -> FAILED;
   else (non-2xx / non-404 error)
     :Status -> FAILED;
   endif

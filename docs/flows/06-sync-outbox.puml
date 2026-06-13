@@ -92,9 +92,10 @@ else (N tasks claimed, 1 ≤ N ≤ 12)
   :Launch N goroutines (fire & forget)
   RunSyncHandler returns immediately;
   note right
-    Each goroutine runs processSyncTaskWorker
-    independently with context.Background() —
-    not bound to the trigger's context.
+    Each goroutine runs processSyncTaskWorker with
+    context.WithTimeout(ctx, **5 min**) + defer cancel().
+    The 5-minute deadline bounds the goroutine lifetime —
+    a stuck pg_advisory_xact_lock wait cannot leak forever.
     Subsequent triggers can claim more rows
     without waiting for these goroutines.
   end note
@@ -135,6 +136,13 @@ partition "processSyncTaskWorker (per goroutine)" {
     pg_advisory_xact_lock — **blocking wait**
     (serialises concurrent goroutines that also
     reach count == 24 at the same time);<<lock>>
+    note right
+      If the lock cannot be acquired within the
+      5-minute goroutine deadline, lib/pq cancels
+      the blocking query via the PostgreSQL cancel
+      protocol → WaitAndAcquireAdvisoryLock returns
+      an error and the goroutine exits cleanly.
+    end note
 
     :UPDATE State (CANDLE row)
     SET resolved_tick_count = 24,

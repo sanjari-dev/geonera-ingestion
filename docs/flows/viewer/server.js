@@ -10,7 +10,7 @@
  * Usage (from this `viewer` folder):
  *   node server.js [port]
  *
- * Then open:  http://localhost:<port>/viewer/
+ * Then open: http://localhost:<port>/viewer/
  *
  * (Root of the server is the parent `flows` folder, so both the viewer app
  * AND the .puml sources are reachable from the same origin.)

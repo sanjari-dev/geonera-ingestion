@@ -19,7 +19,7 @@ const decimalScale = 100_000
 //
 // Architecture §3.A schema:
 //   - Timestamp: int64 — microseconds since Unix epoch, UTC
-//   - Instrument: string — instrument name (e.g. "eurusd")
+//   - Instrument: string — instrument name (e.g., "eurusd")
 //   - Bid / ask: float64 — actual price after divider (≈ Decimal precision)
 //   - Bid_volume / ask_volume: int64
 type Row struct {

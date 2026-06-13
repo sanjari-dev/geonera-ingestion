@@ -117,8 +117,8 @@ html, body {
   margin-bottom: 5px;
 }
 .diagram-item.active .num { background: var(--accent); color: #fff; }
-.diagram-item .name { display: block; font-size: 13.5px; font-weight: 600; margin-bottom: 2px; }
-.diagram-item .desc { display: block; font-size: 11.5px; color: var(--text-muted); line-height: 1.4; }
+.diagram-item .name { display: block; font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+.diagram-item .desc { display: block; font-size: 11px; color: var(--text-muted); line-height: 1.4; }
 
 .sidebar-footer {
   border-top: 1px solid var(--border);
@@ -143,7 +143,7 @@ html, body {
 .ghost-btn:hover { background: var(--hover); }
 .ghost-btn.small { font-size: 12px; padding: 6px 10px; }
 
-.settings { font-size: 12.5px; }
+.settings { font-size: 12px; }
 .settings summary {
   cursor: pointer;
   color: var(--text-muted);
@@ -159,7 +159,7 @@ html, body {
   color: var(--text);
   border-radius: 8px;
   padding: 7px 9px;
-  font-size: 12.5px;
+  font-size: 12px;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 .field.row select { font-family: inherit; }
@@ -296,7 +296,7 @@ html, body {
   padding: 8px 24px;
   border-top: 1px solid var(--border);
   background: var(--panel);
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text-muted);
 }
 

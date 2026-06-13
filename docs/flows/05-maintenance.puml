@@ -157,11 +157,10 @@ repeat
       — true while historical range not yet fully covered,
       false once seeded down to StartDate;<<db>>
       note right
-        Status baris tidak dipertimbangkan.
-        Backward gap fill sudah menyisipkan PENDING
-        untuk setiap slot yang kosong — apakah baris
-        tersebut sudah diproses atau belum tidak relevan
-        untuk keputusan pause.
+        Row status is not considered.
+        Backward gap fill has already inserted PENDING rows
+        for every missing slot — whether those rows have been
+        processed yet is irrelevant to the pause decision.
       end note
 
     split again
@@ -182,7 +181,7 @@ repeat
       :UPDATE batch SET IsDeleted = true
       WHERE timestamp < Instrument.StartDate
       AND IsDeleted = false;<<db>>
-      note right: Marked rows are immediately\nignored by every ETL worker
+      note right: Marked rows are immediately \n ignored by every ETL worker
 
       :**Phase 2 — R2 Sweep (collect results)**;
       :Initialise two groups:

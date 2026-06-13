@@ -18,6 +18,9 @@ import (
 // that hour) or when the server returns an empty body.
 var ErrNotFound = errors.New("dukascopy: 404 not found")
 
+// ErrTooManyRequests is returned when Dukascopy responds with HTTP 429.
+var ErrTooManyRequests = errors.New("dukascopy: 429 too many requests")
+
 const baseURL = "https://datafeed.dukascopy.com/datafeed/"
 
 // Client fetches BI5 tick files from Dukascopy's public data feed.
@@ -85,6 +88,8 @@ func (c *Client) FetchBI5(ctx context.Context, instrument string, ts time.Time) 
 		return data, nil
 	case http.StatusNotFound:
 		return nil, ErrNotFound
+	case http.StatusTooManyRequests:
+		return nil, ErrTooManyRequests
 	default:
 		return nil, fmt.Errorf("dukascopy: status %d for %s", resp.StatusCode, url)
 	}

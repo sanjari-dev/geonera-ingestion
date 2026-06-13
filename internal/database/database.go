@@ -31,35 +31,6 @@ func NewEntClient(ctx context.Context) (*ent.Client, error) {
 	return openEnt(dsn)
 }
 
-// NewLockDB opens a raw *sql.DB on the direct Postgres connection (DATABASE_DIRECT_URL).
-// This bypasses PgBouncer and is reserved exclusively for the Parent Handlers
-// that must hold a transaction-level advisory lock for the duration of an ETL run.
-// The caller is responsible for closing the DB when done.
-func NewLockDB(ctx context.Context) (*sql.DB, error) {
-	dsn := os.Getenv("DATABASE_DIRECT_URL")
-	if dsn == "" {
-		return nil, fmt.Errorf("DATABASE_DIRECT_URL is not set")
-	}
-
-	db, err := otelsql.Open("postgres", dsn,
-		otelsql.WithAttributes(semconv.DBSystemNamePostgreSQL),
-		otelsql.WithSpanOptions(otelsql.SpanOptions{
-			OmitConnResetSession: true, // avoid noise from connection resets
-			OmitRows:             true, // skip row-level spans (too verbose)
-		}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open lock db: %w", err)
-	}
-
-	if err = db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to ping lock db: %w", err)
-	}
-
-	return db, nil
-}
-
 // NewPoolClient opens an OTel-instrumented ent.Client for ETL worker goroutines.
 //
 // Resolution order:
@@ -93,7 +64,7 @@ func NewPoolClient(ctx context.Context) (*ent.Client, error) {
 
 // openEnt opens an OTel-instrumented ent.Client for the given DSN without
 // pinging (caller already pinged).
-func openEnt(dsn string) (*ent.Client, error) {
+func openEnt(dsn string) (_ *ent.Client, err error) {
 	db, err := otelsql.Open("postgres", dsn,
 		otelsql.WithAttributes(semconv.DBSystemNamePostgreSQL),
 		otelsql.WithSpanOptions(otelsql.SpanOptions{
@@ -104,10 +75,15 @@ func openEnt(dsn string) (*ent.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open otelsql db: %w", err)
 	}
+	// Close db if anything after this point fails; on success db ownership
+	// transfers to the ent.Client and is released via client.Close().
+	defer func() {
+		if err != nil {
+			_ = db.Close()
+		}
+	}()
 
-	drv := entsql.OpenDB(dialect.Postgres, db)
-	client := ent.NewClient(ent.Driver(drv))
-	return client, nil
+	return ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db))), nil
 }
 
 // ping opens a temporary sql.DB, runs PingContext, and closes the connection.

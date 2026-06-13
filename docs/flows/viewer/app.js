@@ -1,9 +1,9 @@
 /* ============================================================================
  * Geonera Ingestion — Flow Diagram Viewer
  *
- * Renders the .puml sources in ../ live in the browser by talking to a
+ * Renders the .puml sources in '../' live in the browser by talking to a
  * PlantUML rendering server (the public one by default, or any local/self
- * hosted instance — e.g. the `plantuml/plantuml-server` Docker image).
+ * hosted instance — e.g., the `plantuml/plantuml-server` Docker image).
  *
  * No build step, no dependencies. Encoding uses PlantUML's "hex" transport
  * (`~h<hex>`), which needs no compression library — just UTF-8 -> hex.
@@ -114,7 +114,7 @@ const els = {
 //
 //  1. "Standard" transport (preferred): raw-deflate the UTF-8 source, then
 //     pack it with PlantUML's custom 6-bit alphabet (3 bytes -> 4 chars).
-//     This is exactly what editor.plantuml.com / plantuml.com use, and
+//     This is exactly what editor.plantuml.com / plantuml.com uses and
 //     produces URLs roughly 1/3-1/6th the length of the raw source — well
 //     under the URL-length limits enforced by the public server's CDN/WAF.
 //     Compression uses the browser-native `CompressionStream("deflate-raw")`
@@ -125,7 +125,7 @@ const els = {
 //     compression required. Always correct, but produces URLs ~2x the byte
 //     length of the source — long enough that the public plantuml.com server
 //     rejects them with HTTP 403 (its CDN/WAF caps URL length). Kept as a
-//     fallback for browsers without `CompressionStream` (e.g. very old ones),
+//     fallback for browsers without `CompressionStream` (e.g., very old ones),
 //     which will mostly only matter against self-hosted servers anyway.
 // ---------------------------------------------------------------------------
 const PLANTUML_ALPHABET =
@@ -162,16 +162,14 @@ const supportsDeflate = typeof CompressionStream !== "undefined";
 async function deflateRaw(bytes) {
   const cs = new CompressionStream("deflate-raw");
   const writer = cs.writable.getWriter();
-  writer.write(bytes);
-  writer.close();
+  await writer.write(bytes);
+  await writer.close();
   const buf = await new Response(cs.readable).arrayBuffer();
   return new Uint8Array(buf);
 }
 
 function encodeHex(bytes) {
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  return "~h" + hex;
+  return "~h" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /**
@@ -242,6 +240,12 @@ function escapeHtml(s) {
 // ---------------------------------------------------------------------------
 // Selecting & rendering a diagram
 // ---------------------------------------------------------------------------
+function showError(message) {
+  els.loading.classList.add("hidden");
+  els.error.textContent = "⚠ " + message;
+  els.error.classList.remove("hidden");
+}
+
 async function selectDiagram(d) {
   state.current = d;
   renderList(els.search.value);
@@ -254,9 +258,19 @@ async function selectDiagram(d) {
   els.loading.classList.remove("hidden");
   els.img.removeAttribute("src");
 
+  let res;
   try {
-    const res = await fetch(`../${d.file}`, { cache: "no-store" });
-    if (!res.ok) throw new Error(`Failed to fetch ${d.file} (HTTP ${res.status}). Are you serving this folder over HTTP? See README.md.`);
+    res = await fetch(`../${d.file}`, { cache: "no-store" });
+  } catch (err) {
+    showError(err.message);
+    return;
+  }
+  if (!res.ok) {
+    showError(`Failed to fetch ${d.file} (HTTP ${res.status}). Are you serving this folder over HTTP? See README.md.`);
+    return;
+  }
+
+  try {
     state.source = await res.text();
     els.sourceCode.textContent = state.source;
 
@@ -272,9 +286,7 @@ async function selectDiagram(d) {
     els.statusText.textContent =
       `Rendered "${d.name}" via ${state.serverUrl}${encNote} • Drag to pan • Scroll / pinch to zoom • Double-click to fit`;
   } catch (err) {
-    els.loading.classList.add("hidden");
-    els.error.textContent = "⚠ " + err.message;
-    els.error.classList.remove("hidden");
+    showError(err.message);
   }
 }
 
@@ -378,8 +390,8 @@ els.stage.addEventListener("dblclick", () => state.current && fitToScreen());
 // Toolbar zoom buttons
 els.zoomIn.addEventListener("click", () => setScale(state.scale * 1.25));
 els.zoomOut.addEventListener("click", () => setScale(state.scale / 1.25));
-els.zoomFit.addEventListener("click", fitToScreen);
-els.zoomReset.addEventListener("click", resetZoom);
+els.zoomFit.addEventListener("click", () => fitToScreen());
+els.zoomReset.addEventListener("click", () => resetZoom());
 
 window.addEventListener("resize", () => state.current && fitToScreen());
 
@@ -398,14 +410,14 @@ async function refreshCurrent() {
   }
 }
 
-els.refresh.addEventListener("click", refreshCurrent);
+els.refresh.addEventListener("click", () => void refreshCurrent());
 
 document.addEventListener("keydown", (e) => {
   const tag = document.activeElement.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
   if (e.key === "r" || e.key === "R") {
     e.preventDefault();
-    refreshCurrent();
+    void refreshCurrent();
   }
 });
 
@@ -418,7 +430,7 @@ els.toggleSource.addEventListener("click", () => {
 
 // ---------------------------------------------------------------------------
 // Theme toggle (UI chrome only — rendered diagrams always have a white
-// background, forced in the .puml skinparams, so they stay readable either way)
+// background, forced in the .puml skin params, so they stay readable either way)
 // ---------------------------------------------------------------------------
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
@@ -438,28 +450,28 @@ applyTheme(localStorage.getItem("puml-viewer-theme") || "light");
 els.serverUrlInput.value = state.serverUrl;
 els.formatSelect.value = state.format;
 
-function rerenderCurrent() {
-  if (state.current) selectDiagram(state.current);
+async function rerenderCurrent() {
+  if (state.current) await selectDiagram(state.current);
 }
 
 els.serverUrlInput.addEventListener("change", () => {
   const v = els.serverUrlInput.value.trim() || DEFAULT_SERVER;
   state.serverUrl = v;
   localStorage.setItem("puml-viewer-server", v);
-  rerenderCurrent();
+  void rerenderCurrent();
 });
 
 els.formatSelect.addEventListener("change", () => {
   state.format = els.formatSelect.value;
   localStorage.setItem("puml-viewer-format", state.format);
-  rerenderCurrent();
+  void rerenderCurrent();
 });
 
 els.resetServer.addEventListener("click", () => {
   state.serverUrl = DEFAULT_SERVER;
   els.serverUrlInput.value = DEFAULT_SERVER;
   localStorage.setItem("puml-viewer-server", DEFAULT_SERVER);
-  rerenderCurrent();
+  void rerenderCurrent();
 });
 
 // ---------------------------------------------------------------------------
@@ -472,4 +484,4 @@ els.search.addEventListener("input", () => renderList(els.search.value));
 // ---------------------------------------------------------------------------
 renderList();
 applyTransform();
-selectDiagram(DIAGRAMS[0]);
+void selectDiagram(DIAGRAMS[0]);

@@ -30,11 +30,11 @@ type backfillLayer int
 const (
 	// backfillLayerIngestion: PENDING → PROCESSED, run the full download/convert/upload ETL.
 	backfillLayerIngestion backfillLayer = iota
-	// backfillLayerRetryReset: FAILED/BROKEN → PROCESSED, apply handleRetryReset
+	// backfillLayerRetryReset: FAILED/BROKEN → PROCESSED, apply the handleRetryReset
 	// (RetryCount+1 / NotFoundStreak-1 → PENDING; no ABANDONED cap).
 	backfillLayerRetryReset
 	// backfillLayerT2Action: COMPLETED or NOT_FOUND (streak >= threshold) → PROCESSED,
-	// run the same re-download + cross-validation logic as T-2 (executeT2Action):
+	// run the same re-download and cross-validation logic as T-2 (executeT2Action):
 	// COMPLETED+2xx → convert+upload+validate → CONFIRMED/BROKEN,
 	// NOT_FOUND+2xx → PENDING, NOT_FOUND+404+streak>=3 → validateZeroRow → CONFIRMED,
 	// COMPLETED+404 → BROKEN.
@@ -77,10 +77,9 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	runBackfillMasterClaim(ctx, d, span)
 }
 
-
 // runBackfillMasterClaim implements the "Master Bulk-Claim" strategy: claim up
 // to backfillMasterClaimLimit rows in a single FOR UPDATE SKIP LOCKED transaction
-// (oldest Timestamp first, Timestamp <= T-3), apply the per-row routing decision,
+// (the oldest Timestamp first, Timestamp <= T-3), apply the per-row routing decision,
 // dispatch all rows in parallel goroutines, and wait for them to finish.
 // Each backfill trigger processes exactly one batch of up to 120 rows — no loop.
 // The only real throttles are the download rate-gate/semaphore (12 concurrent)
@@ -125,7 +124,7 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL, span trace.Span) {
 //
 // This single function replaces the per-status routing rules that used to be
 // split across runIngestionLoop / runResetLoop / runValidationLoop /
-// runNotFoundRecheckLoop / runAbandonedResetPhase for the Backfill path.
+// runNotFoundRecheckLoop for the Backfill path.
 func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Time) ([]backfillRoutedRow, error) {
 	var routed []backfillRoutedRow
 	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
@@ -203,7 +202,7 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 					// Layer C — T-2 style: re-download + cross-validate, same as T-2.
 					newPrev, newStatus, layer = state.PreviousStatusNOT_FOUND, state.StatusPROCESSED, backfillLayerT2Action
 				} else {
-					// Layer B: streak below threshold — re-download like T-1.
+					// Layer B: streak below a threshold — re-download like T-1.
 					// 2xx → PENDING, 404 → Zero-Row + NOT_FOUND, error → FAILED.
 					newPrev, newStatus, layer = state.PreviousStatusNOT_FOUND, state.StatusPROCESSED, backfillLayerNotFoundRecheck
 				}

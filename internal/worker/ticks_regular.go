@@ -103,7 +103,7 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // of the Master Bulk-Claim (see runBackfillMasterClaimLoop / claimBackfillMasterBatch).
 //
 // Concurrency is bounded by the real bottlenecks deeper in the pipeline —
-// tickDownloadSem / tickDownloadRateGate (12 concurrent downloads) and
+// the download gate (12 concurrent workers, download_gate.go) and
 // tickProcessSem (runtime.NumCPU() concurrent convert+upload) — not by an
 // artificial goroutine-pool cap here.
 func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time) {
@@ -190,10 +190,10 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target ti
 // runValidationLoop claims COMPLETED and NOT_FOUND rows for the given hour
 // and cross-validates each one via executeT2Action (re-download from Dukascopy):
 //
-//   - COMPLETED  + 2xx  → convert+upload(overwrite)+validate → CONFIRMED or BROKEN.
-//   - NOT_FOUND  + 2xx  → SetNotFoundStreak=0, Status=PENDING (ETL next cycle).
-//   - NOT_FOUND  + 404  → streak+1; at notFoundThreshold(3): executeValidation → CONFIRMED.
-//   - COMPLETED  + 404  → BROKEN (anomaly: data was present at T-0 time).
+//   - COMPLETED + 2xx → convert+upload(overwrite)+validate → CONFIRMED or BROKEN.
+//   - NOT_FOUND + 2xx → SetNotFoundStreak=0, Status=PENDING (ETL next cycle).
+//   - NOT_FOUND + 404 → streak+1; at notFoundThreshold(3): executeValidation → CONFIRMED.
+//   - COMPLETED + 404 → BROKEN (anomaly: data was present at T-0 time).
 //   - Any non-404 error → FAILED.
 //
 // Used by T-2 (two-hours-ago) with a non-nil timestamp.
@@ -203,7 +203,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
 		// preclaimPrev is the row's PreviousStatus BEFORE the claim — forwarded to
-		// executeNotFoundRecheckFull to detect genuine demotions (CONFIRMED → BROKEN).
+		// executeT2Action to detect genuine demotions (CONFIRMED → BROKEN).
 		claimed, preclaimPrev, err := claimStateWithPrevious(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			instrumentFilters := []predicate.Instrument{instrument.IsActiveEQ(true)}
 			if respectPause {
