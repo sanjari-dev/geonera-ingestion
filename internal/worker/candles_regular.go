@@ -156,6 +156,9 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	)
 	defer span.End()
 
+	candleAggSem <- struct{}{}
+	defer func() { <-candleAggSem }()
+
 	if row.Edges.Instrument == nil {
 		span.RecordError(fmt.Errorf("candle agg: instrument not loaded for %s", row.ID))
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "candle agg: instrument not loaded")

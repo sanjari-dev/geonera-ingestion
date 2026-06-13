@@ -170,7 +170,7 @@ func main() {
 </html>`)
 	})
 
-	api.RegisterRoutes(app, appDAL, activityLogger, r2Client)
+	api.RegisterRoutes(app, appDAL, activityLogger, r2Client, os.Getenv("INGESTION_SECRET"))
 
 	port := os.Getenv("APP_PORT")
 	if port == "" {

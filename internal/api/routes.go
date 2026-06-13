@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
+	"log"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -18,8 +20,29 @@ import (
 // RegisterRoutes mounts all /api/v1 endpoints on app.
 // Every handler extracts the incoming OTel trace context from HTTP headers,
 // fires the corresponding background worker goroutine, and returns 202 immediately.
-func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c *r2.Client) {
+//
+// ingestionSecret is the value of INGESTION_SECRET from the environment.
+// When non-empty, all /api/v1 requests must carry a matching X-Ingestion-Secret
+// header (verified with constant-time comparison to prevent timing attacks).
+// When empty, authentication is skipped and a startup warning is emitted.
+func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c *r2.Client, ingestionSecret string) {
 	v1 := app.Group("/api/v1")
+
+	// ── Ingestion secret middleware ───────────────────────────────────────────
+	if ingestionSecret != "" {
+		secretBytes := []byte(ingestionSecret)
+		v1.Use(func(c *fiber.Ctx) error {
+			incoming := c.Get("X-Ingestion-Secret")
+			if subtle.ConstantTimeCompare([]byte(incoming), secretBytes) != 1 {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+					"error": "unauthorized: missing or invalid X-Ingestion-Secret",
+				})
+			}
+			return c.Next()
+		})
+	} else {
+		log.Print("warning: INGESTION_SECRET not set — /api/v1 routes are unauthenticated")
+	}
 
 	// ── Auto-Seeder & Pruning ─────────────────────────────────────────────────
 	// Triggered every ~5 minutes from an external scheduler.

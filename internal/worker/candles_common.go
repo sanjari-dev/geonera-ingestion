@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 
 	"go.opentelemetry.io/otel"
@@ -19,6 +20,11 @@ import (
 )
 
 var candleTracer = otel.Tracer("worker/candles")
+
+// candleAggSem limits concurrent candle aggregation goroutines to runtime.NumCPU().
+// Each goroutine streams up to 24 hourly Parquet files from R2; bounding concurrency
+// prevents R2 connection spikes and caps peak memory under the aggregation loop.
+var candleAggSem = make(chan struct{}, runtime.NumCPU())
 
 // RunCandleParentHandler is the single entry point for all candle-aggregation work.
 // It holds the global advisory lock for the full duration, so no other job
