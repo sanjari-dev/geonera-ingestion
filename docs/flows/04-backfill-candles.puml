@@ -67,24 +67,31 @@ end note
 
 :Claim CANDLE rows belonging to instruments
 where IsActive = true & IsPause = false, matching:
- (a) Status IN (FAILED, BROKEN, PROCESSED) — claimed
+ (a) Status IN (FAILED, BROKEN, PROCESSED, COMPLETED) — claimed
      immediately, no UpdatedAt staleness check, OR
  (b) Status = PENDING **and** ResolvedTickCount = 24
      (a lagging-but-ready aggregation job);
 
-if (Which category was claimed?) then (a — FAILED / BROKEN / PROCESSED: needs reset)
-  :**Reset path**;
+if (Which category was claimed?) then (PROCESSED — zombie interrupted aggregation)
+  :Reset → PENDING at claim time
+  (no RetryCount change — not treated as failure,
+  same behaviour as TICK zombie recovery);
+
+elseif () then (COMPLETED — orphaned upload before validation)
   note right
-    *** Important CANDLE-specific exception ***
-    On the generic TICK flow, PROCESSED -> PENDING
-    recovery does NOT bump RetryCount.
-    For CANDLE, a stuck PROCESSED row indicates a
-    daily aggregation that got interrupted, so
-    RetryCount IS incremented even for this transition.
+    Upload succeeded but worker crashed before
+    the instant read-back + validation pass.
+    Backfill re-runs validation only — no re-upload.
   end note
-  :AddRetryCount(+1) — atomic SQL increment
-  (applies uniformly to FAILED, BROKEN,
-  and stuck PROCESSED -> PENDING for CANDLE);
+  :Read-back Candle Parquet from R2;<<r2>>
+  if (Validation result?) then (PASSED)
+    :Status -> CONFIRMED;
+  else (FAILED)
+    :Status -> BROKEN;
+  endif
+
+elseif () then (FAILED or BROKEN — needs retry-reset)
+  :AddRetryCount(+1) — atomic SQL increment;
   if (RetryCount >= 5 ?) then (yes)
     :Status -> ABANDONED
     (stop the infinite retry loop,
@@ -120,6 +127,21 @@ else (b — PENDING & ResolvedTickCount = 24: ready for catch-up)
   else (Storage anomaly: NoSuchKey + IsDeleted=false)
     :Status -> BROKEN;
   endif
+endif
+
+' Phase C — last-resort ABANDONED reset.
+' Only runs when the master claim returned zero actionable rows,
+' meaning no FAILED/BROKEN/PROCESSED/COMPLETED/PENDING-ready rows
+' exist within the Zona Eksklusif boundary.
+if (Batch was empty?) then (yes — no actionable rows remain)
+  repeat
+    :Claim one ABANDONED CANDLE row
+    WHERE Timestamp <= boundary
+    (FOR UPDATE SKIP LOCKED);<<db>>
+    :SetRetryCount = 0, Status -> PENDING
+    (fresh aggregation budget);
+  repeat while (More ABANDONED rows?) is (yes) not (no — all reset)
+else (no — batch had rows, Phase C skipped)
 endif
 
 :wg.Done() — join point

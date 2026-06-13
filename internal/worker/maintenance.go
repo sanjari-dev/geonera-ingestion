@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -584,7 +585,9 @@ func normalizeTS(t time.Time, jobType state.JobType) time.Time {
 }
 
 // insertBatched splits candidates into chunks of maintenanceSeedBatchSize and
-// inserts each chunk in a single pool transaction using ON CONFLICT DO NOTHING.
+// inserts each chunk as a single multi-row INSERT per transaction using
+// ON CONFLICT DO NOTHING. One SQL statement per batch replaces the previous
+// per-row loop, reducing parse/plan/index overhead by ~720×.
 func insertBatched(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType, candidates []time.Time, phase string) {
 	span := trace.SpanFromContext(ctx)
 	for i := 0; i < len(candidates) && ctx.Err() == nil; i += maintenanceSeedBatchSize {
@@ -592,12 +595,10 @@ func insertBatched(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobT
 		if end > len(candidates) {
 			end = len(candidates)
 		}
+		batchIdx := i / maintenanceSeedBatchSize
 		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
-			insertedAt := time.Now().UTC()
-			for _, ts := range candidates[i:end] {
-				if err := insertStatePendingOnConflictDoNothing(ctx, tx, instrumentID, jobType, ts, insertedAt); err != nil {
-					return fmt.Errorf("%s batch[%d]: %w", phase, i/maintenanceSeedBatchSize, err)
-				}
+			if err := insertBatchPendingOnConflictDoNothing(ctx, tx, instrumentID, jobType, candidates[i:end], time.Now().UTC()); err != nil {
+				return fmt.Errorf("%s batch[%d]: %w", phase, batchIdx, err)
 			}
 			return nil
 		}); err != nil {
@@ -605,6 +606,51 @@ func insertBatched(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobT
 			log.Printf("maintenance %s: insert (traceID=%s): %v", phase, span.SpanContext().TraceID(), err)
 		}
 	}
+}
+
+// insertBatchPendingOnConflictDoNothing inserts all timestamps in a single
+// multi-row INSERT statement. Shared values (instrument_id, job_type, status,
+// updated_at) are bound once as $1–$4 and reused across every tuple; per-row
+// params start at $5 (id) and $6 (timestamp), advancing by 2 per row.
+// Rows that already exist at (instrument_id, timestamp, job_type) are silently
+// skipped via ON CONFLICT DO NOTHING, preserving idempotency.
+func insertBatchPendingOnConflictDoNothing(
+	ctx context.Context,
+	tx *ent.Tx,
+	instrumentID uuid.UUID,
+	jobType state.JobType,
+	timestamps []time.Time,
+	updatedAt time.Time,
+) error {
+	if len(timestamps) == 0 {
+		return nil
+	}
+
+	// $1=instrumentID  $2=jobType  $3=status  $4=updatedAt (shared across all tuples)
+	const sharedCount = 4
+	args := make([]any, 0, sharedCount+len(timestamps)*2)
+	args = append(args, instrumentID, string(jobType), string(state.StatusPENDING), updatedAt)
+
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO ingestion.states (
+		id, instrument_id, job_type, timestamp, status,
+		is_holiday, resolved_tick_count, retry_count, not_found_streak,
+		is_deleted, updated_at
+	) VALUES `)
+
+	for i, ts := range timestamps {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		idParam := sharedCount + i*2 + 1 // $5, $7, $9, ...
+		tsParam := sharedCount + i*2 + 2 // $6, $8, $10, ...
+		fmt.Fprintf(&sb, "($%d,$1,$2,$%d,$3,false,0,0,0,false,$4)", idParam, tsParam)
+		args = append(args, uuid.New(), ts)
+	}
+
+	sb.WriteString(` ON CONFLICT (instrument_id, timestamp, job_type) DO NOTHING`)
+
+	return tx.ExecContext(ctx, sb.String(), args...)
 }
 
 // insertStatePendingOnConflictDoNothing inserts one PENDING row, silently

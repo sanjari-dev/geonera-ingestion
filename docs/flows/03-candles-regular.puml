@@ -71,12 +71,17 @@ split
   Triggered once per day at 00:00 UTC;
   :Iterate over instruments where
   IsActive = true & IsPause = false;
-  :Upsert (INSERT ... ON CONFLICT DO NOTHING):
-  JobType = CANDLE, timestamp = 00:00:00 of that day,
-  Status = PENDING, ResolvedTickCount = 0;
-  :Booking row ready — waiting for the
+  :Upsert (INSERT ... ON CONFLICT DO NOTHING)
+  for TWO timestamps per instrument:
+  • yesterday 00:00:00 UTC (D-1): ensures Stage B
+    at 05:08 UTC already has a bookable row
+    for the completed previous day
+  • today 00:00:00 UTC (D): seeds the current day
+  JobType = CANDLE, Status = PENDING,
+  ResolvedTickCount = 0 for both rows;
+  :Booking rows ready — waiting for the
   Sync Outbox Worker to fill ResolvedTickCount
-  as the day's Ticks become CONFIRMED;
+  as each day's Ticks become CONFIRMED;
 
 split again
   ' ============== Main Aggregation ==============

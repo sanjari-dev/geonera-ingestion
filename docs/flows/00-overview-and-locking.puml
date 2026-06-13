@@ -125,8 +125,10 @@ each carrying lockCtx (OTel trace) & DAL.pool
 
 note right
   REGULAR mode forks 3 goroutines: T-0, T-1, T-2
-  BACKFILL mode forks 3 goroutines: Ingest, Reset, Validate
-  MAINTENANCE forks 3 goroutines: Seeder, Gap-Fill, Pruning
+  BACKFILL mode forks 1 goroutine:  Master Bulk-Claim (claim up to 120 rows,
+                                    route in-memory to Ingestion/Reset/Validation)
+  MAINTENANCE forks 4 goroutines:   A (Forward Seeding), B (Backward Gap Fill),
+                                    C (Pruning), D (Consistency Check)
   Each child MUST register deferred panic-recovery
   + defer wg.Done() so the lock is never held hostage.
 end note
