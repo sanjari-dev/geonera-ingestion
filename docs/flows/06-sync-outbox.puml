@@ -11,9 +11,9 @@ skinparam activity {
   FontColor #1B1B1B
   FontSize 13
 
-  BackgroundColor<<lock>> #EF6C00
-  FontColor<<lock>> #FFFFFF
-  BorderColor<<lock>> #A34B00
+  BackgroundColor<<handler>> #EF6C00
+  FontColor<<handler>> #FFFFFF
+  BorderColor<<handler>> #A34B00
 
   BackgroundColor<<db>> #1565C0
   FontColor<<db>> #FFFFFF
@@ -50,7 +50,7 @@ skinparam note {
 
 legend right
   |= Tag |= Meaning |
-  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#EF6C00><color:#FFFFFF> handler </color></back>| Parent Handler entry point |
   |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
   |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
   |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
@@ -60,8 +60,7 @@ start
 :RunSyncHandler(ctx, dal);
 note right
   Triggered by queue jobs.sync (every 5 minutes).
-  **NO global advisory lock** — fire & forget design.
-  Concurrent triggers are allowed; no trigger is dropped.
+  Fire & forget design — concurrent triggers are allowed; no trigger is dropped.
 
   ** How SyncTask rows are created (publish side, NOT this process): **
   Whenever a TICK row reaches a terminal state (→ CONFIRMED,
@@ -94,8 +93,7 @@ else (N tasks claimed, 1 ≤ N ≤ 12)
   note right
     Each goroutine runs processSyncTaskWorker with
     context.WithTimeout(ctx, **5 min**) + defer cancel().
-    The 5-minute deadline bounds the goroutine lifetime —
-    a stuck pg_advisory_xact_lock wait cannot leak forever.
+    The 5-minute deadline bounds the goroutine lifetime.
     Subsequent triggers can claim more rows
     without waiting for these goroutines.
   end note
@@ -111,7 +109,7 @@ partition "processSyncTaskWorker (per goroutine)" {
   windowStart = task.TargetDate
   windowEnd   = windowStart + 24h;
 
-  ' ── Step 1: count (no advisory lock needed) ──
+  ' ── Step 1: count ──
   :COUNT(*) State
   WHERE JobType = TICK
     AND InstrumentID = task.InstrumentID
@@ -131,19 +129,7 @@ partition "processSyncTaskWorker (per goroutine)" {
     end note
     stop
   else (== 24 — all hours confirmed)
-    ' ── Step 2: management lock + candle finalisation ──
-    :Acquire LockIDSync (1004) via Direct Connection
-    pg_advisory_xact_lock — **blocking wait**
-    (serialises concurrent goroutines that also
-    reach count == 24 at the same time);<<lock>>
-    note right
-      If the lock cannot be acquired within the
-      5-minute goroutine deadline, lib/pq cancels
-      the blocking query via the PostgreSQL cancel
-      protocol → WaitAndAcquireAdvisoryLock returns
-      an error and the goroutine exits cleanly.
-    end note
-
+    ' ── Step 2: candle finalisation (plain PostgreSQL transaction) ──
     :UPDATE State (CANDLE row)
     SET resolved_tick_count = 24,
         updated_at = now()
@@ -164,8 +150,6 @@ partition "processSyncTaskWorker (per goroutine)" {
       on the next cycle. No event is lost.
     end note
 
-    :Release LockIDSync
-    (lockTx.Rollback() in defer);<<lock>>
     stop
   endif
 

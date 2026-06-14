@@ -1,5 +1,5 @@
 @startuml 00-overview-and-locking
-title Geonera Ingestion — 0. Overview: Trigger, Parent Handler & Advisory Lock
+title Geonera Ingestion — 0. Overview: Trigger & Parent Handler
 
 skinparam backgroundColor #FFFFFF
 skinparam defaultFontColor #1B1B1B
@@ -12,9 +12,9 @@ skinparam activity {
   FontColor #1B1B1B
   FontSize 13
 
-  BackgroundColor<<lock>> #EF6C00
-  FontColor<<lock>> #FFFFFF
-  BorderColor<<lock>> #A34B00
+  BackgroundColor<<handler>> #EF6C00
+  FontColor<<handler>> #FFFFFF
+  BorderColor<<handler>> #A34B00
 
   BackgroundColor<<db>> #1565C0
   FontColor<<db>> #FFFFFF
@@ -51,19 +51,19 @@ skinparam note {
 
 legend right
   |= Tag |= Meaning |
-  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#EF6C00><color:#FFFFFF> handler </color></back>| Parent Handler entry point |
   |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
   |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
   |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
 endlegend
 
-|#E8EAF6|MQ / Trigger|
-|#FFF3E0|Parent Handler (Lock Layer)|
-|#ECF6EF|Worker Group (Pool Connection)|
+|#E8EAF6|MQ / HTTP Trigger|
+|#FFF3E0|Parent Handler|
+|#ECF6EF|Worker Goroutines|
 
 start
 
-|MQ / Trigger|
+|MQ / HTTP Trigger|
 :Message received from one of the queues;
 note right
   6 Main Queues -> 6 Main Processes:
@@ -85,62 +85,45 @@ end note
 
 switch (Which queue triggered it?)
 case ( jobs.ticks.regular / jobs.ticks.backfill )
-  :runTickParentHandler(mode);<<lock>>
+  :RunTickParentHandler(mode);<<handler>>
   note right: mode = REGULAR or BACKFILL
 case ( jobs.candles.regular / jobs.candles.backfill )
-  :runCandleParentHandler(mode);<<lock>>
+  :RunCandleParentHandler(mode);<<handler>>
   note right: mode = REGULAR or BACKFILL
 case ( jobs.maintenance )
-  :runMaintenanceHandler();<<lock>>
+  :RunMaintenanceHandler();<<handler>>
 case ( jobs.sync )
-  :runSyncHandler();<<lock>>
+  :RunSyncHandler();<<handler>>
 endswitch
 
-|Parent Handler (Lock Layer)|
-:dal.AcquireAdvisoryLock(ctx)
-**Direct Connection** (bypass PgBouncer);
-:pg_try_advisory_xact_lock(LockID);
+|Parent Handler|
+:onStarted() — record activity log entry immediately;<<db>>
 note right
-  Lock ID constants (avoid magic numbers):
-  LockIDTick        = 1001  -> Ticks Regular & Backfill
-  LockIDCandle      = 1002  -> Candles Regular & Backfill
-  LockIDMaintenance = 1003  -> Auto-Seeder & Pruning
-  LockIDSync        = 1004  -> Outbox Worker
+  Every trigger is logged at the start.
+  No trigger is silently dropped or discarded.
 end note
 
-if (Lock acquired?) then (no / already held by another instance)
-  :Record span event "lock already acquired,
-  skipping execution";
-  stop
-else (yes, exclusive lock obtained)
-endif
-
-:Start Lock Health Monitor goroutine
-(heartbeat 'SELECT true' every 30s via lockCtx,
-cancels the whole ETL context if the
-direct connection drops — HA failover safety);
-:Fork child goroutines (wg.Add + go func),
-each carrying lockCtx (OTel trace) & DAL.pool
-(PgBouncer connection for fast claim/update);
-
+:Fork child goroutines (wg.Add + go func), each carrying ctx & DAL;
 note right
   REGULAR mode forks 3 goroutines: T-0, T-1, T-2
-  BACKFILL mode forks 1 goroutine:  Master Bulk-Claim (claim up to 120 rows,
-                                    route in-memory to Ingestion/Reset/Validation)
+  BACKFILL mode forks 1 goroutine:  Master Bulk-Claim (up to 120 rows,
+                                    routed in-memory to Ingestion/Reset/Validation)
   MAINTENANCE forks 4 goroutines:   A (Forward Seeding), B (Backward Gap Fill),
                                     C (Pruning), D (Consistency Check)
-  Each child MUST register deferred panic-recovery
-  + defer wg.Done() so the lock is never held hostage.
+
+  Concurrency is managed entirely by PostgreSQL transactions:
+  every DB operation uses dal.Execute(ctx, fn) → a single PostgreSQL
+  transaction. Row-level mutual exclusion is enforced by
+  FOR UPDATE SKIP LOCKED inside each claim query.
+
+  Each goroutine MUST register:
+    defer recoverGoroutine(ctx, "name")   — panic safety
+    defer wg.Done()                       — Fork-Join guarantee
 end note
 
-:wg.Wait() — wait for all forked
-sub-processes to finish (Fork-Join);
+:wg.Wait() — block until all goroutines finish (Fork-Join);
 
-|Parent Handler (Lock Layer)|
-:cancelETL() — stop the Lock Health Monitor;
-:tx.Rollback() — release
-pg_try_advisory_xact_lock (defer guarantee,
-runs even on panic / context cancel);
+|Parent Handler|
 stop
 
 @enduml

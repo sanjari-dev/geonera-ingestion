@@ -11,9 +11,9 @@ skinparam activity {
   FontColor #1B1B1B
   FontSize 13
 
-  BackgroundColor<<lock>> #EF6C00
-  FontColor<<lock>> #FFFFFF
-  BorderColor<<lock>> #A34B00
+  BackgroundColor<<handler>> #EF6C00
+  FontColor<<handler>> #FFFFFF
+  BorderColor<<handler>> #A34B00
 
   BackgroundColor<<db>> #1565C0
   FontColor<<db>> #FFFFFF
@@ -50,19 +50,17 @@ skinparam note {
 
 legend right
   |= Tag |= Meaning |
-  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#EF6C00><color:#FFFFFF> handler </color></back>| Parent Handler entry point |
   |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
   |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
   |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
 endlegend
 
 start
-:runTickParentHandler(ctx, "REGULAR", dal);<<lock>>
+:runTickParentHandler(ctx, "REGULAR", dal);<<handler>>
 note right
   Triggered by queue jobs.ticks.regular,
   expected to fire every hour at minute :05 (e.g., 10:05 UTC).
-  Runs only after LockIDTick (1001) is acquired
-  via the Direct Connection (see 00-overview-and-locking.puml).
 end note
 
 split
@@ -82,7 +80,7 @@ split
   end note
   :Claim: JobType=TICK, Status=PENDING,
   Instrument.IsPause=false & IsActive=true
-  (FOR UPDATE SKIP LOCKED via DAL.ExecuteInPool);
+  (FOR UPDATE SKIP LOCKED via dal.Execute);
   :Update -> PROCESSED
   (SetPreviousStatus = old status, atomic);
   :Download raw BI5 file from Dukascopy API;<<api>>
@@ -234,9 +232,7 @@ split again
   endif
 end split
 
-:wg.Done() x3 — join point
-(Parent Handler's wg.Wait() can now
-proceed to release the advisory lock);
+:wg.Done() x3 — join point (Parent Handler's wg.Wait() returns);
 stop
 
 @enduml

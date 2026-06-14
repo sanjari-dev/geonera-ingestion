@@ -11,9 +11,9 @@ skinparam activity {
   FontColor #1B1B1B
   FontSize 13
 
-  BackgroundColor<<lock>> #EF6C00
-  FontColor<<lock>> #FFFFFF
-  BorderColor<<lock>> #A34B00
+  BackgroundColor<<handler>> #EF6C00
+  FontColor<<handler>> #FFFFFF
+  BorderColor<<handler>> #A34B00
 
   BackgroundColor<<db>> #1565C0
   FontColor<<db>> #FFFFFF
@@ -50,16 +50,15 @@ skinparam note {
 
 legend right
   |= Tag |= Meaning |
-  |<back:#EF6C00><color:#FFFFFF> lock </color></back>| Advisory-lock / Parent Handler step |
+  |<back:#EF6C00><color:#FFFFFF> handler </color></back>| Parent Handler entry point |
   |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
   |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
   |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
 endlegend
 
 start
-:runCandleParentHandler(ctx, "REGULAR", dal);<<lock>>
+:runCandleParentHandler(ctx, "REGULAR", dal);<<handler>>
 note right
-  Acquires LockIDCandle (1002) via Direct Connection.
   This process is the final link in the chain — it never
   contacts Dukascopy; it only aggregates already-CONFIRMED
   Tick Parquet files from R2 into 19-timeframe daily Candles.
@@ -141,8 +140,7 @@ split again
   endif
 end split
 
-:wg.Done() — join point
-(Parent Handler releases LockIDCandle);
+:wg.Done() — join point (Parent Handler's wg.Wait() returns);
 stop
 
 @enduml
