@@ -8,20 +8,11 @@ import (
 
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
 )
-
-// mqTracer is the OTel tracer for the MQ consumer layer.
-// It creates a consumer span for each incoming message, acting as the
-// MQ equivalent of otelfiber.Middleware() on the HTTP layer.
-var mqTracer = otel.Tracer("mq/consumer")
 
 // Queue names — must match the names used by the external scheduler.
 const (
@@ -41,8 +32,7 @@ func jobNameFromQueue(queue string) string {
 }
 
 // SetupConsumers declares all job queues and starts a self-healing goroutine
-// consumer for each one. Every consumed message extracts the incoming OTel
-// trace context from its AMQP headers before dispatching the background worker.
+// consumer for each one.
 //
 // A dedicated channel is opened per queue so one slow consumer cannot starve
 // the others. If a channel or connection dies, each consumer goroutine
@@ -139,8 +129,8 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 		return err
 	}
 
-	// Limit to 1 unacknowledged message per consumer so a burst of triggers
-	// does not queue up work that the advisory lock would discard anyway.
+	// Limit to 1 unacknowledged message per consumer to bound the burst of
+	// concurrent trigger goroutines per queue.
 	if err = ch.Qos(1, 0, false); err != nil {
 		return err
 	}
@@ -169,37 +159,13 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 				// msgs channel closed; let consumeLoop retry.
 				return nil
 			}
-			// Extract incoming trace context from AMQP headers (W3C traceparent).
-			// If no traceparent is present, ctx carries no span and the consumer
-			// span below becomes the root of a new trace.
-			ctx := extractMQOtelCtx(msg.Headers)
 
-			// Create a CONSUMER span for this message. This establishes a parent
-			// span so that the worker's child spans are always visible in
-			// Jaeger under a single trace root.
-			//
-			// Because the handler is synchronous, this root span accurately
-			// measures the total end-to-end processing time of the job.
-			ctx, span := mqTracer.Start(ctx, "mq/receive",
-				trace.WithSpanKind(trace.SpanKindConsumer),
-				trace.WithAttributes(
-					attribute.String("messaging.system", "rabbitmq"),
-					attribute.String("messaging.destination.name", queue),
-					attribute.String("messaging.operation.type", "process"),
-				),
-			)
+			ctx := context.Background()
 
-			// Ack immediately so the broker can deliver the next message right
-			// away. This prevents stale triggers from piling up in RabbitMQ
-			// while a long-running job holds the advisory lock.
+			// Ack immediately so the broker can deliver the next message.
 			_ = msg.Ack(false)
 
-			// Dispatch in a goroutine so the consumer loop is free to receive and
-			// drop the next message. logger.Record is called inside onStarted —
-			// only AFTER the advisory lock is successfully acquired — so dropped
-			// triggers (lock busy) never appear in the activity dashboard at all.
-			go func(ctx context.Context, sp trace.Span) {
-				defer sp.End()
+			go func(ctx context.Context) {
 				jobName := jobNameFromQueue(queue)
 				var logID uuid.UUID
 				ran := handler(ctx, func() {
@@ -208,7 +174,7 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 				if ran {
 					logger.Complete(logID)
 				}
-			}(ctx, span)
+			}(ctx)
 
 		case amqpErr, ok := <-chClose:
 			if !ok || amqpErr == nil {
@@ -217,16 +183,4 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 			return amqpErr
 		}
 	}
-}
-
-// extractMQOtelCtx converts AMQP headers (map[string]any) to the string map
-// the OTel text-map propagator expects, then extracts the trace context.
-func extractMQOtelCtx(headers amqp.Table) context.Context {
-	carrier := make(propagation.MapCarrier, len(headers))
-	for k, v := range headers {
-		if s, ok := v.(string); ok {
-			carrier[k] = s
-		}
-	}
-	return otel.GetTextMapPropagator().Extract(context.Background(), carrier)
 }

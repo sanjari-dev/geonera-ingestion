@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // ErrNotFound is returned when Dukascopy responds with HTTP 404 (no data for
@@ -29,13 +28,11 @@ type Client struct {
 }
 
 // NewClient returns a Dukascopy Client with a 30-second per-request timeout.
-// Outbound HTTP calls are wrapped with an OpenTelemetry transport, so each
-// request produces a child span.
 func NewClient() *Client {
 	return &Client{
 		http: &http.Client{
 			Timeout:   30 * time.Second,
-			Transport: otelhttp.NewTransport(http.DefaultTransport),
+			Transport: http.DefaultTransport,
 		},
 	}
 }

@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
@@ -68,13 +66,10 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runBackfillMasterLoop")
 
-	ctx, span := tickTracer.Start(ctx, "runBackfillMasterLoop")
-	defer span.End()
-
 	// Claim up to 120 rows once and dispatch in parallel.
 	// ABANDONED rows are sorted last, so they are only reached when no other
 	// actionable rows exist within the T-3 boundary.
-	runBackfillMasterClaim(ctx, d, span)
+	runBackfillMasterClaim(ctx, d)
 }
 
 // runBackfillMasterClaim implements the "Master Bulk-Claim" strategy: claim up
@@ -84,13 +79,12 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 // Each backfill trigger processes exactly one batch of up to 120 rows — no loop.
 // The only real throttles are the download rate-gate/semaphore (12 concurrent)
 // and the convert/upload semaphore (runtime.NumCPU()).
-func runBackfillMasterClaim(ctx context.Context, d *dal.DAL, span trace.Span) {
+func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 	boundary := backfillTimeBoundary()
 
 	batch, err := claimBackfillMasterBatch(ctx, d, boundary)
 	if err != nil {
 		if !ent.IsNotFound(err) {
-			span.RecordError(err)
 			log.Printf("backfill master-claim: %v", err)
 		}
 		return
@@ -127,7 +121,7 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL, span trace.Span) {
 // runNotFoundRecheckLoop for the Backfill path.
 func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Time) ([]backfillRoutedRow, error) {
 	var routed []backfillRoutedRow
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		rows, e := tickActiveStateRows(tx.State.Query(),
 			state.StatusIn(
 				state.StatusPENDING,

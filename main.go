@@ -7,7 +7,6 @@ import (
 
 	"database/sql"
 
-	"github.com/gofiber/contrib/otelfiber/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/joho/godotenv"
@@ -22,7 +21,6 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/runtimecollector"
 	"github.com/sanjari-dev/geonera-ingestion/internal/seed"
-	"github.com/sanjari-dev/geonera-ingestion/internal/telemetry"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
 )
 
@@ -34,18 +32,7 @@ func main() {
 
 	ctx := context.Background()
 
-	// ── OpenTelemetry ─────────────────────────────────────────────────────────
-	shutdownTracer, err := telemetry.SetupTracer(ctx)
-	if err != nil {
-		log.Fatalf("telemetry: %v", err)
-	}
-	defer func() {
-		if err := shutdownTracer(ctx); err != nil {
-			log.Printf("telemetry shutdown: %v", err)
-		}
-	}()
-
-	// ── Database: direct ent client (for seeding / migrations) ───────────────
+	// ── Database ─────────────────────────────────────────────────────────────
 	dbClient, err := database.NewEntClient(ctx)
 	if err != nil {
 		log.Fatalf("database: %v", err)
@@ -56,19 +43,7 @@ func main() {
 		}
 	}()
 
-	// ── Database: PgBouncer pool ent client (for ETL workers) ────────────────
-	poolClient, err := database.NewPoolClient(ctx)
-	if err != nil {
-		log.Fatalf("pool client: %v", err)
-	}
-	defer func() {
-		if err := poolClient.Close(); err != nil {
-			log.Printf("pool client close: %v", err)
-		}
-	}()
-
-	// ── DAL: enforces split-connection strategy ───────────────────────────────
-	appDAL := dal.New(dbClient, poolClient)
+	appDAL := dal.New(dbClient)
 
 	// ── Runtime metrics collector ─────────────────────────────────────────────
 	runtimecollector.Start()
@@ -101,10 +76,7 @@ func main() {
 	}
 
 	// ── Activity Logger ───────────────────────────────────────────────────────
-	logDSN := os.Getenv("DATABASE_POOL_URL")
-	if logDSN == "" {
-		logDSN = os.Getenv("DATABASE_DIRECT_URL")
-	}
+	logDSN := os.Getenv("DATABASE_URL")
 	logDB, err := sql.Open("postgres", logDSN)
 	if err != nil {
 		log.Fatalf("activity log db: %v", err)
@@ -143,8 +115,6 @@ func main() {
 		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization",
 	}))
-
-	app.Use(otelfiber.Middleware())
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello World")

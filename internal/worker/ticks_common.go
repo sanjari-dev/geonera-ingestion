@@ -11,9 +11,6 @@ import (
 
 	"entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
@@ -25,8 +22,6 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/tickparquet"
 )
-
-var tickTracer = otel.Tracer("worker/ticks")
 
 const (
 	// notFoundThreshold is the consecutive-404 count that triggers a Zero-Row Parquet commit.
@@ -107,32 +102,26 @@ func InitDownloadRateLimiter() {
 var tickProcessSem = make(chan struct{}, runtime.NumCPU())
 
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
-// It holds the global advisory lock for the full duration, so no other job
-// (candles, maintenance, sync) can run concurrently. If the lock is already
-//
-//	held, the trigger is dropped immediately.
-//
 // Mode must be either "REGULAR" or "BACKFILL".
 func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
-	ctx, span := tickTracer.Start(ctx, fmt.Sprintf("RunTickParentHandler_%s", mode))
-	defer span.End()
-
-	return runWithLocks(ctx, d, "ticks/"+mode, []int64{dal.LockIDTick}, onStarted, func(lockCtx context.Context) {
-		var wg sync.WaitGroup
-		switch mode {
-		case "REGULAR":
-			wg.Add(3)
-			go runT0Phase(lockCtx, d, &wg)
-			go runT1Phase(lockCtx, d, &wg)
-			go runT2Phase(lockCtx, d, &wg)
-		case "BACKFILL":
-			wg.Add(1)
-			go runBackfillMasterLoop(lockCtx, d, &wg)
-		default:
-			log.Printf("ticks: unknown mode %q", mode)
-		}
-		wg.Wait()
-	})
+	if onStarted != nil {
+		onStarted()
+	}
+	var wg sync.WaitGroup
+	switch mode {
+	case "REGULAR":
+		wg.Add(3)
+		go runT0Phase(ctx, d, &wg)
+		go runT1Phase(ctx, d, &wg)
+		go runT2Phase(ctx, d, &wg)
+	case "BACKFILL":
+		wg.Add(1)
+		go runBackfillMasterLoop(ctx, d, &wg)
+	default:
+		log.Printf("ticks: unknown mode %q", mode)
+	}
+	wg.Wait()
+	return true
 }
 
 // ── Loop implementations ──────────────────────────────────────────────────────
@@ -173,9 +162,6 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 //   - T-0 passes handleNotFoundSimple (SetNotFoundStreak=1, always first attempt)
 //   - Backfill Group 1 passes handleNotFoundIncrement (AddNotFoundStreak+1, streak may be >0)
 func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotFound func(context.Context, *dal.DAL, *ent.State)) {
-	ctx, span := tickTracer.Start(ctx, "ticks/etl", tickSpanAttrs(row))
-	defer span.End()
-
 	log.Printf("ticks: executing ETL for %s tick %s", row.Edges.Instrument.Name, row.Timestamp.Format(time.RFC3339))
 
 	// Phase 1: Download BI5 — submitted to the download gate worker pool.
@@ -190,7 +176,6 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	case DownloadOK:
 		// fall through to Phase 2
 	default: // DownloadRateLimited, DownloadError, or ctx canceled
-		span.RecordError(dl.Err)
 		updateStateFailed(ctx, d, row)
 		return
 	}
@@ -211,9 +196,6 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 // Still 404 → AddNotFoundStreak(+1, streak=2), IsHoliday=true, upload Zero-Row Parquet, Status=NOT_FOUND.
 // Other error → FAILED (handled by backfill-reset on retry).
 func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
-	ctx, span := tickTracer.Start(ctx, "ticks/not-found-recheck", tickSpanAttrs(row))
-	defer span.End()
-
 	dl := RequestDownload(ctx, row)
 	if dl.Status != DownloadOK {
 		if dl.Status == DownloadNotFound {
@@ -221,7 +203,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 			// DB commit happens before R2 upload, so IsHoliday flag persists even on
 			// upload failure. If the upload fails, the row is set to FAILED so that
 			// T-1/Backfill can retry the full pipeline on the next cycle.
-			if dbErr := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+			if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 				_, e := tx.State.UpdateOneID(row.ID).
 					AddNotFoundStreak(1).
 					SetIsHoliday(true).
@@ -231,19 +213,16 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 					Save(ctx)
 				return e
 			}); dbErr != nil {
-				span.RecordError(dbErr)
-				log.Printf("not-found recheck: DB update for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), dbErr)
+				log.Printf("not-found recheck: DB update for %s: %v", row.ID, dbErr)
 				return
 			}
 			zeroRow := buildZeroRowParquet()
 			if upErr := uploadToR2(ctx, row, zeroRow); upErr != nil {
-				span.RecordError(upErr)
-				log.Printf("not-found recheck: Zero-Row upload for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), upErr)
+				log.Printf("not-found recheck: Zero-Row upload for %s: %v — setting FAILED", row.ID, upErr)
 				updateStateFailed(ctx, d, row)
 			}
 		} else {
-			span.RecordError(dl.Err)
-			log.Printf("NOT_FOUND recheck error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), dl.Err)
+			log.Printf("NOT_FOUND recheck error for %s: %v — setting FAILED", row.ID, dl.Err)
 			updateStateFailed(ctx, d, row)
 		}
 		return
@@ -251,7 +230,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 
 	// Data is available again: reset streak to 0, set PENDING.
 	// The row will be picked up for a full ETL pass on the next cycle.
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
 			SetPreviousStatus(state.PreviousStatusNOT_FOUND).
@@ -260,8 +239,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("not-found recheck: reset to PENDING for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("not-found recheck: reset to PENDING for %s: %v", row.ID, err)
 	}
 }
 
@@ -274,9 +252,6 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 //	COMPLETED + 404 → BROKEN (data was present at T-0 but is now missing — anomaly).
 //	Non-404 error → FAILED.
 func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
-	ctx, span := tickTracer.Start(ctx, "ticks/T2-action", tickSpanAttrs(row))
-	defer span.End()
-
 	dl := RequestDownload(ctx, row)
 	wasNotFound := row.PreviousStatus != nil && *row.PreviousStatus == state.PreviousStatusNOT_FOUND
 
@@ -293,7 +268,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 					newRetryCount = 0
 				}
 				if newStreak >= notFoundThreshold {
-					if dbErr := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
 							SetRetryCount(newRetryCount).
@@ -301,14 +276,13 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
-						span.RecordError(dbErr)
-						log.Printf("T2: streak update for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), dbErr)
+						log.Printf("T2: streak update for %s: %v", row.ID, dbErr)
 						return
 					}
 					row.NotFoundStreak = newStreak
 					executeValidation(ctx, d, row, preclaimPrev)
 				} else {
-					if dbErr := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
 							SetRetryCount(newRetryCount).
@@ -318,19 +292,16 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
-						span.RecordError(dbErr)
-						log.Printf("T2: NOT_FOUND update for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), dbErr)
+						log.Printf("T2: NOT_FOUND update for %s: %v", row.ID, dbErr)
 					}
 				}
 			} else {
 				// COMPLETED + unexpected 404: data was there at T-0 time — mark as anomaly.
-				span.RecordError(dl.Err)
-				log.Printf("T2: COMPLETED got 404 for %s (traceID=%s) — setting BROKEN", row.ID, span.SpanContext().TraceID())
+				log.Printf("T2: COMPLETED got 404 for %s — setting BROKEN", row.ID)
 				updateStateBroken(ctx, d, row)
 			}
 		} else {
-			span.RecordError(dl.Err)
-			log.Printf("T2: download error for %s (traceID=%s): %v — setting FAILED", row.ID, span.SpanContext().TraceID(), dl.Err)
+			log.Printf("T2: download error for %s: %v — setting FAILED", row.ID, dl.Err)
 			updateStateFailed(ctx, d, row)
 		}
 		return
@@ -338,7 +309,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 
 	if wasNotFound {
 		// NOT_FOUND + data now available: reset streak, hand off to next cycle via PENDING.
-		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			_, e := tx.State.UpdateOneID(row.ID).
 				SetNotFoundStreak(0).
 				SetPreviousStatus(state.PreviousStatusNOT_FOUND).
@@ -347,8 +318,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 				Save(ctx)
 			return e
 		}); err != nil {
-			span.RecordError(err)
-			log.Printf("T2: NOT_FOUND→PENDING for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+			log.Printf("T2: NOT_FOUND→PENDING for %s: %v", row.ID, err)
 		}
 		return
 	}
@@ -363,12 +333,10 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 		defer func() { <-tickProcessSem }()
 		parquet, convErr := convertBI5ToParquet(dl.Data, row)
 		if convErr != nil {
-			span.RecordError(convErr)
 			uploadErr = convErr
 			return
 		}
 		if upErr := uploadToR2(ctx, row, parquet); upErr != nil {
-			span.RecordError(upErr)
 			uploadErr = upErr
 		}
 	}()
@@ -385,13 +353,9 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 // preclaimPrev == CONFIRMED, which indicates a genuine demotion: the row had
 // already been confirmed in a previous cycle and is now found to be BROKEN.
 func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
-	ctx, span := tickTracer.Start(ctx, "ticks/validate", tickSpanAttrs(row))
-	defer span.End()
-
 	fileBytes, err := readFromR2(ctx, row)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("read from R2 for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("read from R2 for %s: %v", row.ID, err)
 		// Unable to read the file — treat as BROKEN so Backfill can retry.
 		updateStateBroken(ctx, d, row)
 		return
@@ -400,13 +364,12 @@ func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaim
 	validationErr := validateParquetFile(ctx, row, fileBytes)
 
 	if err := updateValidatedTickStatus(ctx, d, row, validationErr, preclaimPrev); err != nil {
-		span.RecordError(err)
-		log.Printf("validation status update for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("validation status update for %s: %v", row.ID, err)
 	}
 }
 
 func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, validationErr error, preclaimPrev *state.PreviousStatus) error {
-	return d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	return d.Execute(ctx, func(tx *ent.Tx) error {
 		if validationErr == nil {
 			saved, e := tx.State.UpdateOneID(row.ID).
 				SetPreviousStatus(state.PreviousStatusPROCESSED).
@@ -435,12 +398,11 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 			return e
 		}
 		log.Printf(
-			"state_transition status=%s state_id=%s job_type=%s previous_status=%s traceID=%s message=%q",
+			"state_transition status=%s state_id=%s job_type=%s previous_status=%s message=%q",
 			state.StatusBROKEN,
 			broken.ID,
 			broken.JobType,
 			state.PreviousStatusPROCESSED,
-			trace.SpanFromContext(ctx).SpanContext().TraceID(),
 			"tick parquet validation failed",
 		)
 		if preclaimPrev != nil && *preclaimPrev == state.PreviousStatusCONFIRMED {
@@ -453,16 +415,14 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 // ── State transition helpers ──────────────────────────────────────────────────
 
 func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPrefix string) {
-	span := trace.SpanFromContext(ctx)
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
 			SetUpdatedAt(time.Now().UTC()).
 			Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("%s for %s (traceID=%s): %v", logPrefix, row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("%s for %s: %v", logPrefix, row.ID, err)
 	}
 }
 
@@ -472,8 +432,7 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 // and makes the first-attempt intent explicit.
 // It never touches RetryCount and never triggers the Zero-Row Parquet flow.
 func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
-	span := trace.SpanFromContext(ctx)
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(1).
 			SetPreviousStatus(state.PreviousStatusPROCESSED).
@@ -482,8 +441,7 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("not-found simple for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("not-found simple for %s: %v", row.ID, err)
 	}
 }
 
@@ -492,8 +450,7 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 // a NOT_FOUND path (streak > 0), so Add is required instead of Set.
 // Like the handleNotFoundSimple, it never touches RetryCount and never triggers Zero-Row.
 func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
-	span := trace.SpanFromContext(ctx)
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			AddNotFoundStreak(1).
 			SetPreviousStatus(state.PreviousStatusPROCESSED).
@@ -502,8 +459,7 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("not-found increment for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("not-found increment for %s: %v", row.ID, err)
 	}
 }
 
@@ -516,14 +472,12 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 // (e.g., a row that alternates between 404s and 503s).
 // T-1 recovery never transitions to ABANDONED — retry is unbounded.
 func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
-	span := trace.SpanFromContext(ctx)
-
 	newStreak := row.NotFoundStreak - 1
 	if newStreak < 0 {
 		newStreak = 0
 	}
 
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			AddRetryCount(1).
 			SetNotFoundStreak(newStreak).
@@ -533,8 +487,7 @@ func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("retry reset for %s (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("retry reset for %s: %v", row.ID, err)
 	}
 }
 
@@ -556,7 +509,7 @@ func updateStateBroken(ctx context.Context, d *dal.DAL, row *ent.State) {
 
 // upsertSyncTaskInTx inserts a PENDING SyncTask for the specified instrument and day,
 // or resets an existing one back to PENDING to trigger ResolvedTickCount recomputation.
-// It must be called inside an ExecuteInPool transaction.
+// It must be called inside an Execute transaction.
 func upsertSyncTaskInTx(ctx context.Context, tx *ent.Tx, instrumentID uuid.UUID, tickTimestamp time.Time) error {
 	targetDate := tickTimestamp.Truncate(24 * time.Hour)
 
@@ -581,20 +534,15 @@ func upsertSyncTaskInTx(ctx context.Context, tx *ent.Tx, instrumentID uuid.UUID,
 // Extracted to avoid duplicating the same block in executeIngestionETL and
 // executeNotFoundRecheck.
 func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data []byte) {
-	ctx, span := tickTracer.Start(ctx, "ticks/convert-upload", tickSpanAttrs(row))
-	defer span.End()
-
 	tickProcessSem <- struct{}{}
 	defer func() { <-tickProcessSem }()
 
 	parquet, err := convertBI5ToParquet(data, row)
 	if err != nil {
-		span.RecordError(err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "convert failed")
 		return
 	}
 	if err := uploadToR2(ctx, row, parquet); err != nil {
-		span.RecordError(err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload failed")
 		return
 	}
@@ -603,7 +551,7 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 
 // updateSimpleStatus writes a single status transition to the DB.
 // The prev value is recorded in previous_status; next becomes the new status.
-// Extracted to avoid duplicating the same ExecuteInPool pattern across
+// Extracted to avoid duplicating the same Execute pattern across
 // updateStateCompleted / updateStateFailed / updateStateBroken / resetStateToPending.
 //
 // NotFoundStreak is intentionally NOT touched here. The bidirectional counter-rule
@@ -613,8 +561,7 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 // in the same pipeline (e.g., executeIngestionETL resets streak to 0 on data-found,
 // then executeConvertUpload fails — touching streak here would undo that reset).
 func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev state.PreviousStatus, next state.Status, errMsg string) {
-	span := trace.SpanFromContext(ctx)
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetPreviousStatus(prev).
 			SetStatus(next).
@@ -622,18 +569,16 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 			Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("%s for %s (traceID=%s): %v", errMsg, row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("%s for %s: %v", errMsg, row.ID, err)
 		return
 	}
 	if next == state.StatusFAILED || next == state.StatusBROKEN {
 		log.Printf(
-			"state_transition status=%s state_id=%s job_type=%s previous_status=%s traceID=%s message=%q",
+			"state_transition status=%s state_id=%s job_type=%s previous_status=%s message=%q",
 			next,
 			row.ID,
 			row.JobType,
 			prev,
-			span.SpanContext().TraceID(),
 			errMsg,
 		)
 	}
@@ -642,20 +587,6 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 // ── External operations ───────────────────────────────────────────────────────
 // All functions below require row.Edges.Instrument to be non-nil.
 // The claim loops in this file use WithInstrument() to satisfy that contract.
-
-// tickSpanAttrs returns OTel span start options with instrument+timestamp attributes.
-// Safe to call even when row.Edges.Instrument is nil.
-func tickSpanAttrs(row *ent.State) trace.SpanStartOption {
-	attrs := []attribute.KeyValue{
-		attribute.String("state.id", row.ID.String()),
-		attribute.String("tick.timestamp", row.Timestamp.UTC().Format(time.RFC3339)),
-		attribute.String("job.type", string(row.JobType)),
-	}
-	if row.Edges.Instrument != nil {
-		attrs = append(attrs, attribute.String("instrument.name", row.Edges.Instrument.Name))
-	}
-	return trace.WithAttributes(attrs...)
-}
 
 // errNotFound is returned by downloadBI5 when Dukascopy responds with HTTP 404.
 var errNotFound = errors.New("tick source: 404 not found")
@@ -673,30 +604,20 @@ func isRateLimitedError(err error) bool { return errors.Is(err, errRateLimited) 
 // Must only be called from a download gate worker (runDownloadWorker) after a
 // rate-gate token has been consumed. Direct calls bypass the concurrency budget.
 func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
-	ctx, span := tickTracer.Start(ctx, "ticks/download-bi5", tickSpanAttrs(row))
-	defer span.End()
-
 	if dukClient == nil {
-		err := errClientsNotInitialized
-		span.RecordError(err)
-		return nil, err
+		return nil, errClientsNotInitialized
 	}
 	if row.Edges.Instrument == nil {
-		err := fmt.Errorf("downloadBI5: instrument edge not loaded for state %s", row.ID)
-		span.RecordError(err)
-		return nil, err
+		return nil, fmt.Errorf("downloadBI5: instrument edge not loaded for state %s", row.ID)
 	}
 	data, err := dukClient.FetchBI5(ctx, row.Edges.Instrument.Name, row.Timestamp)
 	if errors.Is(err, dukascopy.ErrNotFound) {
-		span.AddEvent("404: no data for this hour")
 		return nil, errNotFound
 	}
 	if errors.Is(err, dukascopy.ErrTooManyRequests) {
-		span.AddEvent("429: rate limited")
 		return nil, errRateLimited
 	}
 	if err != nil {
-		span.RecordError(err)
 		return nil, err
 	}
 	return data, nil
@@ -740,50 +661,27 @@ func convertBI5ToParquet(raw []byte, row *ent.State) ([]byte, error) {
 // This implements the Overwrite Policy (§6.2): calling on an existing key
 // replaces the old file, which is the correct behavior on FAILED/BROKEN retries.
 func uploadToR2(ctx context.Context, row *ent.State, data []byte) error {
-	ctx, span := tickTracer.Start(ctx, "ticks/upload-r2", tickSpanAttrs(row))
-	defer span.End()
-
 	if r2Client == nil {
-		err := errClientsNotInitialized
-		span.RecordError(err)
-		return err
+		return errClientsNotInitialized
 	}
 	if row.Edges.Instrument == nil {
-		err := fmt.Errorf("uploadToR2: instrument edge not loaded for state %s", row.ID)
-		span.RecordError(err)
-		return err
+		return fmt.Errorf("uploadToR2: instrument edge not loaded for state %s", row.ID)
 	}
 	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	if err := r2Client.PutObject(ctx, key, data); err != nil {
-		span.RecordError(err)
-		return err
-	}
-	return nil
+	return r2Client.PutObject(ctx, key, data)
 }
 
 // readFromR2 downloads the Parquet file for this row from R2 so it can be
 // validated. Returns r2.ErrNotFound if the object is absent.
 func readFromR2(ctx context.Context, row *ent.State) ([]byte, error) {
-	ctx, span := tickTracer.Start(ctx, "ticks/read-r2", tickSpanAttrs(row))
-	defer span.End()
-
 	if r2Client == nil {
-		err := errClientsNotInitialized
-		span.RecordError(err)
-		return nil, err
+		return nil, errClientsNotInitialized
 	}
 	if row.Edges.Instrument == nil {
-		err := fmt.Errorf("readFromR2: instrument edge not loaded for state %s", row.ID)
-		span.RecordError(err)
-		return nil, err
+		return nil, fmt.Errorf("readFromR2: instrument edge not loaded for state %s", row.ID)
 	}
 	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	data, err := r2Client.GetObject(ctx, key)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return data, nil
+	return r2Client.GetObject(ctx, key)
 }
 
 // validateParquetFile runs the four-step physical validation from §6.3:
@@ -793,15 +691,8 @@ func readFromR2(ctx context.Context, row *ent.State) ([]byte, error) {
 //  4. Each timestamp falls within the expected 1-hour window.
 //
 // Zero-row files are accepted only if the row is marked as a holiday (step 4 skipped).
-func validateParquetFile(ctx context.Context, row *ent.State, data []byte) error {
-	_, span := tickTracer.Start(ctx, "ticks/validate-parquet", tickSpanAttrs(row))
-	defer span.End()
-
-	err := tickparquet.Validate(data, row.IsHoliday, row.Timestamp.UTC())
-	if err != nil {
-		span.RecordError(err)
-	}
-	return err
+func validateParquetFile(_ context.Context, row *ent.State, data []byte) error {
+	return tickparquet.Validate(data, row.IsHoliday, row.Timestamp.UTC())
 }
 
 // buildZeroRowParquet returns a valid Parquet file with the Tick schema but
@@ -816,13 +707,10 @@ func buildZeroRowParquet() []byte {
 	return data
 }
 
-// recoverGoroutine catches any panic, records it on the active OTel span,
-// and logs a fallback message. It must be deferred AFTER wg.Done().
+// recoverGoroutine catches any panic and logs a fallback message.
+// It must be deferred AFTER wg.Done().
 func recoverGoroutine(ctx context.Context, name string) {
 	if r := recover(); r != nil {
-		span := trace.SpanFromContext(ctx)
-		err := fmt.Errorf("panic in %s: %v", name, r)
-		span.RecordError(err)
-		log.Printf("FATAL: %v (traceID: %s)", err, span.SpanContext().TraceID())
+		log.Printf("FATAL: panic in %s: %v", name, r)
 	}
 }

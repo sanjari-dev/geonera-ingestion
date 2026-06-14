@@ -16,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
 // ErrNotFound is returned by GetObject / DeleteObject when the key is absent.
@@ -49,9 +48,6 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("r2: load config: %w", err)
 	}
-
-	// Instrument all AWS SDK calls with OpenTelemetry spans.
-	otelaws.AppendMiddlewares(&ac.APIOptions)
 
 	svc := s3.NewFromConfig(ac, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(cfg.Endpoint)

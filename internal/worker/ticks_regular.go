@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
 	"github.com/sanjari-dev/geonera-ingestion/ent/predicate"
@@ -22,9 +20,6 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "ticks/T0")
 
-	ctx, span := tickTracer.Start(ctx, "ticks/T0")
-	defer span.End()
-
 	target := time.Now().UTC().Truncate(time.Hour)
 
 	// Guarantee every eligible instrument has a PENDING row for this hour before
@@ -32,17 +27,17 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	// call is a safety net for instruments that were just activated or whose row
 	// was not yet seeded by the time T-0 fires. ON CONFLICT DO NOTHING makes it
 	// a no-op when the row already exists.
-	ensureT0TickTasks(ctx, d, span, target)
+	ensureT0TickTasks(ctx, d, target)
 
-	runIngestionLoop(ctx, d, span, &target)
+	runIngestionLoop(ctx, d, &target)
 }
 
 // ensureT0TickTasks inserts a PENDING TICK row at target for every instrument
 // where IsActive=true AND IsPause=false that does not already have one.
 // Each instrument gets exactly one task per hour; duplicates are silently
 // ignored via ON CONFLICT (instrument_id, timestamp, job_type) DO NOTHING.
-func ensureT0TickTasks(ctx context.Context, d *dal.DAL, span trace.Span, target time.Time) {
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		instruments, err := tx.Instrument.Query().
 			Where(
 				instrument.IsActiveEQ(true),
@@ -60,8 +55,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, span trace.Span, target 
 		}
 		return nil
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("T0 ensure tasks (traceID=%s): %v", span.SpanContext().TraceID(), err)
+		log.Printf("T0 ensure tasks: %v", err)
 	}
 }
 
@@ -71,11 +65,8 @@ func runT1Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "ticks/T1")
 
-	ctx, span := tickTracer.Start(ctx, "ticks/T1")
-	defer span.End()
-
 	target := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	runRecoveryLoop(ctx, d, span, target)
+	runRecoveryLoop(ctx, d, target)
 }
 
 // ── T-2: two-hours-ago physical validation ────────────────────────────────────
@@ -84,14 +75,11 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "ticks/T2")
 
-	ctx, span := tickTracer.Start(ctx, "ticks/T2")
-	defer span.End()
-
 	target := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
 	// T-2 Regular: claims COMPLETED + NOT_FOUND, re-downloads BI5 for cross-validation.
 	// COMPLETED → re-download matches → CONFIRMED; NOT_FOUND → streak+1, at ≥3 → CONFIRMED.
 	// Only IsActive filter — paused instruments still get validated.
-	runValidationLoop(ctx, d, span, &target, false)
+	runValidationLoop(ctx, d, &target, false)
 }
 
 // runIngestionLoop claims PENDING TICK rows one at a time for the given hour
@@ -106,7 +94,7 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // the download gate (12 concurrent workers, download_gate.go) and
 // tickProcessSem (runtime.NumCPU() concurrent convert+upload) — not by an
 // artificial goroutine-pool cap here.
-func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time) {
+func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
@@ -124,7 +112,6 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestam
 			if ent.IsNotFound(err) {
 				break
 			}
-			span.RecordError(err)
 			log.Printf("ingestion claim: %v", err)
 			break
 		}
@@ -141,7 +128,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestam
 
 // runRecoveryLoop claims PENDING/PROCESSED/FAILED/BROKEN/NOT_FOUND rows for the
 // given timestamp and applies the T-1 recovery rules to each.
-func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target time.Time) {
+func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
@@ -171,7 +158,6 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target ti
 			if ent.IsNotFound(err) {
 				break
 			}
-			span.RecordError(err)
 			log.Printf("recovery claim (target %s): %v", target, err)
 			break
 		}
@@ -199,7 +185,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, span trace.Span, target ti
 // Used by T-2 (two-hours-ago) with a non-nil timestamp.
 // Backfill drives its own rows via the Master Bulk-Claim.
 // respectPause=false for T-2 Regular: paused instruments still get validated.
-func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timestamp *time.Time, respectPause bool) {
+func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time, respectPause bool) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
 		// preclaimPrev is the row's PreviousStatus BEFORE the claim — forwarded to
@@ -229,7 +215,6 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, span trace.Span, timesta
 			if ent.IsNotFound(err) {
 				break
 			}
-			span.RecordError(err)
 			log.Printf("validation claim: %v", err)
 			break
 		}

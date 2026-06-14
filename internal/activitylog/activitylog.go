@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/trace"
 )
 
 // TriggerSrc identifies what initiated the job.
@@ -44,7 +43,7 @@ func New(db *sql.DB) *Logger { return &Logger{db: db} }
 // same row — the row is guaranteed to exist before the job handler even starts.
 func (l *Logger) Record(ctx context.Context, src TriggerSrc, jobName string, meta map[string]any) uuid.UUID {
 	id := uuid.New()
-	traceID := trace.SpanFromContext(ctx).SpanContext().TraceID().String()
+	traceID := ""
 	metaJSON, _ := json.Marshal(meta)
 	now := time.Now().UTC()
 

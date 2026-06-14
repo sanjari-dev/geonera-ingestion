@@ -7,9 +7,6 @@ import (
 	"time"
 
 	"entgo.io/ent/dialect/sql"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
@@ -17,32 +14,19 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 )
 
-var syncTracer = otel.Tracer("worker/sync")
-
 // syncBatchSize is the maximum number of SyncTask rows claimed per trigger.
 const syncBatchSize = 12
 
 // syncWorkerTimeout is the maximum lifetime of a per-task sync goroutine.
-// It bounds the time spent waiting for pg_advisory_xact_lock (LockIDSync) —
-// if the lock holder crashes via SIGKILL, the lock is released immediately by
-// PostgreSQL, but if the goroutine itself hangs for any other reason, this
-// timeout ensures it eventually exits rather than leaking forever.
 const syncWorkerTimeout = 5 * time.Minute
 
 // RunSyncHandler claims up to syncBatchSize PENDING SyncTask rows ordered by
 // hours_count DESC (closest to 24 processed first) and dispatches one goroutine
-// per row as fire-and-forget. The handler returns immediately after launching
-// goroutines — it does NOT hold a global advisory lock.
-// Each goroutine acquires LockIDSync (1004) only when hours_count reaches 24
-// and a CANDLE row needs to be updated.
+// per row as fire-and-forget. The handler returns immediately after launching goroutines.
 func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
-	ctx, span := syncTracer.Start(ctx, "RunSyncHandler")
-	defer span.End()
-
 	tasks, err := claimBatchSyncTasks(ctx, d)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("sync: claim batch (traceID=%s): %v", span.SpanContext().TraceID(), err)
+		log.Printf("sync: claim batch: %v", err)
 		return false
 	}
 
@@ -56,11 +40,6 @@ func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 
 	for _, task := range tasks {
 		task := task
-		// Each worker gets its own deadline, so a stuck pg_advisory_xact_lock wait
-		// (e.g., lock holder hung, not crashed) cannot leak the goroutine forever.
-		// lib/pq cancels the blocking query via the PostgreSQL cancel protocol when
-		// the context deadline fires, so WaitAndAcquireAdvisoryLock returns an error
-		// rather than blocking indefinitely.
 		workerCtx, cancel := context.WithTimeout(ctx, syncWorkerTimeout)
 		go func() {
 			defer cancel()
@@ -77,7 +56,7 @@ func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 // current field values.
 func claimBatchSyncTasks(ctx context.Context, d *dal.DAL) ([]*ent.SyncTask, error) {
 	var tasks []*ent.SyncTask
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		rows, err := tx.QueryContext(ctx, `
 			WITH claimed AS (
 				SELECT id
@@ -126,23 +105,17 @@ func claimBatchSyncTasks(ctx context.Context, d *dal.DAL) ([]*ent.SyncTask, erro
 //     next trigger re-evaluates it (prioritized by hours_count DESC).
 //   - If count == 24: proceed to Step 2.
 //
-// Step 2 (LockIDSync held): acquire the advisory lock, then in ONE pool
-// transaction update the CANDLE's resolved_tick_count, and hard-delete the
-// SyncTask row. The advisory lock serializes concurrent goroutines that
-// simultaneously reach count == 24.
+// Step 2: all 24 hours confirmed — update the CANDLE's resolved_tick_count
+// and hard-delete the SyncTask row in one pool transaction.
 func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) {
 	defer recoverGoroutine(ctx, "processSyncTaskWorker")
-
-	_, span := syncTracer.Start(ctx, "sync/process-task",
-		trace.WithAttributes(attribute.String("task.id", task.ID.String())))
-	defer span.End()
 
 	windowStart := task.TargetDate
 	windowEnd := task.TargetDate.Add(24 * time.Hour)
 
 	// Step 1: count + branch.
 	var actualCount int
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var err error
 		actualCount, err = tx.State.Query().
 			Where(
@@ -174,9 +147,7 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		}
 		return nil
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("sync: task %s count/reset (traceID=%s): %v",
-			task.ID, span.SpanContext().TraceID(), err)
+		log.Printf("sync: task %s count/reset: %v", task.ID, err)
 		return
 	}
 
@@ -186,17 +157,7 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		return
 	}
 
-	// Step 2: all 24 hours confirmed — acquire LockIDSync then finalize the candle.
-	lockTx, err := d.WaitAndAcquireAdvisoryLock(ctx, dal.LockIDSync)
-	if err != nil {
-		span.RecordError(err)
-		log.Printf("sync: task %s acquire lock (traceID=%s): %v",
-			task.ID, span.SpanContext().TraceID(), err)
-		return
-	}
-	defer func() { _ = lockTx.Rollback() }()
-
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		if err := tx.State.Update().
 			Where(
 				state.InstrumentID(task.InstrumentID),
@@ -222,9 +183,7 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		}
 		return nil
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("sync: task %s finalize (traceID=%s): %v",
-			task.ID, span.SpanContext().TraceID(), err)
+		log.Printf("sync: task %s finalize: %v", task.ID, err)
 		return
 	}
 

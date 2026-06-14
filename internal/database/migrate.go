@@ -35,9 +35,9 @@ var activityLogStmts = []string{
 // EnsureActivityLogTable creates ingestion.job_activity_logs and its indexes
 // if they do not already exist. Safe to run on every startup (fully idempotent).
 func EnsureActivityLogTable(ctx context.Context) error {
-	dsn := os.Getenv("DATABASE_DIRECT_URL")
+	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		return fmt.Errorf("DATABASE_DIRECT_URL is not set")
+		return fmt.Errorf("DATABASE_URL is not set")
 	}
 
 	db, err := sql.Open("postgres", dsn)
@@ -60,9 +60,9 @@ func EnsureActivityLogTable(ctx context.Context) error {
 // to create all schemas, tables, and seed data automatically.
 // This allows the app to self-bootstrap in development without a manual migrated step.
 func EnsureSchema(ctx context.Context) error {
-	dsn := os.Getenv("DATABASE_DIRECT_URL")
+	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		return fmt.Errorf("DATABASE_DIRECT_URL is not set")
+		return fmt.Errorf("DATABASE_URL is not set")
 	}
 
 	db, err := sql.Open("postgres", dsn)

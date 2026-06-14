@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
@@ -31,14 +29,11 @@ func runCandleRegular(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runCandleRegular")
 
-	ctx, span := candleTracer.Start(ctx, "candles/regular")
-	defer span.End()
-
 	// Step 1 — Seed today's CANDLE row for all active instruments.
-	seedTodayCandleRows(ctx, d, span)
+	seedTodayCandleRows(ctx, d)
 
 	// Step 2 — Claim PENDING CANDLE rows with ResolvedTickCount=24 and aggregate.
-	runCandleAggregationLoop(ctx, d, span)
+	runCandleAggregationLoop(ctx, d)
 }
 
 // ── Seeding ───────────────────────────────────────────────────────────────────
@@ -47,12 +42,12 @@ func runCandleRegular(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // for every active, unpaused instrument. Seeding yesterday ensures the row exists
 // before Stage B's aggregation loop tries to claim it at 05:08 UTC.
 // ON CONFLICT DO NOTHING makes both inserts idempotent.
-func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
+func seedTodayCandleRows(ctx context.Context, d *dal.DAL) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	yesterday := today.AddDate(0, 0, -1)
 
 	var instruments []*ent.Instrument
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		instruments, e = tx.Instrument.Query().
 			Where(
@@ -62,8 +57,7 @@ func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
 			All(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("candle seed: list instruments (traceID=%s): %v", span.SpanContext().TraceID(), err)
+		log.Printf("candle seed: list instruments: %v", err)
 		return
 	}
 
@@ -71,14 +65,14 @@ func seedTodayCandleRows(ctx context.Context, d *dal.DAL, span trace.Span) {
 		if ctx.Err() != nil {
 			return
 		}
-		seedOneCandleRow(ctx, d, span, instr.ID, yesterday)
-		seedOneCandleRow(ctx, d, span, instr.ID, today)
+		seedOneCandleRow(ctx, d, instr.ID, yesterday)
+		seedOneCandleRow(ctx, d, instr.ID, today)
 	}
 }
 
 // seedOneCandleRow idempotently inserts a CANDLE PENDING row for (instrumentID, today).
-func seedOneCandleRow(ctx context.Context, d *dal.DAL, span trace.Span, instrumentID uuid.UUID, today time.Time) {
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+func seedOneCandleRow(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, today time.Time) {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		return tx.ExecContext(ctx, `
 			INSERT INTO ingestion.states (
 				id, instrument_id, job_type, timestamp, status,
@@ -96,8 +90,7 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, span trace.Span, instrume
 			time.Now().UTC(),
 		)
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("candle seed %s %s (traceID=%s): %v", instrumentID, today.Format(time.DateOnly), span.SpanContext().TraceID(), err)
+		log.Printf("candle seed %s %s: %v", instrumentID, today.Format(time.DateOnly), err)
 	}
 }
 
@@ -105,9 +98,8 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, span trace.Span, instrume
 
 // runCandleAggregationLoop claims PENDING CANDLE rows with ResolvedTickCount=24
 // and dispatches each to executeCandleAggregation in a goroutine.
-// Claims use FOR UPDATE SKIP LOCKED via claimStateAsProcessed so Regular and
-// Backfill runs can safely route work by status under LockIDCandle.
-func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) {
+// Claims use FOR UPDATE SKIP LOCKED so Regular and Backfill runs safely route work by status.
+func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
@@ -122,8 +114,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 			if ent.IsNotFound(err) {
 				break
 			}
-			span.RecordError(err)
-			log.Printf("candle aggregation claim (traceID=%s): %v", span.SpanContext().TraceID(), err)
+			log.Printf("candle aggregation claim: %v", err)
 			break
 		}
 
@@ -148,19 +139,10 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL, span trace.Span) 
 //  4. Upload to R2, read back, validate, promote to CONFIRMED.
 //     On any error: PROCESSED → FAILED or BROKEN depending on cause.
 func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
-	ctx, span := candleTracer.Start(ctx, "candles/aggregation",
-		trace.WithAttributes(
-			attribute.String("state.id", row.ID.String()),
-			attribute.String("candle.date", row.Timestamp.UTC().Format("2006-01-02")),
-		),
-	)
-	defer span.End()
-
 	candleAggSem <- struct{}{}
 	defer func() { <-candleAggSem }()
 
 	if row.Edges.Instrument == nil {
-		span.RecordError(fmt.Errorf("candle agg: instrument not loaded for %s", row.ID))
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "candle agg: instrument not loaded")
 		return
 	}
@@ -171,7 +153,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	dayEnd := dayStart.Add(24 * time.Hour)
 
 	var tickStates []*ent.State
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		tickStates, e = tx.State.Query().
 			Where(
@@ -186,8 +168,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 			All(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("candle agg %s: query tick states (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle agg %s: query tick states: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "query tick states failed")
 		return
 	}
@@ -215,20 +196,17 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 					continue
 				}
 				// BROKEN Storage: file should exist but doesn't.
-				span.RecordError(fmt.Errorf("candle agg %s: NoSuchKey for tick %s (not deleted): BROKEN", row.ID, tickState.ID))
-				log.Printf("candle agg %s: NoSuchKey for tick %s (not deleted) (traceID=%s)", row.ID, tickState.ID, span.SpanContext().TraceID())
+				log.Printf("candle agg %s: NoSuchKey for tick %s (not deleted)", row.ID, tickState.ID)
 				broken = true
 				break
 			}
-			span.RecordError(err)
-			log.Printf("candle agg %s: read tick parquet %s (traceID=%s): %v", row.ID, tickState.ID, span.SpanContext().TraceID(), err)
+			log.Printf("candle agg %s: read tick parquet %s: %v", row.ID, tickState.ID, err)
 			updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "read tick parquet failed")
 			return
 		}
 
 		if err := acc.AccumulateTickParquet(data); err != nil {
-			span.RecordError(err)
-			log.Printf("candle agg %s: accumulate tick %s (traceID=%s): %v", row.ID, tickState.ID, span.SpanContext().TraceID(), err)
+			log.Printf("candle agg %s: accumulate tick %s: %v", row.ID, tickState.ID, err)
 			updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "accumulate tick parquet failed")
 			return
 		}
@@ -242,16 +220,14 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	// Step 3 — Build the daily Candles Parquet (all 19 timeframes).
 	candleData, err := buildCandleParquet(ctx, row, acc)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("candle agg %s: build candle parquet (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle agg %s: build candle parquet: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "build candle parquet failed")
 		return
 	}
 
 	// Step 4a — Upload to R2.
 	if err := uploadCandleParquetToR2(ctx, row, candleData); err != nil {
-		span.RecordError(err)
-		log.Printf("candle agg %s: upload candle parquet (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle agg %s: upload candle parquet: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload candle parquet failed")
 		return
 	}
@@ -260,15 +236,13 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	// Step 4b — Read back and validate.
 	stored, err := readCandleParquetFromR2(ctx, row)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("candle agg %s: read back candle parquet (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle agg %s: read back candle parquet: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "read-back candle parquet failed")
 		return
 	}
 
 	if err := validateCandleParquet(ctx, row, stored); err != nil {
-		span.RecordError(err)
-		log.Printf("candle agg %s: validate candle parquet (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle agg %s: validate candle parquet: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "validate candle parquet failed")
 		return
 	}

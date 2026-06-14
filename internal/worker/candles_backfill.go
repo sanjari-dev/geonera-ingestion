@@ -2,13 +2,9 @@ package worker
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"sync"
 	"time"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
@@ -44,15 +40,11 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runCandleBackfill")
 
-	ctx, span := candleTracer.Start(ctx, "candles/backfill")
-	defer span.End()
-
 	boundary := backfillCandleBoundary()
 
 	batch, err := claimCandleBackfillBatch(ctx, d, boundary)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("candle backfill: master claim (traceID=%s): %v", span.SpanContext().TraceID(), err)
+		log.Printf("candle backfill: master claim: %v", err)
 		return
 	}
 
@@ -69,7 +61,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 
 	// Phase C: last-resort ABANDONED reset — only when no actionable rows remain.
 	if len(batch) == 0 {
-		resetCandleAbandonedRows(ctx, d, span, boundary)
+		resetCandleAbandonedRows(ctx, d, boundary)
 	}
 }
 
@@ -88,7 +80,7 @@ func backfillCandleBoundary() time.Time {
 // the status transition atomically, and returns the routed batch.
 func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Time) ([]candleRoutedRow, error) {
 	var routed []candleRoutedRow
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		rows, e := candleStateRows(tx.State.Query(),
 			state.Or(
 				state.StatusIn(
@@ -188,31 +180,20 @@ func dispatchCandleBackfillRow(ctx context.Context, d *dal.DAL, item candleRoute
 // the upload (→COMPLETED) but whose worker crashed before the instant read-back
 // and validation pass. It re-runs validation and promotes to CONFIRMED or BROKEN.
 func executeCandleValidation(ctx context.Context, d *dal.DAL, row *ent.State) {
-	ctx, span := candleTracer.Start(ctx, "candles/backfill-validation",
-		trace.WithAttributes(
-			attribute.String("state.id", row.ID.String()),
-			attribute.String("candle.date", row.Timestamp.UTC().Format("2006-01-02")),
-		),
-	)
-	defer span.End()
-
 	if row.Edges.Instrument == nil {
-		span.RecordError(fmt.Errorf("candle validation: instrument not loaded for %s", row.ID))
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "candle validation: instrument not loaded")
 		return
 	}
 
 	stored, err := readCandleParquetFromR2(ctx, row)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("candle validation %s: read-back (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle validation %s: read-back: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "read-back candle parquet failed")
 		return
 	}
 
 	if err := validateCandleParquet(ctx, row, stored); err != nil {
-		span.RecordError(err)
-		log.Printf("candle validation %s: validate (traceID=%s): %v", row.ID, span.SpanContext().TraceID(), err)
+		log.Printf("candle validation %s: validate: %v", row.ID, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "validate candle parquet failed")
 		return
 	}
@@ -224,9 +205,9 @@ func executeCandleValidation(ctx context.Context, d *dal.DAL, row *ent.State) {
 // only when the master bulk-claim yielded 0 actionable rows. It iterates ABANDONED
 // CANDLE rows outside the Zona Eksklusif (Timestamp <= boundary) and resets each
 // to PENDING with RetryCount=0, giving them a fresh aggregation budget.
-func resetCandleAbandonedRows(ctx context.Context, d *dal.DAL, span trace.Span, boundary time.Time) {
+func resetCandleAbandonedRows(ctx context.Context, d *dal.DAL, boundary time.Time) {
 	for ctx.Err() == nil {
-		err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		err := d.Execute(ctx, func(tx *ent.Tx) error {
 			row, err := candleStateRows(tx.State.Query(),
 				state.StatusEQ(state.StatusABANDONED),
 				state.TimestampLTE(boundary),
@@ -246,8 +227,7 @@ func resetCandleAbandonedRows(ctx context.Context, d *dal.DAL, span trace.Span, 
 			if ent.IsNotFound(err) {
 				break
 			}
-			span.RecordError(err)
-			log.Printf("candle abandoned reset (traceID=%s): %v", span.SpanContext().TraceID(), err)
+			log.Printf("candle abandoned reset: %v", err)
 			break
 		}
 	}
@@ -269,3 +249,4 @@ func executeCandleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 		handleRetryReset(ctx, d, row)
 	}
 }
+

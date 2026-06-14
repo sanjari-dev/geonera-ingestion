@@ -8,8 +8,6 @@ import (
 	"runtime"
 	"sync"
 
-	"go.opentelemetry.io/otel"
-
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
 	"github.com/sanjari-dev/geonera-ingestion/ent/predicate"
@@ -19,38 +17,30 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 )
 
-var candleTracer = otel.Tracer("worker/candles")
-
 // candleAggSem limits concurrent candle aggregation goroutines to runtime.NumCPU().
 // Each goroutine streams up to 24 hourly Parquet files from R2; bounding concurrency
 // prevents R2 connection spikes and caps peak memory under the aggregation loop.
 var candleAggSem = make(chan struct{}, runtime.NumCPU())
 
 // RunCandleParentHandler is the single entry point for all candle-aggregation work.
-// It holds the global advisory lock for the full duration, so no other job
-// (ticks, maintenance, sync) can run concurrently. If the lock is already
-//
-//	held, the trigger is dropped immediately.
-//
 // mode must be either "REGULAR" or "BACKFILL".
 func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
-	ctx, span := candleTracer.Start(ctx, fmt.Sprintf("RunCandleParentHandler_%s", mode))
-	defer span.End()
-
-	return runWithLocks(ctx, d, "candles/"+mode, []int64{dal.LockIDCandle}, onStarted, func(lockCtx context.Context) {
-		var wg sync.WaitGroup
-		switch mode {
-		case "REGULAR":
-			wg.Add(1)
-			go runCandleRegular(lockCtx, d, &wg)
-		case "BACKFILL":
-			wg.Add(1)
-			go runCandleBackfill(lockCtx, d, &wg)
-		default:
-			log.Printf("candles: unknown mode %q", mode)
-		}
-		wg.Wait()
-	})
+	if onStarted != nil {
+		onStarted()
+	}
+	var wg sync.WaitGroup
+	switch mode {
+	case "REGULAR":
+		wg.Add(1)
+		go runCandleRegular(ctx, d, &wg)
+	case "BACKFILL":
+		wg.Add(1)
+		go runCandleBackfill(ctx, d, &wg)
+	default:
+		log.Printf("candles: unknown mode %q", mode)
+	}
+	wg.Wait()
+	return true
 }
 
 func candleStateRows(q *ent.StateQuery, filters ...predicate.State) *ent.StateQuery {

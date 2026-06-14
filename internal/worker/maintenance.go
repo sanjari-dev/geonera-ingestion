@@ -12,17 +12,12 @@ import (
 
 	"entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 )
-
-var maintenanceTracer = otel.Tracer("worker/maintenance")
 
 func isR2NotFound(err error) bool { return errors.Is(err, r2.ErrNotFound) }
 
@@ -60,58 +55,45 @@ func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
 
 // ── RunMaintenanceHandler ─────────────────────────────────────────────────────
 
-// RunMaintenanceHandler acquires LockIDMaintenance and iterates over every
-// instrument (active and inactive). Per instrument, it either bootstraps a
-// brand-new states table (Group 1) or runs the four normal-maintenance phases
-// A/B/C/D in parallel (Group 2).
+// RunMaintenanceHandler iterates over every instrument (active and inactive).
+// Per instrument, it either bootstraps a brand-new states table (Group 1) or
+// runs the four normal-maintenance phases A/B/C/D in parallel (Group 2).
 func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
-	ctx, span := maintenanceTracer.Start(ctx, "RunMaintenanceHandler")
-	defer span.End()
+	if onStarted != nil {
+		onStarted()
+	}
+	log.Printf("maintenance: running!")
 
-	return runWithLocks(ctx, d, "maintenance", []int64{dal.LockIDMaintenance}, onStarted, func(lockCtx context.Context) {
-		log.Printf("maintenance: lock acquired, running!")
+	if actLogger != nil {
+		actLogger.Purge(ctx)
+	}
 
-		// Enforce 7-day retention on job activity logs before proceeding with
-		// instrument-level work. Runs every maintenance cycle (~5 min) but is
-		// a fast no-op when nothing qualifies for deletion.
-		if actLogger != nil {
-			actLogger.Purge(lockCtx)
+	var instruments []*ent.Instrument
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
+		var e error
+		instruments, e = tx.Instrument.Query().All(ctx)
+		return e
+	}); err != nil {
+		log.Printf("maintenance: query instruments: %v", err)
+		return true
+	}
+
+	for _, inst := range instruments {
+		if ctx.Err() != nil {
+			return true
 		}
-
-		var instruments []*ent.Instrument
-		if err := d.ExecuteInPool(lockCtx, func(tx *ent.Tx) error {
-			var e error
-			// Fetch ALL instruments — active and inactive — so bootstrap can
-			// proceed even before an engineer sets IsActive=true.
-			instruments, e = tx.Instrument.Query().All(lockCtx)
-			return e
-		}); err != nil {
-			span.RecordError(err)
-			log.Printf("maintenance: query instruments (traceID=%s): %v", span.SpanContext().TraceID(), err)
-			return
-		}
-
-		for _, inst := range instruments {
-			if lockCtx.Err() != nil {
-				return
-			}
-			runMaintenanceForInstrument(lockCtx, d, inst)
-		}
-	})
+		runMaintenanceForInstrument(ctx, d, inst)
+	}
+	return true
 }
 
 // runMaintenanceForInstrument dispatches Group 1 (bootstrap) when the state
 // table is empty for this instrument, or Group 2 (A + B + C + D in parallel)
 // when rows already exist.
 func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
-	ctx, span := maintenanceTracer.Start(ctx, "maintenance/instrument",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	empty, err := isStatesEmpty(ctx, d, inst.ID)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("maintenance %s: check empty (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+		log.Printf("maintenance %s: check empty: %v", inst.Name, err)
 		return
 	}
 
@@ -132,7 +114,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 
 func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (bool, error) {
 	var count int
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		count, e = tx.State.Query().
 			Where(
@@ -155,18 +137,13 @@ func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (boo
 func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/bootstrap")
 
-	ctx, span := maintenanceTracer.Start(ctx, "maintenance/bootstrap",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	log.Printf("maintenance bootstrap %s: seeding from %s", inst.Name, inst.StartDate.UTC().Format(time.RFC3339))
 
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("maintenance bootstrap %s: set IsPause=true (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+		log.Printf("maintenance bootstrap %s: set IsPause=true: %v", inst.Name, err)
 		return
 	}
 
@@ -186,12 +163,11 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("bootstrap %s", inst.Name))
 	}
 
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(false).Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("maintenance bootstrap %s: set IsPause=false (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+		log.Printf("maintenance bootstrap %s: set IsPause=false: %v", inst.Name, err)
 		return
 	}
 	log.Printf("maintenance bootstrap %s: complete", inst.Name)
@@ -205,10 +181,6 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/forward-seeding")
 
-	ctx, span := maintenanceTracer.Start(ctx, "maintenance/forward-seeding",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
 			return
@@ -217,8 +189,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 
 		maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
 		if err != nil {
-			span.RecordError(err)
-			log.Printf("forward seeding %s %s: query max (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+			log.Printf("forward seeding %s %s: query max: %v", inst.Name, jobType, err)
 			continue
 		}
 		if maxTS.IsZero() {
@@ -248,10 +219,6 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/backward-gap-fill")
 
-	ctx, span := maintenanceTracer.Start(ctx, "maintenance/backward-gap-fill",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	startDate := inst.StartDate.UTC()
 
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
@@ -263,8 +230,7 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 
 		minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
 		if err != nil {
-			span.RecordError(err)
-			log.Printf("backward gap fill %s %s: query min (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+			log.Printf("backward gap fill %s %s: query min: %v", inst.Name, jobType, err)
 			continue
 		}
 
@@ -292,12 +258,9 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 // PENDING rows for every missing slot; whether those rows haven't been processed
 // yet is irrelevant to the pause decision.
 func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
-	span := trace.SpanFromContext(ctx)
-
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, state.JobTypeTICK)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("manage pause %s: query min tick (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+		log.Printf("manage pause %s: query min tick: %v", inst.Name, err)
 		return
 	}
 	if minTS.IsZero() {
@@ -307,12 +270,11 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	startNorm := normalizeTS(inst.StartDate.UTC(), state.JobTypeTICK)
 	shouldPause := minTS.After(startNorm)
 
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(shouldPause).Save(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("manage pause %s: set IsPause=%v (traceID=%s): %v", inst.Name, shouldPause, span.SpanContext().TraceID(), err)
+		log.Printf("manage pause %s: set IsPause=%v: %v", inst.Name, shouldPause, err)
 	}
 }
 
@@ -324,10 +286,6 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/pruning")
 
-	ctx, span := maintenanceTracer.Start(ctx, "maintenance/pruning",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	runPruningPhase1Mark(ctx, d, inst)
 	runPruningPhase2Sweep(ctx, d, inst)
 }
@@ -335,13 +293,9 @@ func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 // runPruningPhase1Mark soft-deletes rows WHERE timestamp < StartDate AND
 // is_deleted=false for this instrument, in batches of 100.
 func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
-	_, span := maintenanceTracer.Start(ctx, "maintenance/pruning/phase1-mark",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	for ctx.Err() == nil {
 		var batchLen int
-		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			rows, e := tx.State.Query().
 				Where(
 					state.InstrumentID(inst.ID),
@@ -367,8 +321,7 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 				SetUpdatedAt(time.Now().UTC()).
 				Exec(ctx)
 		}); err != nil {
-			span.RecordError(err)
-			log.Printf("pruning phase1 mark %s (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+			log.Printf("pruning phase1 mark %s: %v", inst.Name, err)
 			break
 		}
 		if batchLen == 0 {
@@ -386,15 +339,11 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 // Phase 3 — DB Hard Delete: bulk-delete only the succeeding group from the DB.
 // Failed rows remain is_deleted=true and are retried automatically.
 func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
-	_, span := maintenanceTracer.Start(ctx, "maintenance/pruning/phase2-sweep",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	// ── Phase 2: R2 Sweep ────────────────────────────────────────────────────
 	// Load all is_deleted=true rows for this instrument. The set is bounded —
 	// only rows below Instrument.StartDate are soft-deleted by Phase 1.
 	var allRows []*ent.State
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		allRows, e = tx.State.Query().
 			Where(
@@ -405,8 +354,7 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			All(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("pruning phase2 %s: query IsDeleted rows (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+		log.Printf("pruning phase2 %s: query IsDeleted rows: %v", inst.Name, err)
 		return
 	}
 	if len(allRows) == 0 {
@@ -426,9 +374,8 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			r2Err = deleteCandleParquetFromR2(ctx, row)
 		}
 		if r2Err != nil && !isR2NotFound(r2Err) {
-			span.RecordError(r2Err)
-			log.Printf("pruning phase2 %s: R2 delete %s (%s) (traceID=%s): %v (will retry next cycle)",
-				inst.Name, row.ID, row.JobType, span.SpanContext().TraceID(), r2Err)
+			log.Printf("pruning phase2 %s: R2 delete %s (%s): %v (will retry next cycle)",
+				inst.Name, row.ID, row.JobType, r2Err)
 		} else {
 			succeeded = append(succeeded, row.ID)
 		}
@@ -445,12 +392,11 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			end = len(succeeded)
 		}
 		chunk := succeeded[i:end]
-		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			_, e := tx.State.Delete().Where(state.IDIn(chunk...)).Exec(ctx)
 			return e
 		}); err != nil {
-			span.RecordError(err)
-			log.Printf("pruning phase3 %s: hard-delete (traceID=%s): %v", inst.Name, span.SpanContext().TraceID(), err)
+			log.Printf("pruning phase3 %s: hard-delete: %v", inst.Name, err)
 		}
 	}
 }
@@ -463,10 +409,6 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 func runConsistencyCheck(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/consistency-check")
 
-	ctx, span := maintenanceTracer.Start(ctx, "maintenance/consistency-check",
-		trace.WithAttributes(attribute.String("instrument.name", inst.Name)))
-	defer span.End()
-
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
 			return
@@ -476,13 +418,11 @@ func runConsistencyCheck(ctx context.Context, d *dal.DAL, inst *ent.Instrument) 
 }
 
 func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instrument, jobType state.JobType) {
-	span := trace.SpanFromContext(ctx)
 	interval := jobTypeInterval(jobType)
 
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("consistency check %s %s: query min (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+		log.Printf("consistency check %s %s: query min: %v", inst.Name, jobType, err)
 		return
 	}
 	if minTS.IsZero() {
@@ -490,15 +430,14 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	}
 	maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
 	if err != nil {
-		span.RecordError(err)
-		log.Printf("consistency check %s %s: query max (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+		log.Printf("consistency check %s %s: query max: %v", inst.Name, jobType, err)
 		return
 	}
 
 	expected := int(maxTS.Sub(minTS)/interval) + 1
 
 	var actual int
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		actual, e = tx.State.Query().
 			Where(
@@ -511,8 +450,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 			Count(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("consistency check %s %s: count actual (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+		log.Printf("consistency check %s %s: count actual: %v", inst.Name, jobType, err)
 		return
 	}
 
@@ -527,7 +465,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	// set difference in memory. This is efficient for typical ranges (years of
 	// data) because we only transfer timestamps, not full row payloads.
 	var existingRows []*ent.State
-	if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		existingRows, e = tx.State.Query().
 			Where(
@@ -540,8 +478,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 			All(ctx)
 		return e
 	}); err != nil {
-		span.RecordError(err)
-		log.Printf("consistency check %s %s: query existing (traceID=%s): %v", inst.Name, jobType, span.SpanContext().TraceID(), err)
+		log.Printf("consistency check %s %s: query existing: %v", inst.Name, jobType, err)
 		return
 	}
 
@@ -589,21 +526,19 @@ func normalizeTS(t time.Time, jobType state.JobType) time.Time {
 // ON CONFLICT DO NOTHING. One SQL statement per batch replaces the previous
 // per-row loop, reducing parse/plan/index overhead by ~720×.
 func insertBatched(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType, candidates []time.Time, phase string) {
-	span := trace.SpanFromContext(ctx)
 	for i := 0; i < len(candidates) && ctx.Err() == nil; i += maintenanceSeedBatchSize {
 		end := i + maintenanceSeedBatchSize
 		if end > len(candidates) {
 			end = len(candidates)
 		}
 		batchIdx := i / maintenanceSeedBatchSize
-		if err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			if err := insertBatchPendingOnConflictDoNothing(ctx, tx, instrumentID, jobType, candidates[i:end], time.Now().UTC()); err != nil {
 				return fmt.Errorf("%s batch[%d]: %w", phase, batchIdx, err)
 			}
 			return nil
 		}); err != nil {
-			span.RecordError(err)
-			log.Printf("maintenance %s: insert (traceID=%s): %v", phase, span.SpanContext().TraceID(), err)
+			log.Printf("maintenance %s: insert: %v", phase, err)
 		}
 	}
 }
@@ -685,7 +620,7 @@ func insertStatePendingOnConflictDoNothing(
 // instrument/jobType. Returns zero time when no rows exist.
 func queryStateMinTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType) (time.Time, error) {
 	var minTS time.Time
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		row, e := tx.State.Query().
 			Where(
 				state.InstrumentID(instrumentID),
@@ -710,7 +645,7 @@ func queryStateMinTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jo
 // instrument/jobType. Returns zero time when no rows exist.
 func queryStateMaxTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType) (time.Time, error) {
 	var maxTS time.Time
-	err := d.ExecuteInPool(ctx, func(tx *ent.Tx) error {
+	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		row, e := tx.State.Query().
 			Where(
 				state.InstrumentID(instrumentID),
