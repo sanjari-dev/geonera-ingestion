@@ -9,7 +9,7 @@
  * (`~h<hex>`), which needs no compression library — just UTF-8 -> hex.
  * ==========================================================================*/
 
-const DEFAULT_SERVER = "https://www.plantuml.com/plantuml";
+const DEFAULT_SERVER = "http://localhost:4040/plantuml";
 
 const DIAGRAMS = [
   {
@@ -59,6 +59,9 @@ const DIAGRAMS = [
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
+// Always clear stored server URL so the proxy default is used on every load.
+localStorage.removeItem("puml-viewer-server");
+
 const state = {
   current: null,       // diagram descriptor
   source: "",          // raw .puml text
@@ -190,10 +193,8 @@ async function encodeForServer(text) {
   return { token: encodeHex(bytes), mode: "hex" };
 }
 
-async function buildRenderUrl(serverUrl, format, source) {
-  const base = serverUrl.replace(/\/+$/, "");
-  const { token, mode } = await encodeForServer(source);
-  return { url: `${base}/${format}/${token}`, mode };
+function buildRenderUrl(format, filename) {
+  return { url: `http://localhost:4040/render/${format}/${filename}`, mode: "server" };
 }
 
 // ---------------------------------------------------------------------------
@@ -274,17 +275,14 @@ async function selectDiagram(d) {
     state.source = await res.text();
     els.sourceCode.textContent = state.source;
 
-    const { url, mode } = await buildRenderUrl(state.serverUrl, state.format, state.source);
+    const { url } = buildRenderUrl(state.format, d.file);
     await loadImage(url);
     els.downloadImage.href = url;
     els.downloadImage.download = d.file.replace(/\.puml$/, `.${state.format}`);
     els.loading.classList.add("hidden");
     fitToScreen();
-    const encNote = mode === "hex"
-      ? " (hex transport — your browser lacks compression support; very long URLs may be rejected by public servers)"
-      : "";
     els.statusText.textContent =
-      `Rendered "${d.name}" via ${state.serverUrl}${encNote} • Drag to pan • Scroll / pinch to zoom • Double-click to fit`;
+      `Rendered "${d.name}" • Drag to pan • Scroll / pinch to zoom • Double-click to fit`;
   } catch (err) {
     showError(err.message);
   }

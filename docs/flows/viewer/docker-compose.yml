@@ -10,8 +10,17 @@
 # `context:` is intentional — see Dockerfile's header comment: the image
 # needs both this `viewer/` app AND the sibling `../*.puml` sources, so the
 # build context must be `docs/flows/` (this file's parent directory).
+#
+# plantuml-server runs locally so diagrams render without internet access.
 
 services:
+  plantuml-server:
+    image: plantuml/plantuml-server:jetty
+    container_name: geonera-plantuml-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+
   flow-viewer:
     build:
       context: ..
@@ -29,3 +38,5 @@ services:
       timeout: 5s
       start_period: 5s
       retries: 3
+    depends_on:
+      - plantuml-server
