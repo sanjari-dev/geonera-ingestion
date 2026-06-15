@@ -26,6 +26,10 @@ skinparam activity {
   BackgroundColor<<api>> #AD1457
   FontColor<<api>> #FFFFFF
   BorderColor<<api>> #6A0F38
+
+  BackgroundColor<<lock>> #6A1B9A
+  FontColor<<lock>> #FFFFFF
+  BorderColor<<lock>> #38006B
 }
 
 skinparam activityDiamond {
@@ -54,6 +58,7 @@ legend right
   |<back:#1565C0><color:#FFFFFF> db </color></back>| PostgreSQL transaction (state / outbox) |
   |<back:#2E7D32><color:#FFFFFF> r2 </color></back>| Cloudflare R2 storage I/O |
   |<back:#AD1457><color:#FFFFFF> api </color></back>| External Dukascopy API call |
+  |<back:#6A1B9A><color:#FFFFFF> lock </color></back>| PostgreSQL advisory lock (session-level) |
 endlegend
 
 start
@@ -70,192 +75,225 @@ end note
 repeat
   ' ── PER-INSTRUMENT ITERATION ──────────────────────────────
 
-  if (States table EMPTY for this instrument?) then (yes — brand-new / never seeded)
+  :key = instrumentLockKey(instrument.ID)
+  FNV-1a hash of UUID → int64;
+  note right
+    Each instrument maps to a unique int64 key.
+    Collision probability: 1/2^64 — worst case is
+    a spurious skip for one cycle (no data loss).
+  end note
 
-    ' ══════════════════════════════════════════════════════════
-    ' GROUP 1 — BOOTSTRAP
-    ' Runs when an instrument is first added (IsActive just set
-    ' true by an engineer) or its states were fully wiped.
-    ' IsActive is forced false to block Tick/Candle workers
-    ' from claiming rows that do not exist yet.
-    ' ══════════════════════════════════════════════════════════
+  :Acquire dedicated SQL connection from pool
+  (session-level lock must outlive individual transactions);
+  :pg_try_advisory_lock(key);<<lock>>
+  note right
+    Non-blocking: returns immediately.
+    true  → this worker now owns the instrument.
+    false → another worker is already handling it.
+    Lock is session-level, not transaction-level —
+    survives across all inner transactions of Group 1/2.
+  end note
 
-    :Set Instrument.IsPause = true
-    (block Tick/Candle workers from touching
-    this instrument during seeding);<<db>>
+  if (Lock acquired?) then (no — another worker holds this instrument)
 
-    repeat
-      :Insert next batch of PENDING rows
-      (TICK: hourly slots, CANDLE: daily slots)
-      from StartDate to time.Now()
-      using INSERT ... ON CONFLICT DO NOTHING;<<db>>
-    repeat while (More rows remaining between\nStartDate and time.Now() ?) is (yes) not (no — all rows inserted)
+    :log "skipped — lock held by concurrent worker"
+    move on to next instrument;
 
-    :Set Instrument.IsPause = false;<<db>>
-    note right
-      Bootstrap fully complete in one
-      maintenance cycle — instrument handed
-      off to Group 2 (A + B + C + D) on the
-      very next trigger.
-    end note
+  else (yes — this worker owns the instrument)
 
-  else (states exist — instrument already bootstrapped)
+    if (States table EMPTY for this instrument?) then (yes — brand-new / never seeded)
 
-    ' ══════════════════════════════════════════════════════════
-    ' GROUP 2 — NORMAL MAINTENANCE (A + B + C + D run in parallel)
-    ' Only reached when IsActive = true and states are non-empty.
-    ' All branches apply to every job_type: TICK and CANDLE.
-    ' ══════════════════════════════════════════════════════════
+      ' ══════════════════════════════════════════════════════════
+      ' GROUP 1 — BOOTSTRAP
+      ' Runs when an instrument is first added (IsActive just set
+      ' true by an engineer) or its states were fully wiped.
+      ' IsPause is set to block Tick/Candle workers from claiming
+      ' rows that do not exist yet.
+      ' ══════════════════════════════════════════════════════════
 
-    split
-      ' ── A. Forward Seeding ──────────────────────────────────
-      :**A. Forward Seeding (Batched)**
-      Iterates over job_types: TICK and CANDLE;
-      note right
-        Each job_type is processed independently.
-        job_type filter is MANDATORY to avoid
-        TICK/CANDLE ambiguity in MAX lookup.
-      end note
+      :Set Instrument.IsPause = true
+      (block Tick/Candle workers from touching
+      this instrument during seeding);<<db>>
+
       repeat
-        :Find MAX(timestamp) for current
-        (instrument_id, job_type);<<db>>
+        :Insert next batch of PENDING rows
+        (TICK: hourly slots, CANDLE: daily slots)
+        from StartDate to time.Now()
+        using INSERT ... ON CONFLICT DO NOTHING;<<db>>
+      repeat while (More rows remaining between\nStartDate and time.Now() ?) is (yes) not (no — all rows inserted)
+
+      :Set Instrument.IsPause = false;<<db>>
+      note right
+        Bootstrap fully complete in one
+        maintenance cycle — instrument handed
+        off to Group 2 (A + B + C + D) on the
+        very next trigger.
+      end note
+
+    else (states exist — instrument already bootstrapped)
+
+      ' ══════════════════════════════════════════════════════════
+      ' GROUP 2 — NORMAL MAINTENANCE (A + B + C + D run in parallel)
+      ' Only reached when states are non-empty.
+      ' All branches apply to every job_type: TICK and CANDLE.
+      ' ══════════════════════════════════════════════════════════
+
+      split
+        ' ── A. Forward Seeding ──────────────────────────────────
+        :**A. Forward Seeding (Batched)**
+        Iterates over job_types: TICK and CANDLE;
+        note right
+          Each job_type is processed independently.
+          job_type filter is MANDATORY to avoid
+          TICK/CANDLE ambiguity in MAX lookup.
+        end note
         repeat
-          :Insert next batch of PENDING rows
-          from MAX(timestamp) toward time.Now()
-          using INSERT ... ON CONFLICT DO NOTHING;<<db>>
-        repeat while (MAX(timestamp) < time.Now() ?) is (yes) not (no — fully up to date)
-      repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
-
-    split again
-      ' ── B. Backward Gap Fill ────────────────────────────────
-      :**B. Backward Gap Fill (Batched)**
-      Iterates over job_types: TICK and CANDLE;
-      note right
-        Maintenance does not care about row status.
-        Only the existence of a row at a given
-        timestamp matters — ON CONFLICT DO NOTHING
-        leaves any existing row untouched.
-      end note
-      repeat
-        :Compare MIN(timestamp) for current
-        (instrument_id, job_type)
-        against Instrument.StartDate;<<db>>
-        if (MIN(timestamp) > StartDate ?) then (yes — gap toward past exists)
+          :Find MAX(timestamp) for current
+          (instrument_id, job_type);<<db>>
           repeat
             :Insert next batch of PENDING rows
-            backward toward StartDate
+            from MAX(timestamp) toward time.Now()
             using INSERT ... ON CONFLICT DO NOTHING;<<db>>
-          repeat while (MIN(timestamp) > StartDate ?) is (yes) not (no — gap fully closed)
-        else (MIN <= StartDate — history already complete)
-        endif
-      repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
+          repeat while (MAX(timestamp) < time.Now() ?) is (yes) not (no — fully up to date)
+        repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
 
-      :Update Instrument.IsPause based on TICK coverage:
-      Find MIN(Timestamp, **any status**, TICK).
-      IsPause = (MIN > StartDate)
-      — true while historical range not yet fully covered,
-      false once seeded down to StartDate;<<db>>
-      note right
-        Row status is not considered.
-        Backward gap fill has already inserted PENDING rows
-        for every missing slot — whether those rows have been
-        processed yet is irrelevant to the pause decision.
-      end note
+      split again
+        ' ── B. Backward Gap Fill ────────────────────────────────
+        :**B. Backward Gap Fill (Batched)**
+        Iterates over job_types: TICK and CANDLE;
+        note right
+          Maintenance does not care about row status.
+          Only the existence of a row at a given
+          timestamp matters — ON CONFLICT DO NOTHING
+          leaves any existing row untouched.
+        end note
+        repeat
+          :Compare MIN(timestamp) for current
+          (instrument_id, job_type)
+          against Instrument.StartDate;<<db>>
+          if (MIN(timestamp) > StartDate ?) then (yes — gap toward past exists)
+            repeat
+              :Insert next batch of PENDING rows
+              backward toward StartDate
+              using INSERT ... ON CONFLICT DO NOTHING;<<db>>
+            repeat while (MIN(timestamp) > StartDate ?) is (yes) not (no — gap fully closed)
+          else (MIN <= StartDate — history already complete)
+          endif
+        repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
 
-    split again
-      ' ── C. Pruning — Mark, R2 Sweep, then DB Delete ────────
-      :**C. Pruning — Mark & Sweep (3-Phase, Batched)**;
-      note right
-        Runs across ALL job_types at once
-        (timestamp-based, not job_type filtered).
-        DB delete and R2 delete cannot be made atomic.
-        R2 is swept completely first — results grouped
-        into succeeded vs failed — then DB hard-delete
-        is applied only to the succeeded group.
-        Failed rows stay IsDeleted=true and are
-        retried on the next Pruning cycle.
-      end note
+        :Update Instrument.IsPause based on TICK coverage:
+        Find MIN(Timestamp, **any status**, TICK).
+        IsPause = (MIN > StartDate)
+        — true while historical range not yet fully covered,
+        false once seeded down to StartDate;<<db>>
+        note right
+          Row status is not considered.
+          Backward gap fill has already inserted PENDING rows
+          for every missing slot — whether those rows have been
+          processed yet is irrelevant to the pause decision.
+        end note
 
-      :**Phase 1 — Mark (Soft Delete)**;<<db>>
-      :UPDATE batch SET IsDeleted = true
-      WHERE timestamp < Instrument.StartDate
-      AND IsDeleted = false;<<db>>
-      note right: Marked rows are immediately \n ignored by every ETL worker
+      split again
+        ' ── C. Pruning — Mark, R2 Sweep, then DB Delete ────────
+        :**C. Pruning — Mark & Sweep (3-Phase, Batched)**;
+        note right
+          Runs across ALL job_types at once
+          (timestamp-based, not job_type filtered).
+          DB delete and R2 delete cannot be made atomic.
+          R2 is swept completely first — results grouped
+          into succeeded vs failed — then DB hard-delete
+          is applied only to the succeeded group.
+          Failed rows stay IsDeleted=true and are
+          retried on the next Pruning cycle.
+        end note
 
-      :**Phase 2 — R2 Sweep (collect results)**;
-      :Initialise two groups:
-      **succeeded** = [] and **failed** = [];
-      repeat
-        :Fetch next batch WHERE IsDeleted = true;
-        :Request deletion of each object
-        from Cloudflare R2;<<r2>>
-        if (R2 response?) then (deleted successfully)
-          :Add row IDs to **succeeded** group;
-        elseif (NoSuchKey?) then (yes — no file in R2\nDB record is a leftover)
-          :Add row IDs to **succeeded** group
-          (no R2 object to clean up —
-          safe to delete from DB directly);
-        else (timeout / error)
-          :Add row IDs to **failed** group;
-        endif
-      repeat while (More IsDeleted rows remaining?) is (yes) not (no — all rows processed)
-      note right
-        Every IsDeleted=true row is now
-        in exactly one group.
-      end note
+        :**Phase 1 — Mark (Soft Delete)**;<<db>>
+        :UPDATE batch SET IsDeleted = true
+        WHERE timestamp < Instrument.StartDate
+        AND IsDeleted = false;<<db>>
+        note right: Marked rows are immediately \n ignored by every ETL worker
 
-      :**Phase 3 — DB Hard Delete (succeeded group only)**;<<db>>
-      :DELETE FROM states
-      WHERE id IN (**succeeded** group);<<db>>
-      note right
-        **failed** group rows remain IsDeleted=true
-        and will be retried on the next
-        Pruning cycle automatically.
-      end note
+        :**Phase 2 — R2 Sweep (collect results)**;
+        :Initialise two groups:
+        **succeeded** = [] and **failed** = [];
+        repeat
+          :Fetch next batch WHERE IsDeleted = true;
+          :Request deletion of each object
+          from Cloudflare R2;<<r2>>
+          if (R2 response?) then (deleted successfully)
+            :Add row IDs to **succeeded** group;
+          elseif (NoSuchKey?) then (yes — no file in R2\nDB record is a leftover)
+            :Add row IDs to **succeeded** group
+            (no R2 object to clean up —
+            safe to delete from DB directly);
+          else (timeout / error)
+            :Add row IDs to **failed** group;
+          endif
+        repeat while (More IsDeleted rows remaining?) is (yes) not (no — all rows processed)
+        note right
+          Every IsDeleted=true row is now
+          in exactly one group.
+        end note
 
-    split again
-      ' ── D. Consistency Check ────────────────────────────────
-      :**D. Consistency Check (Range Integrity)**
-      Iterates over job_types: TICK and CANDLE;
-      note right
-        Verifies that every timestamp slot between
-        MIN and MAX actually has a row in states.
-        Fills any internal gap with PENDING rows
-        without touching existing rows (any status).
-        TICK counts hourly slots; CANDLE counts daily slots.
-      end note
-      repeat
-        :Fetch MIN(timestamp) and MAX(timestamp)
-        for current (instrument_id, job_type);<<db>>
-        :Calculate EXPECTED count between MIN and MAX:
-        - TICK   → number of hours in [MIN, MAX]
-        - CANDLE → number of days  in [MIN, MAX];
-        :Fetch ACTUAL count = COUNT(*)
-        WHERE timestamp BETWEEN MIN AND MAX
-        for current (instrument_id, job_type);<<db>>
-        if (ACTUAL < EXPECTED ?) then (yes — missing tasks detected)
-          :Query missing timestamps:
-          expected slots EXCEPT timestamps
-          already present in states;<<db>>
-          repeat
-            :Insert next batch of missing rows
-            as PENDING using
-            INSERT ... ON CONFLICT DO NOTHING;<<db>>
-          repeat while (More missing timestamps?) is (yes) not (no — all gaps filled)
-        else (no — counts match, data is consistent)
-          :Skip — no action needed;
-        endif
-      repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
+        :**Phase 3 — DB Hard Delete (succeeded group only)**;<<db>>
+        :DELETE FROM states
+        WHERE id IN (**succeeded** group);<<db>>
+        note right
+          **failed** group rows remain IsDeleted=true
+          and will be retried on the next
+          Pruning cycle automatically.
+        end note
 
-    end split
+      split again
+        ' ── D. Consistency Check ────────────────────────────────
+        :**D. Consistency Check (Range Integrity)**
+        Iterates over job_types: TICK and CANDLE;
+        note right
+          Verifies that every timestamp slot between
+          MIN and MAX actually has a row in states.
+          Fills any internal gap with PENDING rows
+          without touching existing rows (any status).
+          TICK counts hourly slots; CANDLE counts daily slots.
+        end note
+        repeat
+          :Fetch MIN(timestamp) and MAX(timestamp)
+          for current (instrument_id, job_type);<<db>>
+          :Calculate EXPECTED count between MIN and MAX:
+          - TICK   → number of hours in [MIN, MAX]
+          - CANDLE → number of days  in [MIN, MAX];
+          :Fetch ACTUAL count = COUNT(*)
+          WHERE timestamp BETWEEN MIN AND MAX
+          for current (instrument_id, job_type);<<db>>
+          if (ACTUAL < EXPECTED ?) then (yes — missing tasks detected)
+            :Query missing timestamps:
+            expected slots EXCEPT timestamps
+            already present in states;<<db>>
+            repeat
+              :Insert next batch of missing rows
+              as PENDING using
+              INSERT ... ON CONFLICT DO NOTHING;<<db>>
+            repeat while (More missing timestamps?) is (yes) not (no — all gaps filled)
+          else (no — counts match, data is consistent)
+            :Skip — no action needed;
+          endif
+        repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
 
-    :wg.Done() x4 — A, B, C, D goroutines join;
+      end split
+
+      :wg.Done() x4 — A, B, C, D goroutines join;
+
+    endif
+
+    :pg_advisory_unlock(key)
+    deferred via context.Background() — always executes
+    even if Group 1/2 panics or ctx is cancelled;<<lock>>
+    :Release dedicated connection back to pool;
 
   endif
 
 repeat while (More instruments?) is (yes) not (no — all instruments processed)
 
-:All instruments processed — Parent Handler's wg.Wait() returns;
+:All instruments processed — maintenance cycle complete;
 stop
 
 @enduml
