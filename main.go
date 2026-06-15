@@ -33,7 +33,7 @@ func main() {
 	ctx := context.Background()
 
 	// ── Database ─────────────────────────────────────────────────────────────
-	dbClient, err := database.NewEntClient(ctx)
+	dbClient, sqlDB, err := database.NewEntClient(ctx)
 	if err != nil {
 		log.Fatalf("database: %v", err)
 	}
@@ -43,7 +43,7 @@ func main() {
 		}
 	}()
 
-	appDAL := dal.New(dbClient)
+	appDAL := dal.New(dbClient, sqlDB)
 
 	// ── Runtime metrics collector ─────────────────────────────────────────────
 	runtimecollector.Start()

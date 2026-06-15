@@ -13,26 +13,28 @@ import (
 )
 
 // NewEntClient opens a PostgreSQL connection using DATABASE_URL from the
-// environment, verifies connectivity with Ping, then returns an Ent client.
-// The caller is responsible for closing the client when done.
-func NewEntClient(ctx context.Context) (*ent.Client, error) {
+// environment, verifies connectivity with Ping, then returns both an Ent client
+// and the underlying *sql.DB. The caller is responsible for closing both when done.
+func NewEntClient(ctx context.Context) (*ent.Client, *sql.DB, error) {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		return nil, fmt.Errorf("DATABASE_URL is not set")
+		return nil, nil, fmt.Errorf("DATABASE_URL is not set")
 	}
 
 	if err := ping(ctx, dsn); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	return openEnt(dsn)
 }
 
 // openEnt opens an ent.Client for the given DSN without pinging (caller already pinged).
-func openEnt(dsn string) (_ *ent.Client, err error) {
+// It returns both the ent.Client and the underlying *sql.DB so callers that need
+// raw connection access (e.g. advisory locks) do not have to reach through ent internals.
+func openEnt(dsn string) (_ *ent.Client, _ *sql.DB, err error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+		return nil, nil, fmt.Errorf("open db: %w", err)
 	}
 	// Close db if anything after this point fails; on success db ownership
 	// transfers to the ent.Client and is released via client.Close().
@@ -42,7 +44,7 @@ func openEnt(dsn string) (_ *ent.Client, err error) {
 		}
 	}()
 
-	return ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db))), nil
+	return ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db))), db, nil
 }
 
 // ping opens a temporary sql.DB, runs PingContext, and closes the connection.

@@ -43,9 +43,7 @@ func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c 
 
 	// ── Auto-Seeder & Pruning ─────────────────────────────────────────────────
 	// Triggered every ~5 minutes from an external scheduler.
-	httpTrigger := func(ctx context.Context, meta map[string]any, jobName string,
-		run func(onStarted func()) bool,
-	) {
+	httpTrigger := func(ctx context.Context, meta map[string]any, jobName string, run func(onStarted func()) bool) {
 		go func() {
 			var id uuid.UUID
 			ran := run(func() {
@@ -178,7 +176,7 @@ func max0(v int) int {
 
 // extractCtx returns a detached copy of the Fiber request context.
 // context.WithoutCancel is used so the background worker goroutine is not
-// cancelled when Fiber closes the HTTP request after returning 202 Accepted.
+// canceled when Fiber closes the HTTP request after returning 202 Accepted.
 func extractCtx(c *fiber.Ctx) context.Context {
 	return context.WithoutCancel(c.UserContext())
 }

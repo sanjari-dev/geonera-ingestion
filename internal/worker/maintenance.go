@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sort"
 	"strings"
@@ -87,29 +88,50 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 	return true
 }
 
-// runMaintenanceForInstrument dispatches Group 1 (bootstrap) when the state
-// table is empty for this instrument, or Group 2 (A + B + C + D in parallel)
-// when rows already exist.
+// instrumentLockKey derives a stable int64 advisory-lock key from an instrument
+// UUID using FNV-1a. Collision probability is 1/2^64 — acceptable here because
+// the worst outcome is a spurious skip of one maintenance cycle for one instrument.
+func instrumentLockKey(id uuid.UUID) int64 {
+	h := fnv.New64a()
+	h.Write(id[:])
+	return int64(h.Sum64())
+}
+
+// runMaintenanceForInstrument acquires a per-instrument PostgreSQL advisory lock
+// before dispatching Group 1 (bootstrap) or Group 2 (A + B + C + D in parallel).
+// If a concurrent maintenance worker already holds the lock for this instrument,
+// the call returns immediately without doing any work — the other worker is
+// responsible for this instrument in the current cycle.
 func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
-	empty, err := isStatesEmpty(ctx, d, inst.ID)
+	locked, err := d.WithAdvisoryLock(ctx, instrumentLockKey(inst.ID), func() error {
+		empty, err := isStatesEmpty(ctx, d, inst.ID)
+		if err != nil {
+			log.Printf("maintenance %s: check empty: %v", inst.Name, err)
+			return nil
+		}
+
+		if empty {
+			runBootstrap(ctx, d, inst)
+			return nil
+		}
+
+		// Group 2: A + B + C + D run concurrently for this instrument.
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() { defer wg.Done(); runForwardSeeding(ctx, d, inst) }()
+		go func() { defer wg.Done(); runBackwardGapFill(ctx, d, inst) }()
+		go func() { defer wg.Done(); runPruning(ctx, d, inst) }()
+		go func() { defer wg.Done(); runConsistencyCheck(ctx, d, inst) }()
+		wg.Wait()
+		return nil
+	})
 	if err != nil {
-		log.Printf("maintenance %s: check empty: %v", inst.Name, err)
+		log.Printf("maintenance %s: advisory lock: %v", inst.Name, err)
 		return
 	}
-
-	if empty {
-		runBootstrap(ctx, d, inst)
-		return
+	if !locked {
+		log.Printf("maintenance %s: skipped — lock held by concurrent worker", inst.Name)
 	}
-
-	// Group 2: A + B + C + D run concurrently for this instrument.
-	var wg sync.WaitGroup
-	wg.Add(4)
-	go func() { defer wg.Done(); runForwardSeeding(ctx, d, inst) }()
-	go func() { defer wg.Done(); runBackwardGapFill(ctx, d, inst) }()
-	go func() { defer wg.Done(); runPruning(ctx, d, inst) }()
-	go func() { defer wg.Done(); runConsistencyCheck(ctx, d, inst) }()
-	wg.Wait()
 }
 
 func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (bool, error) {
@@ -561,7 +583,7 @@ func insertBatchPendingOnConflictDoNothing(
 		return nil
 	}
 
-	// $1=instrumentID  $2=jobType  $3=status  $4=updatedAt (shared across all tuples)
+	// $1=instrumentID $2=jobType $3=status $4=updatedAt (shared across all tuples)
 	const sharedCount = 4
 	args := make([]any, 0, sharedCount+len(timestamps)*2)
 	args = append(args, instrumentID, string(jobType), string(state.StatusPENDING), updatedAt)
