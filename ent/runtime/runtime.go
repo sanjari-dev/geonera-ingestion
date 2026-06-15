@@ -78,7 +78,7 @@ func init() {
 	synctaskFields := schema.SyncTask{}.Fields()
 	_ = synctaskFields
 	// synctaskDescCreatedAt is the schema descriptor for created_at field.
-	synctaskDescCreatedAt := synctaskFields[4].Descriptor()
+	synctaskDescCreatedAt := synctaskFields[5].Descriptor()
 	// synctask.DefaultCreatedAt holds the default value on creation for the created_at field.
 	synctask.DefaultCreatedAt = synctaskDescCreatedAt.Default.(func() time.Time)
 	// synctaskDescID is the schema descriptor for id field.
