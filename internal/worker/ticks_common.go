@@ -37,28 +37,40 @@ const (
 	// so the burst and sustained rate are identical (12 per second).
 	dukascopyBurst = dukascopyMaxRPS
 
-	// backfillMasterClaimLimit is the batch size for the Backfill "Master
-	// Bulk-Claim" (Mapping State.md §2): a one FOR UPDATE SKIP LOCKED query locks
-	// up to this many rows per cycle, ordered oldest-Timestamp-first, and the
-	// program routes them in memory to the Ingestion / Reset / Validation
-	// layers based on each row's pre-claim status.
-	//
-	// There is intentionally NO separate goroutine-pool cap (the old
-	// tickLoopMaxGoroutines / tickLoopSem = 48 design) on top of this: every
-	// claimed row is dispatched immediately, and the real bottleneck —
-	// Dukascopy BI5 downloads — is already throttled to dukascopyBurst (12)
-	// concurrent workers via the download gate (download_gate.go), with
-	// tickProcessSem (runtime.NumCPU()) bounding convert+upload. Capping the
-	// claim batch at 120 (rather than leaving it unbounded) is what keeps the
-	// in-flight PROCESSED-row count, and therefore goroutine/memory growth, predictable.
-	backfillMasterClaimLimit = 120
-
 	// backfillExclusionHours is the "Zona Eksklusif" boundary (Mapping
 	// State.md §2): Backfill only ever claims rows timestamped at or before
 	// (current hour − this many hours) — i.e., T-3 and older — leaving the
 	// most recent hours to the T-0/T-1/T-2 Regular pipeline.
 	backfillExclusionHours = 3
 )
+
+// backfillMasterClaimLimit is the batch size for the Backfill "Master Bulk-Claim":
+// a single FOR UPDATE SKIP LOCKED query locks up to this many rows per cycle.
+// Default 120; overridable at startup via BACKFILL_CLAIM_LIMIT env var (must be > 0).
+// There is intentionally NO separate goroutine-pool cap on top of this: every
+// claimed row is dispatched immediately, and the real bottlenecks —
+// the download gate (dukascopyBurst workers) and tickProcessSem (runtime.NumCPU())
+// — already bound concurrency. This value controls in-flight PROCESSED-row count
+// and therefore goroutine/memory growth.
+var backfillMasterClaimLimit = 120
+
+// instrName returns the instrument name from a state row's edge, falling back
+// to the UUID string when the edge was not eagerly loaded (e.g. queries missing
+// WithInstrument). Safe to call on any *ent.State.
+func instrName(row *ent.State) string {
+	if row.Edges.Instrument != nil {
+		return row.Edges.Instrument.Name
+	}
+	return row.InstrumentID.String()
+}
+
+// prevStatusStr formats a nullable PreviousStatus pointer for log output.
+func prevStatusStr(p *state.PreviousStatus) string {
+	if p == nil {
+		return "nil"
+	}
+	return string(*p)
+}
 
 // tickDownloadRateGate is a token-bucket rate limiter for Dukascopy downloads.
 // A background goroutine (started by InitDownloadRateLimiter) refills it at
@@ -107,6 +119,7 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	if onStarted != nil {
 		onStarted()
 	}
+	log.Printf("ticks: handler start mode=%s", mode)
 	var wg sync.WaitGroup
 	switch mode {
 	case "REGULAR":
@@ -121,6 +134,7 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 		log.Printf("ticks: unknown mode %q", mode)
 	}
 	wg.Wait()
+	log.Printf("ticks: handler done mode=%s", mode)
 	return true
 }
 
@@ -165,7 +179,9 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 // highPriority routes the download to regularDownloadQueue (true) or
 // backfillDownloadQueue (false); see RequestDownload for the priority contract.
 func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotFound func(context.Context, *dal.DAL, *ent.State), highPriority bool) {
-	log.Printf("ticks: executing ETL for %s tick %s", row.Edges.Instrument.Name, row.Timestamp.Format(time.RFC3339))
+	inst := instrName(row)
+	ts := row.Timestamp.Format(time.RFC3339)
+	log.Printf("ticks/ETL: start instrument=%s ts=%s", inst, ts)
 
 	// Phase 1: Download BI5 — submitted to the download gate worker pool.
 	// The gate manages concurrency (dukascopyBurst workers) and rate limiting
@@ -174,11 +190,13 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	dl := RequestDownload(ctx, row, highPriority)
 	switch dl.Status {
 	case DownloadNotFound:
+		log.Printf("ticks/ETL: download NOT_FOUND instrument=%s ts=%s", inst, ts)
 		onNotFound(ctx, d, row)
 		return
 	case DownloadOK:
-		// fall through to Phase 2
+		log.Printf("ticks/ETL: download OK instrument=%s ts=%s bytes=%d", inst, ts, len(dl.Data))
 	default: // DownloadRateLimited, DownloadError, or ctx canceled
+		log.Printf("ticks/ETL: download ERROR instrument=%s ts=%s err=%v → FAILED", inst, ts, dl.Err)
 		updateStateFailed(ctx, d, row)
 		return
 	}
@@ -202,6 +220,10 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 // highPriority routes the download to regularDownloadQueue (true) or
 // backfillDownloadQueue (false); see RequestDownload for the priority contract.
 func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, highPriority bool) {
+	inst := instrName(row)
+	ts := row.Timestamp.Format(time.RFC3339)
+	log.Printf("ticks/recheck: start instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
+
 	dl := RequestDownload(ctx, row, highPriority)
 	if dl.Status != DownloadOK {
 		if dl.Status == DownloadNotFound {
@@ -209,6 +231,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 			// DB commit happens before R2 upload, so IsHoliday flag persists even on
 			// upload failure. If the upload fails, the row is set to FAILED so that
 			// T-1/Backfill can retry the full pipeline on the next cycle.
+			newStreak := row.NotFoundStreak + 1
 			if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 				_, e := tx.State.UpdateOneID(row.ID).
 					AddNotFoundStreak(1).
@@ -219,16 +242,19 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 					Save(ctx)
 				return e
 			}); dbErr != nil {
-				log.Printf("not-found recheck: DB update for %s: %v", row.ID, dbErr)
+				log.Printf("ticks/recheck: DB update FAILED instrument=%s ts=%s err=%v", inst, ts, dbErr)
 				return
 			}
+			log.Printf("ticks/recheck: still NOT_FOUND instrument=%s ts=%s new_streak=%d → uploading zero-row", inst, ts, newStreak)
 			zeroRow := buildZeroRowParquet()
 			if upErr := uploadToR2(ctx, row, zeroRow); upErr != nil {
-				log.Printf("not-found recheck: Zero-Row upload for %s: %v — setting FAILED", row.ID, upErr)
+				log.Printf("ticks/recheck: zero-row upload FAILED instrument=%s ts=%s err=%v → FAILED", inst, ts, upErr)
 				updateStateFailed(ctx, d, row)
+			} else {
+				log.Printf("ticks/recheck: zero-row uploaded instrument=%s ts=%s → NOT_FOUND", inst, ts)
 			}
 		} else {
-			log.Printf("NOT_FOUND recheck error for %s: %v — setting FAILED", row.ID, dl.Err)
+			log.Printf("ticks/recheck: download ERROR instrument=%s ts=%s err=%v → FAILED", inst, ts, dl.Err)
 			updateStateFailed(ctx, d, row)
 		}
 		return
@@ -236,6 +262,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 
 	// Data is available again: reset streak to 0, set PENDING.
 	// The row will be picked up for a full ETL pass on the next cycle.
+	log.Printf("ticks/recheck: data found instrument=%s ts=%s → streak=0 PENDING", inst, ts)
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
@@ -245,7 +272,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("not-found recheck: reset to PENDING for %s: %v", row.ID, err)
+		log.Printf("ticks/recheck: reset to PENDING FAILED instrument=%s ts=%s err=%v", inst, ts, err)
 	}
 }
 
@@ -261,6 +288,11 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 // highPriority routes the download to regularDownloadQueue (true) or
 // backfillDownloadQueue (false); see RequestDownload for the priority contract.
 func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus, highPriority bool) {
+	inst := instrName(row)
+	ts := row.Timestamp.Format(time.RFC3339)
+	log.Printf("ticks/T2: action start instrument=%s ts=%s prev_status=%s streak=%d",
+		inst, ts, prevStatusStr(row.PreviousStatus), row.NotFoundStreak)
+
 	dl := RequestDownload(ctx, row, highPriority)
 	wasNotFound := row.PreviousStatus != nil && *row.PreviousStatus == state.PreviousStatusNOT_FOUND
 
@@ -277,6 +309,8 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 					newRetryCount = 0
 				}
 				if newStreak >= notFoundThreshold {
+					log.Printf("ticks/T2: NOT_FOUND streak=%d >= threshold=%d instrument=%s ts=%s → validate zero-row",
+						newStreak, notFoundThreshold, inst, ts)
 					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
@@ -285,12 +319,13 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
-						log.Printf("T2: streak update for %s: %v", row.ID, dbErr)
+						log.Printf("ticks/T2: streak update FAILED instrument=%s ts=%s err=%v", inst, ts, dbErr)
 						return
 					}
 					row.NotFoundStreak = newStreak
 					executeValidation(ctx, d, row, preclaimPrev)
 				} else {
+					log.Printf("ticks/T2: NOT_FOUND streak=%d instrument=%s ts=%s → NOT_FOUND (below threshold)", newStreak, inst, ts)
 					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
@@ -301,23 +336,25 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
-						log.Printf("T2: NOT_FOUND update for %s: %v", row.ID, dbErr)
+						log.Printf("ticks/T2: NOT_FOUND update FAILED instrument=%s ts=%s err=%v", inst, ts, dbErr)
 					}
 				}
 			} else {
 				// COMPLETED + unexpected 404: data was there at T-0 time — mark as anomaly.
-				log.Printf("T2: COMPLETED got 404 for %s — setting BROKEN", row.ID)
+				log.Printf("ticks/T2: COMPLETED got 404 instrument=%s ts=%s → BROKEN (data missing anomaly)", inst, ts)
 				updateStateBroken(ctx, d, row)
 			}
 		} else {
-			log.Printf("T2: download error for %s: %v — setting FAILED", row.ID, dl.Err)
+			log.Printf("ticks/T2: download ERROR instrument=%s ts=%s err=%v → FAILED", inst, ts, dl.Err)
 			updateStateFailed(ctx, d, row)
 		}
 		return
 	}
 
+	log.Printf("ticks/T2: download OK instrument=%s ts=%s bytes=%d", inst, ts, len(dl.Data))
 	if wasNotFound {
 		// NOT_FOUND + data now available: reset streak, hand off to next cycle via PENDING.
+		log.Printf("ticks/T2: NOT_FOUND data recovered instrument=%s ts=%s → streak=0 PENDING", inst, ts)
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			_, e := tx.State.UpdateOneID(row.ID).
 				SetNotFoundStreak(0).
@@ -327,7 +364,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 				Save(ctx)
 			return e
 		}); err != nil {
-			log.Printf("T2: NOT_FOUND→PENDING for %s: %v", row.ID, err)
+			log.Printf("ticks/T2: NOT_FOUND→PENDING FAILED instrument=%s ts=%s err=%v", inst, ts, err)
 		}
 		return
 	}
@@ -342,12 +379,17 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 		defer func() { <-tickProcessSem }()
 		parquet, convErr := convertBI5ToParquet(dl.Data, row)
 		if convErr != nil {
+			log.Printf("ticks/T2: convert FAILED instrument=%s ts=%s err=%v", inst, ts, convErr)
 			uploadErr = convErr
 			return
 		}
+		log.Printf("ticks/T2: convert OK instrument=%s ts=%s parquet_bytes=%d", inst, ts, len(parquet))
 		if upErr := uploadToR2(ctx, row, parquet); upErr != nil {
+			log.Printf("ticks/T2: upload FAILED instrument=%s ts=%s err=%v", inst, ts, upErr)
 			uploadErr = upErr
+			return
 		}
+		log.Printf("ticks/T2: upload OK instrument=%s ts=%s → validating", inst, ts)
 	}()
 	if uploadErr != nil {
 		updateStateFailed(ctx, d, row)
@@ -450,8 +492,12 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("not-found simple for %s: %v", row.ID, err)
+		log.Printf("ticks/ETL: NOT_FOUND simple FAILED instrument=%s ts=%s err=%v",
+			instrName(row), row.Timestamp.Format(time.RFC3339), err)
+		return
 	}
+	log.Printf("ticks/ETL: NOT_FOUND instrument=%s ts=%s streak=1 (first attempt)",
+		instrName(row), row.Timestamp.Format(time.RFC3339))
 }
 
 // handleNotFoundIncrement increments NotFoundStreak by 1 and sets status = NOT_FOUND.
@@ -468,8 +514,12 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("not-found increment for %s: %v", row.ID, err)
+		log.Printf("ticks/ETL: NOT_FOUND increment FAILED instrument=%s ts=%s err=%v",
+			instrName(row), row.Timestamp.Format(time.RFC3339), err)
+		return
 	}
+	log.Printf("ticks/ETL: NOT_FOUND instrument=%s ts=%s new_streak=%d (backfill increment)",
+		instrName(row), row.Timestamp.Format(time.RFC3339), row.NotFoundStreak+1)
 }
 
 // handleRetryReset increments RetryCount atomically and either resets the row
@@ -496,8 +546,12 @@ func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("retry reset for %s: %v", row.ID, err)
+		log.Printf("ticks/T1: retry_reset FAILED instrument=%s ts=%s err=%v",
+			instrName(row), row.Timestamp.Format(time.RFC3339), err)
+		return
 	}
+	log.Printf("ticks/T1: retry_reset instrument=%s ts=%s prev_retry=%d new_retry=%d new_streak=%d → PENDING",
+		instrName(row), row.Timestamp.Format(time.RFC3339), row.RetryCount, row.RetryCount+1, newStreak)
 }
 
 func resetStateToPending(ctx context.Context, d *dal.DAL, row *ent.State) {
@@ -543,18 +597,26 @@ func upsertSyncTaskInTx(ctx context.Context, tx *ent.Tx, instrumentID uuid.UUID,
 // Extracted to avoid duplicating the same block in executeIngestionETL and
 // executeNotFoundRecheck.
 func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data []byte) {
+	inst := instrName(row)
+	ts := row.Timestamp.Format(time.RFC3339)
+
 	tickProcessSem <- struct{}{}
 	defer func() { <-tickProcessSem }()
 
 	parquet, err := convertBI5ToParquet(data, row)
 	if err != nil {
+		log.Printf("ticks/ETL: convert FAILED instrument=%s ts=%s err=%v", inst, ts, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "convert failed")
 		return
 	}
+	log.Printf("ticks/ETL: convert OK instrument=%s ts=%s parquet_bytes=%d", inst, ts, len(parquet))
+
 	if err := uploadToR2(ctx, row, parquet); err != nil {
+		log.Printf("ticks/ETL: upload FAILED instrument=%s ts=%s err=%v", inst, ts, err)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload failed")
 		return
 	}
+	log.Printf("ticks/ETL: upload OK instrument=%s ts=%s → COMPLETED", inst, ts)
 	updateStateCompleted(ctx, d, row)
 }
 
@@ -581,16 +643,14 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 		log.Printf("%s for %s: %v", errMsg, row.ID, err)
 		return
 	}
-	if next == state.StatusFAILED || next == state.StatusBROKEN {
-		log.Printf(
-			"state_transition status=%s state_id=%s job_type=%s previous_status=%s message=%q",
-			next,
-			row.ID,
-			row.JobType,
-			prev,
-			errMsg,
-		)
-	}
+	log.Printf(
+		"state_transition status=%s state_id=%s job_type=%s previous_status=%s message=%q",
+		next,
+		row.ID,
+		row.JobType,
+		prev,
+		errMsg,
+	)
 }
 
 // ── External operations ───────────────────────────────────────────────────────

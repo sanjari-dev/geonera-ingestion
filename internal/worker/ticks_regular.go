@@ -20,15 +20,12 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T0")
 
 	target := time.Now().UTC().Truncate(time.Hour)
+	log.Printf("ticks/T0: start target=%s", target.Format(time.RFC3339))
 
-	// Guarantee every eligible instrument has a PENDING row for this hour before
-	// claiming. In the normal flow maintenance already seeded these rows; this
-	// call is a safety net for instruments that were just activated or whose row
-	// was not yet seeded by the time T-0 fires. ON CONFLICT DO NOTHING makes it
-	// a no-op when the row already exists.
 	ensureT0TickTasks(ctx, d, target)
-
 	runIngestionLoop(ctx, d, &target)
+
+	log.Printf("ticks/T0: done target=%s", target.Format(time.RFC3339))
 }
 
 // ensureT0TickTasks inserts a PENDING TICK row at target for every instrument
@@ -46,6 +43,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 		if err != nil {
 			return fmt.Errorf("query instruments: %w", err)
 		}
+		log.Printf("ticks/T0: seeding PENDING task(s) for %d instrument(s) at %s", len(instruments), target.Format(time.RFC3339))
 		insertedAt := time.Now().UTC()
 		for _, inst := range instruments {
 			if err := insertStatePendingOnConflictDoNothing(ctx, tx, inst.ID, state.JobTypeTICK, target, insertedAt); err != nil {
@@ -54,7 +52,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 		}
 		return nil
 	}); err != nil {
-		log.Printf("T0 ensure tasks: %v", err)
+		log.Printf("ticks/T0: ensure tasks error target=%s err=%v", target.Format(time.RFC3339), err)
 	}
 }
 
@@ -65,7 +63,9 @@ func runT1Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T1")
 
 	target := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	log.Printf("ticks/T1: start target=%s", target.Format(time.RFC3339))
 	runRecoveryLoop(ctx, d, target)
+	log.Printf("ticks/T1: done target=%s", target.Format(time.RFC3339))
 }
 
 // ── T-2: two-hours-ago physical validation ────────────────────────────────────
@@ -75,10 +75,12 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T2")
 
 	target := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	log.Printf("ticks/T2: start target=%s", target.Format(time.RFC3339))
 	// T-2 Regular: claims COMPLETED + NOT_FOUND, re-downloads BI5 for cross-validation.
 	// COMPLETED → re-download matches → CONFIRMED; NOT_FOUND → streak+1, at ≥3 → CONFIRMED.
 	// IsPause=false enforced, consistent with T-0 and T-1.
 	runValidationLoop(ctx, d, &target)
+	log.Printf("ticks/T2: done target=%s", target.Format(time.RFC3339))
 }
 
 // runIngestionLoop claims PENDING TICK rows one at a time for the given hour
@@ -95,12 +97,13 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // artificial goroutine-pool cap here.
 func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	var loopWg sync.WaitGroup
+	count := 0
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			query := tickActiveStateRows(q,
 				state.StatusEQ(state.StatusPENDING),
 			).
-				WithInstrument(). // needed by downloadBI5 / convertBI5ToParquet / uploadToR2
+				WithInstrument().
 				Order(state.ByTimestamp())
 			if timestamp != nil {
 				query = query.Where(state.TimestampEQ(*timestamp))
@@ -111,9 +114,13 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("ingestion claim: %v", err)
+			log.Printf("ticks/T0: ingestion claim error err=%v", err)
 			break
 		}
+
+		count++
+		log.Printf("ticks/T0: claimed instrument=%s ts=%s state_id=%s",
+			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID)
 
 		loopWg.Add(1)
 		go func(r *ent.State) {
@@ -123,12 +130,16 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		}(claimed)
 	}
 	loopWg.Wait()
+	if timestamp != nil {
+		log.Printf("ticks/T0: ingestion loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
+	}
 }
 
 // runRecoveryLoop claims PENDING/PROCESSED/FAILED/BROKEN/NOT_FOUND rows for the
 // given timestamp and applies the T-1 recovery rules to each.
 func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 	var loopWg sync.WaitGroup
+	count := 0
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			return tickActiveStateRows(q,
@@ -141,6 +152,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 				),
 				state.TimestampEQ(target),
 			).
+				WithInstrument().
 				Order(
 					// Process stuck PROCESSED first, then FAILED/BROKEN, then NOT_FOUND, then PENDING.
 					orderStateStatuses(
@@ -157,9 +169,13 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("recovery claim (target %s): %v", target, err)
+			log.Printf("ticks/T1: recovery claim error target=%s err=%v", target.Format(time.RFC3339), err)
 			break
 		}
+
+		count++
+		log.Printf("ticks/T1: claimed instrument=%s ts=%s state_id=%s prev_status=%s",
+			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID, prevStatusStr(claimed.PreviousStatus))
 
 		prevStatus := claimed.PreviousStatus
 		loopWg.Add(1)
@@ -170,6 +186,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 		}(claimed, prevStatus)
 	}
 	loopWg.Wait()
+	log.Printf("ticks/T1: recovery loop complete rows=%d target=%s", count, target.Format(time.RFC3339))
 }
 
 // runValidationLoop claims COMPLETED and NOT_FOUND rows for the given hour
@@ -185,6 +202,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 // Backfill drives its own rows via the Master Bulk-Claim.
 func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	var loopWg sync.WaitGroup
+	count := 0
 	for ctx.Err() == nil {
 		// preclaimPrev is the row's PreviousStatus BEFORE the claim — forwarded to
 		// executeT2Action to detect genuine demotions (CONFIRMED → BROKEN).
@@ -196,7 +214,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 					state.HasInstrumentWith(instrument.IsActiveEQ(true), instrument.IsPauseEQ(false)),
 					state.IsDeletedEQ(false),
 				).
-				WithInstrument(). // needed for BI5 download / Parquet convert / R2 upload
+				WithInstrument().
 				Order(state.ByTimestamp())
 			if timestamp != nil {
 				query = query.Where(state.TimestampEQ(*timestamp))
@@ -209,9 +227,13 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("validation claim: %v", err)
+			log.Printf("ticks/T2: validation claim error err=%v", err)
 			break
 		}
+
+		count++
+		log.Printf("ticks/T2: claimed instrument=%s ts=%s state_id=%s preclaim_prev=%s",
+			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID, prevStatusStr(preclaimPrev))
 
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
@@ -221,6 +243,9 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		}(claimed, preclaimPrev)
 	}
 	loopWg.Wait()
+	if timestamp != nil {
+		log.Printf("ticks/T2: validation loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
+	}
 }
 
 // executeRecoveryAction applies the T-1 recovery rule for a claimed row based
@@ -229,17 +254,22 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 	if prev == nil {
 		return
 	}
+	inst := instrName(row)
+	ts := row.Timestamp.Format(time.RFC3339)
 	switch *prev {
 	case state.PreviousStatusPROCESSED, state.PreviousStatusPENDING:
 		// Stuck PROCESSED or stale PENDING → reset to PENDING for the next T-0 run.
+		log.Printf("ticks/T1: zombie instrument=%s ts=%s prev_status=%s → PENDING", inst, ts, *prev)
 		resetStateToPending(ctx, d, row)
 
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
 		// Increment RetryCount, decrement NotFoundStreak (floor 0), always → PENDING.
+		log.Printf("ticks/T1: retry instrument=%s ts=%s prev_status=%s retry_count=%d → PENDING", inst, ts, *prev, row.RetryCount)
 		handleRetryReset(ctx, d, row)
 
 	case state.PreviousStatusNOT_FOUND:
 		// Re-check API: data → PENDING+streak=0; still 404 → Zero-Row+NOT_FOUND.
+		log.Printf("ticks/T1: recheck instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
 		executeNotFoundRecheck(ctx, d, row, true)
 	}
 }

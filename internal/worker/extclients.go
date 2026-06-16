@@ -2,6 +2,9 @@ package worker
 
 import (
 	"errors"
+	"log"
+	"os"
+	"strconv"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
@@ -28,7 +31,25 @@ var errClientsNotInitialized = errors.New(
 func InitClients(r2c *r2.Client, dc *dukascopy.Client) {
 	r2Client = r2c
 	dukClient = dc
+	initBackfillConfig()
 	InitDownloadRateLimiter()
+}
+
+// initBackfillConfig reads BACKFILL_CLAIM_LIMIT from the environment and
+// overrides the default backfillMasterClaimLimit. Must be called before
+// startDownloadWorkers so the backfill queue channel is sized correctly.
+func initBackfillConfig() {
+	v := os.Getenv("BACKFILL_CLAIM_LIMIT")
+	if v == "" {
+		return
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		log.Printf("worker: invalid BACKFILL_CLAIM_LIMIT=%q (must be a positive integer) — using default %d", v, backfillMasterClaimLimit)
+		return
+	}
+	backfillMasterClaimLimit = n
+	log.Printf("worker: backfill claim limit set to %d (from BACKFILL_CLAIM_LIMIT)", n)
 }
 
 // InitActivityLogger wires up the activity log logger so that RunMaintenanceHandler

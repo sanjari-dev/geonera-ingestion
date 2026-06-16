@@ -66,10 +66,15 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runBackfillMasterLoop")
 
-	// Claim up to 120 rows once and dispatch in parallel.
+	boundary := backfillTimeBoundary()
+	log.Printf("ticks/backfill: start boundary=%s claim_limit=%d", boundary.Format(time.RFC3339), backfillMasterClaimLimit)
+
+	// Claim up to backfillMasterClaimLimit rows once and dispatch in parallel.
 	// ABANDONED rows are sorted last, so they are only reached when no other
 	// actionable rows exist within the T-3 boundary.
 	runBackfillMasterClaim(ctx, d)
+
+	log.Printf("ticks/backfill: done boundary=%s", boundary.Format(time.RFC3339))
 }
 
 // runBackfillMasterClaim implements the "Master Bulk-Claim" strategy: claim up
@@ -84,14 +89,31 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 
 	batch, err := claimBackfillMasterBatch(ctx, d, boundary)
 	if err != nil {
-		if !ent.IsNotFound(err) {
-			log.Printf("backfill master-claim: %v", err)
+		if ent.IsNotFound(err) {
+			log.Printf("ticks/backfill: no rows to process (boundary=%s)", boundary.Format(time.RFC3339))
+		} else {
+			log.Printf("ticks/backfill: master-claim error boundary=%s err=%v", boundary.Format(time.RFC3339), err)
 		}
 		return
 	}
 	if len(batch) == 0 {
+		log.Printf("ticks/backfill: empty batch (boundary=%s)", boundary.Format(time.RFC3339))
 		return
 	}
+
+	// Count per layer for a single-line summary before dispatching.
+	layerCounts := map[backfillLayer]int{}
+	for _, item := range batch {
+		layerCounts[item.layer]++
+	}
+	log.Printf("ticks/backfill: claimed %d row(s) ingestion=%d retry=%d t2=%d nf_recheck=%d none=%d",
+		len(batch),
+		layerCounts[backfillLayerIngestion],
+		layerCounts[backfillLayerRetryReset],
+		layerCounts[backfillLayerT2Action],
+		layerCounts[backfillLayerNotFoundRecheck],
+		layerCounts[backfillLayerNone],
+	)
 
 	var batchWg sync.WaitGroup
 	for _, item := range batch {
@@ -103,6 +125,7 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 		}(item)
 	}
 	batchWg.Wait()
+	log.Printf("ticks/backfill: batch complete rows=%d", len(batch))
 }
 
 // claimBackfillMasterBatch performs the single master claim: it locks up to
@@ -170,11 +193,15 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 				// Zombie row from a previous in-flight attempt. Per Mapping
 				// State.md §2.B, PROCESSED zombies go straight back to PENDING
 				// with no counter-mutation — resolved entirely at claim time.
+				log.Printf("ticks/backfill: claim zombie instrument=%s ts=%s → PENDING",
+					instrName(row), row.Timestamp.Format(time.RFC3339))
 				newPrev, newStatus, layer = state.PreviousStatusPROCESSED, state.StatusPENDING, backfillLayerNone
 
 			case state.StatusFAILED:
 				if row.RetryCount > 5 {
 					// Retry budget exhausted — retire to ABANDONED at claim time.
+					log.Printf("ticks/backfill: claim FAILED→ABANDONED instrument=%s ts=%s retry_count=%d (budget exhausted)",
+						instrName(row), row.Timestamp.Format(time.RFC3339), row.RetryCount)
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusABANDONED, backfillLayerNone
 				} else {
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusPROCESSED, backfillLayerRetryReset
@@ -182,6 +209,8 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 
 			case state.StatusBROKEN:
 				if row.RetryCount > 5 {
+					log.Printf("ticks/backfill: claim BROKEN→ABANDONED instrument=%s ts=%s retry_count=%d (budget exhausted)",
+						instrName(row), row.Timestamp.Format(time.RFC3339), row.RetryCount)
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusABANDONED, backfillLayerNone
 				} else {
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusPROCESSED, backfillLayerRetryReset
@@ -205,6 +234,8 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 				// ABANDONED rows only reach this branch after all other statuses
 				// are exhausted (status-priority sort puts them last). Reset with
 				// RetryCount=0 so they get a clean ingestion cycle.
+				log.Printf("ticks/backfill: claim ABANDONED→PENDING instrument=%s ts=%s (retry count reset)",
+					instrName(row), row.Timestamp.Format(time.RFC3339))
 				updated, ue := tx.State.UpdateOneID(row.ID).
 					SetPreviousStatus(state.PreviousStatusABANDONED).
 					SetStatus(state.StatusPENDING).
@@ -254,16 +285,23 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 // time. Rows resolved entirely inside the claim transaction (backfillLayerNone)
 // require no further action here.
 func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRoutedRow) {
+	inst := instrName(item.row)
+	ts := item.row.Timestamp.Format(time.RFC3339)
 	switch item.layer {
 	case backfillLayerIngestion:
+		log.Printf("ticks/backfill: dispatch ingestion instrument=%s ts=%s", inst, ts)
 		executeIngestionETL(ctx, d, item.row, handleNotFoundIncrement, false)
 	case backfillLayerRetryReset:
+		log.Printf("ticks/backfill: dispatch retry_reset instrument=%s ts=%s retry_count=%d", inst, ts, item.row.RetryCount)
 		handleRetryReset(ctx, d, item.row)
 	case backfillLayerT2Action:
+		log.Printf("ticks/backfill: dispatch t2_action instrument=%s ts=%s prev=%s streak=%d",
+			inst, ts, prevStatusStr(item.preclaimPrev), item.row.NotFoundStreak)
 		executeT2Action(ctx, d, item.row, item.preclaimPrev, false)
 	case backfillLayerNotFoundRecheck:
+		log.Printf("ticks/backfill: dispatch nf_recheck instrument=%s ts=%s streak=%d", inst, ts, item.row.NotFoundStreak)
 		executeNotFoundRecheck(ctx, d, item.row, false)
 	case backfillLayerNone:
-		// Already fully resolved inside the claim transaction.
+		// Already fully resolved inside the claim transaction (zombie/ABANDONED reset).
 	}
 }

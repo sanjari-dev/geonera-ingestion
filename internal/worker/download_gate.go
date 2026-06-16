@@ -37,8 +37,9 @@ type downloadRequest struct {
 var regularDownloadQueue = make(chan downloadRequest, dukascopyBurst)
 
 // backfillDownloadQueue carries requests from the Backfill master-claim batch.
-// Sized to backfillMasterClaimLimit so a full batch never blocks on submission.
-var backfillDownloadQueue = make(chan downloadRequest, backfillMasterClaimLimit)
+// Initialized in startDownloadWorkers (after env is read) so its capacity always
+// matches backfillMasterClaimLimit, ensuring a full batch never blocks on submission.
+var backfillDownloadQueue chan downloadRequest
 
 // RequestDownload submits a BI5 download request to the worker pool and blocks
 // until a result arrives or ctx is canceled. It is the single entry point for
@@ -78,14 +79,16 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	}
 }
 
-// startDownloadWorkers launches dukascopyBurst long-lived goroutines that drain
-// both download queues with Regular priority. Called once by InitDownloadRateLimiter at startup.
+// startDownloadWorkers initialises backfillDownloadQueue with the (env-resolved)
+// backfillMasterClaimLimit capacity, then launches dukascopyBurst long-lived
+// goroutines that drain both download queues with Regular priority.
+// Called once by InitDownloadRateLimiter at startup, after initBackfillConfig.
 func startDownloadWorkers() {
+	backfillDownloadQueue = make(chan downloadRequest, backfillMasterClaimLimit)
 	for i := 0; i < dukascopyBurst; i++ {
 		go runDownloadWorker()
 	}
-	log.Printf("worker: %d download workers started (max %d req/s, regular queue prioritised over backfill)",
-		dukascopyBurst, dukascopyMaxRPS)
+	log.Printf("worker: %d download workers started (max %d req/s, backfill queue cap %d, regular queue prioritised over backfill)", dukascopyBurst, dukascopyMaxRPS, backfillMasterClaimLimit)
 }
 
 // runDownloadWorker is the body of each download worker goroutine.
