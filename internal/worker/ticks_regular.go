@@ -119,7 +119,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		go func(r *ent.State) {
 			defer loopWg.Done()
 			defer recoverGoroutine(ctx, "ticks/ingestion-row")
-			executeIngestionETL(ctx, d, r, handleNotFoundSimple)
+			executeIngestionETL(ctx, d, r, handleNotFoundSimple, true)
 		}(claimed)
 	}
 	loopWg.Wait()
@@ -217,7 +217,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
 			defer recoverGoroutine(ctx, "ticks/validation-row")
-			executeT2Action(ctx, d, r, prev)
+			executeT2Action(ctx, d, r, prev, true)
 		}(claimed, preclaimPrev)
 	}
 	loopWg.Wait()
@@ -240,6 +240,6 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 
 	case state.PreviousStatusNOT_FOUND:
 		// Re-check API: data → PENDING+streak=0; still 404 → Zero-Row+NOT_FOUND.
-		executeNotFoundRecheck(ctx, d, row)
+		executeNotFoundRecheck(ctx, d, row, true)
 	}
 }

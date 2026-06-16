@@ -161,14 +161,17 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 // onNotFound controls how the streak is recorded on a 404 response:
 //   - T-0 passes handleNotFoundSimple (SetNotFoundStreak=1, always first attempt)
 //   - Backfill Group 1 passes handleNotFoundIncrement (AddNotFoundStreak+1, streak may be >0)
-func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotFound func(context.Context, *dal.DAL, *ent.State)) {
+//
+// highPriority routes the download to regularDownloadQueue (true) or
+// backfillDownloadQueue (false); see RequestDownload for the priority contract.
+func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotFound func(context.Context, *dal.DAL, *ent.State), highPriority bool) {
 	log.Printf("ticks: executing ETL for %s tick %s", row.Edges.Instrument.Name, row.Timestamp.Format(time.RFC3339))
 
 	// Phase 1: Download BI5 — submitted to the download gate worker pool.
 	// The gate manages concurrency (dukascopyBurst workers) and rate limiting
 	// (dukascopyMaxRPS tokens/s). The call respects ctx cancellation at every
 	// blocking point: enqueue, rate-gate wait, and result wait.
-	dl := RequestDownload(ctx, row)
+	dl := RequestDownload(ctx, row, highPriority)
 	switch dl.Status {
 	case DownloadNotFound:
 		onNotFound(ctx, d, row)
@@ -190,13 +193,16 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 }
 
 // executeNotFoundRecheck re-checks the Dukascopy API for a claimed NOT_FOUND row.
-// Used exclusively by T-1 recovery (executeRecoveryAction).
+// Used by T-1 recovery (executeRecoveryAction) and Backfill Layer D.
 //
 // Data found → SetNotFoundStreak=0, Status=PENDING (ETL on the next cycle).
 // Still 404 → AddNotFoundStreak(+1, streak=2), IsHoliday=true, upload Zero-Row Parquet, Status=NOT_FOUND.
 // Other error → FAILED (handled by backfill-reset on retry).
-func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
-	dl := RequestDownload(ctx, row)
+//
+// highPriority routes the download to regularDownloadQueue (true) or
+// backfillDownloadQueue (false); see RequestDownload for the priority contract.
+func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, highPriority bool) {
+	dl := RequestDownload(ctx, row, highPriority)
 	if dl.Status != DownloadOK {
 		if dl.Status == DownloadNotFound {
 			// Still 404: increment streak, mark holiday, upload Zero-Row Parquet.
@@ -251,8 +257,11 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State) {
 //	NOT_FOUND + 404 → AddNotFoundStreak(+1); streak≥3 → executeValidation → CONFIRMED.
 //	COMPLETED + 404 → BROKEN (data was present at T-0 but is now missing — anomaly).
 //	Non-404 error → FAILED.
-func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
-	dl := RequestDownload(ctx, row)
+//
+// highPriority routes the download to regularDownloadQueue (true) or
+// backfillDownloadQueue (false); see RequestDownload for the priority contract.
+func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus, highPriority bool) {
+	dl := RequestDownload(ctx, row, highPriority)
 	wasNotFound := row.PreviousStatus != nil && *row.PreviousStatus == state.PreviousStatusNOT_FOUND
 
 	if dl.Status != DownloadOK {

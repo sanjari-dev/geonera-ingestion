@@ -256,13 +256,13 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRoutedRow) {
 	switch item.layer {
 	case backfillLayerIngestion:
-		executeIngestionETL(ctx, d, item.row, handleNotFoundIncrement)
+		executeIngestionETL(ctx, d, item.row, handleNotFoundIncrement, false)
 	case backfillLayerRetryReset:
 		handleRetryReset(ctx, d, item.row)
 	case backfillLayerT2Action:
-		executeT2Action(ctx, d, item.row, item.preclaimPrev)
+		executeT2Action(ctx, d, item.row, item.preclaimPrev, false)
 	case backfillLayerNotFoundRecheck:
-		executeNotFoundRecheck(ctx, d, item.row)
+		executeNotFoundRecheck(ctx, d, item.row, false)
 	case backfillLayerNone:
 		// Already fully resolved inside the claim transaction.
 	}
