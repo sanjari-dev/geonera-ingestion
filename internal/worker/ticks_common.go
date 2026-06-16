@@ -404,18 +404,26 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 // preclaimPrev == CONFIRMED, which indicates a genuine demotion: the row had
 // already been confirmed in a previous cycle and is now found to be BROKEN.
 func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
+	inst := instrName(row)
+	ts := row.Timestamp.Format(time.RFC3339)
+	log.Printf("ticks/validate: reading R2 instrument=%s ts=%s", inst, ts)
+
 	fileBytes, err := readFromR2(ctx, row)
 	if err != nil {
-		log.Printf("read from R2 for %s: %v", row.ID, err)
+		log.Printf("ticks/validate: R2 read FAILED instrument=%s ts=%s err=%v → BROKEN", inst, ts, err)
 		// Unable to read the file — treat as BROKEN so Backfill can retry.
 		updateStateBroken(ctx, d, row)
 		return
 	}
+	log.Printf("ticks/validate: validating instrument=%s ts=%s bytes=%d", inst, ts, len(fileBytes))
 
 	validationErr := validateParquetFile(ctx, row, fileBytes)
+	if validationErr != nil {
+		log.Printf("ticks/validate: validation FAILED instrument=%s ts=%s err=%v → BROKEN", inst, ts, validationErr)
+	}
 
 	if err := updateValidatedTickStatus(ctx, d, row, validationErr, preclaimPrev); err != nil {
-		log.Printf("validation status update for %s: %v", row.ID, err)
+		log.Printf("ticks/validate: status update FAILED instrument=%s ts=%s err=%v", inst, ts, err)
 	}
 }
 
@@ -430,13 +438,8 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 			if e != nil {
 				return e
 			}
-			var instName string
-			if row.Edges.Instrument != nil {
-				instName = row.Edges.Instrument.Name
-			} else {
-				instName = saved.InstrumentID.String()
-			}
-			log.Printf("ticks: successfully validated and CONFIRMED %s tick %s", instName, saved.Timestamp.Format(time.RFC3339))
+				log.Printf("ticks/validate: CONFIRMED instrument=%s ts=%s",
+				instrName(row), saved.Timestamp.Format(time.RFC3339))
 			return upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
 		}
 
