@@ -57,15 +57,21 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	req := downloadRequest{ctx: ctx, row: row, resultCh: resultCh}
 
 	queue := backfillDownloadQueue
+	queueName := "backfill"
 	if highPriority {
 		queue = regularDownloadQueue
+		queueName = "regular"
 	}
 
 	// Enqueue the request. If ctx is canceled before a worker picks it up,
 	// return immediately without consuming a rate-gate token.
 	select {
 	case queue <- req:
+		log.Printf("ticks/download: queued instrument=%s ts=%s queue=%s",
+			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), queueName)
 	case <-ctx.Done():
+		log.Printf("ticks/download: enqueue canceled instrument=%s ts=%s queue=%s err=%v",
+			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), queueName, ctx.Err())
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
 
@@ -75,6 +81,8 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	case result := <-resultCh:
 		return result
 	case <-ctx.Done():
+		log.Printf("ticks/download: wait canceled instrument=%s ts=%s err=%v",
+			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), ctx.Err())
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
 }
@@ -126,9 +134,13 @@ func pickDownloadRequest() downloadRequest {
 // processDownloadRequest runs the rate-gate check and the actual HTTP download
 // for one request, then delivers the result to the caller's resultCh.
 func processDownloadRequest(req downloadRequest) {
+	inst := instrName(req.row)
+	ts := req.row.Timestamp.Format("2006-01-02T15:04Z")
+
 	// Discard already-canceled requests so they don't consume rate tokens.
 	select {
 	case <-req.ctx.Done():
+		log.Printf("ticks/download: discard pre-rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	default:
@@ -138,7 +150,9 @@ func processDownloadRequest(req downloadRequest) {
 	// Caps global throughput at dukascopyMaxRPS req/s.
 	select {
 	case <-tickDownloadRateGate:
+		log.Printf("ticks/download: rate-gate acquired instrument=%s ts=%s", inst, ts)
 	case <-req.ctx.Done():
+		log.Printf("ticks/download: discard at rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	}
@@ -150,22 +164,31 @@ func processDownloadRequest(req downloadRequest) {
 	select {
 	case req.resultCh <- result:
 	case <-req.ctx.Done():
+		log.Printf("ticks/download: result discarded caller-canceled instrument=%s ts=%s", inst, ts)
 	}
 }
 
 // doDownload performs the actual HTTP request and maps the raw error into a
 // typed DownloadStatus so no caller ever needs to inspect error types directly.
 func doDownload(ctx context.Context, row *ent.State) DownloadResult {
+	inst := instrName(row)
+	ts := row.Timestamp.Format("2006-01-02T15:04Z")
+	log.Printf("ticks/download: fetching instrument=%s ts=%s", inst, ts)
+
 	data, err := downloadBI5(ctx, row)
 	if err == nil {
+		log.Printf("ticks/download: OK instrument=%s ts=%s bytes=%d", inst, ts, len(data))
 		return DownloadResult{Status: DownloadOK, Data: data}
 	}
 	switch {
 	case isNotFoundError(err):
+		log.Printf("ticks/download: NOT_FOUND instrument=%s ts=%s", inst, ts)
 		return DownloadResult{Status: DownloadNotFound, Err: err}
 	case isRateLimitedError(err):
+		log.Printf("ticks/download: RATE_LIMITED instrument=%s ts=%s", inst, ts)
 		return DownloadResult{Status: DownloadRateLimited, Err: err}
 	default:
+		log.Printf("ticks/download: ERROR instrument=%s ts=%s err=%v", inst, ts, err)
 		return DownloadResult{Status: DownloadError, Err: err}
 	}
 }
