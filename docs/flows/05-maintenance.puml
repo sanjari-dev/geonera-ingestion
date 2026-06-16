@@ -138,6 +138,10 @@ repeat
       ' All branches apply to every job_type: TICK and CANDLE.
       ' ══════════════════════════════════════════════════════════
 
+      ' IsPause is set lazily — only when a goroutine finds actual insert/delete work.
+      ' sync.Once ensures the DB write happens at most once across all 4 goroutines.
+      ' If no goroutine has work this cycle, IsPause is not changed at all.
+
       split
         ' ── A. Forward Seeding ──────────────────────────────────
         :**A. Forward Seeding (Batched)**
@@ -150,11 +154,14 @@ repeat
         repeat
           :Find MAX(timestamp) for current
           (instrument_id, job_type);<<db>>
-          repeat
-            :Insert next batch of PENDING rows
-            from MAX(timestamp) toward time.Now()
-            using INSERT ... ON CONFLICT DO NOTHING;<<db>>
-          repeat while (MAX(timestamp) < time.Now() ?) is (yes) not (no — fully up to date)
+          if (MAX(timestamp) < time.Now() ?) then (yes — slots to seed)
+            :setPause() — IsPause=true (sync.Once);<<lock>>
+            repeat
+              :Insert next batch of PENDING rows
+              from MAX(timestamp) toward time.Now()
+              using INSERT ... ON CONFLICT DO NOTHING;<<db>>
+            repeat while (More batches?) is (yes) not (no — fully up to date)
+          endif
         repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
 
       split again
@@ -172,6 +179,7 @@ repeat
           (instrument_id, job_type)
           against Instrument.StartDate;<<db>>
           if (MIN(timestamp) > StartDate ?) then (yes — gap toward past exists)
+            :setPause() — IsPause=true (sync.Once);<<lock>>
             repeat
               :Insert next batch of PENDING rows
               backward toward StartDate
@@ -180,18 +188,6 @@ repeat
           else (MIN <= StartDate — history already complete)
           endif
         repeat while (More job_types [TICK, CANDLE] ?) is (yes) not (no — both covered)
-
-        :Update Instrument.IsPause based on TICK coverage:
-        Find MIN(Timestamp, **any status**, TICK).
-        IsPause = (MIN > StartDate)
-        — true while historical range not yet fully covered,
-        false once seeded down to StartDate;<<db>>
-        note right
-          Row status is not considered.
-          Backward gap fill has already inserted PENDING rows
-          for every missing slot — whether those rows have been
-          processed yet is irrelevant to the pause decision.
-        end note
 
       split again
         ' ── C. Pruning — Mark, R2 Sweep, then DB Delete ────────
@@ -207,42 +203,50 @@ repeat
           retried on the next Pruning cycle.
         end note
 
-        :**Phase 1 — Mark (Soft Delete)**;<<db>>
-        :UPDATE batch SET IsDeleted = true
-        WHERE timestamp < Instrument.StartDate
-        AND IsDeleted = false;<<db>>
-        note right: Marked rows are immediately \n ignored by every ETL worker
+        :Check: any rows with timestamp < StartDate AND IsDeleted=false
+        OR any IsDeleted=true rows left from prior cycle;<<db>>
+        if (Pruning work exists?) then (yes)
+          :setPause() — IsPause=true (sync.Once);<<lock>>
 
-        :**Phase 2 — R2 Sweep (collect results)**;
-        :Initialise two groups:
-        **succeeded** = [] and **failed** = [];
-        repeat
-          :Fetch next batch WHERE IsDeleted = true;
-          :Request deletion of each object
-          from Cloudflare R2;<<r2>>
-          if (R2 response?) then (deleted successfully)
-            :Add row IDs to **succeeded** group;
-          elseif (NoSuchKey?) then (yes — no file in R2\nDB record is a leftover)
-            :Add row IDs to **succeeded** group
-            (no R2 object to clean up —
-            safe to delete from DB directly);
-          else (timeout / error)
-            :Add row IDs to **failed** group;
-          endif
-        repeat while (More IsDeleted rows remaining?) is (yes) not (no — all rows processed)
-        note right
-          Every IsDeleted=true row is now
-          in exactly one group.
-        end note
+          :**Phase 1 — Mark (Soft Delete)**;<<db>>
+          :UPDATE batch SET IsDeleted = true
+          WHERE timestamp < Instrument.StartDate
+          AND IsDeleted = false;<<db>>
+          note right: Marked rows are immediately \n ignored by every ETL worker
 
-        :**Phase 3 — DB Hard Delete (succeeded group only)**;<<db>>
-        :DELETE FROM states
-        WHERE id IN (**succeeded** group);<<db>>
-        note right
-          **failed** group rows remain IsDeleted=true
-          and will be retried on the next
-          Pruning cycle automatically.
-        end note
+          :**Phase 2 — R2 Sweep (collect results)**;
+          :Initialise two groups:
+          **succeeded** = [] and **failed** = [];
+          repeat
+            :Fetch next batch WHERE IsDeleted = true;
+            :Request deletion of each object
+            from Cloudflare R2;<<r2>>
+            if (R2 response?) then (deleted successfully)
+              :Add row IDs to **succeeded** group;
+            elseif (NoSuchKey?) then (yes — no file in R2\nDB record is a leftover)
+              :Add row IDs to **succeeded** group
+              (no R2 object to clean up —
+              safe to delete from DB directly);
+            else (timeout / error)
+              :Add row IDs to **failed** group;
+            endif
+          repeat while (More IsDeleted rows remaining?) is (yes) not (no — all rows processed)
+          note right
+            Every IsDeleted=true row is now
+            in exactly one group.
+          end note
+
+          :**Phase 3 — DB Hard Delete (succeeded group only)**;<<db>>
+          :DELETE FROM states
+          WHERE id IN (**succeeded** group);<<db>>
+          note right
+            **failed** group rows remain IsDeleted=true
+            and will be retried on the next
+            Pruning cycle automatically.
+          end note
+
+        else (no — nothing to prune this cycle)
+        endif
 
       split again
         ' ── D. Consistency Check ────────────────────────────────
@@ -265,6 +269,7 @@ repeat
           WHERE timestamp BETWEEN MIN AND MAX
           for current (instrument_id, job_type);<<db>>
           if (ACTUAL < EXPECTED ?) then (yes — missing tasks detected)
+            :setPause() — IsPause=true (sync.Once);<<lock>>
             :Query missing timestamps:
             expected slots EXCEPT timestamps
             already present in states;<<db>>
@@ -281,6 +286,21 @@ repeat
       end split
 
       :wg.Done() x4 — A, B, C, D goroutines join;
+
+      :managePauseFlag — set Instrument.IsPause
+      based on final TICK coverage after all phases:
+      Find MIN(Timestamp, **any status**, TICK).
+      IsPause = (MIN > StartDate)
+      — true if historical range still incomplete,
+      false once fully seeded to StartDate;<<db>>
+      note right
+        Called after wg.Wait() — sees the final state
+        of all four phases before determining IsPause.
+        If no goroutine had work, IsPause was never
+        set to true, so managePauseFlag may set it
+        false (history complete) or leave it unchanged
+        (already false). Row status is not considered.
+      end note
 
     endif
 

@@ -9,7 +9,6 @@ import (
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
-	"github.com/sanjari-dev/geonera-ingestion/ent/predicate"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 )
@@ -78,8 +77,8 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	target := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
 	// T-2 Regular: claims COMPLETED + NOT_FOUND, re-downloads BI5 for cross-validation.
 	// COMPLETED → re-download matches → CONFIRMED; NOT_FOUND → streak+1, at ≥3 → CONFIRMED.
-	// Only IsActive filter — paused instruments still get validated.
-	runValidationLoop(ctx, d, &target, false)
+	// IsPause=false enforced, consistent with T-0 and T-1.
+	runValidationLoop(ctx, d, &target)
 }
 
 // runIngestionLoop claims PENDING TICK rows one at a time for the given hour
@@ -184,22 +183,17 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 //
 // Used by T-2 (two-hours-ago) with a non-nil timestamp.
 // Backfill drives its own rows via the Master Bulk-Claim.
-// respectPause=false for T-2 Regular: paused instruments still get validated.
-func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time, respectPause bool) {
+func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	var loopWg sync.WaitGroup
 	for ctx.Err() == nil {
 		// preclaimPrev is the row's PreviousStatus BEFORE the claim — forwarded to
 		// executeT2Action to detect genuine demotions (CONFIRMED → BROKEN).
 		claimed, preclaimPrev, err := claimStateWithPrevious(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
-			instrumentFilters := []predicate.Instrument{instrument.IsActiveEQ(true)}
-			if respectPause {
-				instrumentFilters = append(instrumentFilters, instrument.IsPauseEQ(false))
-			}
 			query := q.
 				Where(
 					state.JobTypeEQ(state.JobTypeTICK),
 					state.StatusIn(state.StatusCOMPLETED, state.StatusNOT_FOUND),
-					state.HasInstrumentWith(instrumentFilters...),
+					state.HasInstrumentWith(instrument.IsActiveEQ(true), instrument.IsPauseEQ(false)),
 					state.IsDeletedEQ(false),
 				).
 				WithInstrument(). // needed for BI5 download / Parquet convert / R2 upload

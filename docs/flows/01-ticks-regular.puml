@@ -177,7 +177,7 @@ split again
   Target timestamp = two hours before current
   (e.g., run at 10:05 -> target 08:00:00 UTC);
   :Claim: Status IN (COMPLETED, NOT_FOUND),
-  Instrument.IsActive = true;
+  Instrument.IsActive=true AND IsPause=false;
   :Download raw BI5 file from Dukascopy API;<<api>>
   note right: Download gate — same 12-worker pool as T-0
 

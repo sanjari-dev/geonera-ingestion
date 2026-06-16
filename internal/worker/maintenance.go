@@ -121,14 +121,35 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		}
 
 		// Group 2: A + B + C + D run concurrently for this instrument.
+		// IsPause is set lazily — the first goroutine that finds actual work
+		// (insert or delete) calls setPause(), which uses sync.Once to ensure
+		// the DB writing happens at most once. Goroutines with nothing to do
+		// leave IsPause untouched for this cycle.
+		// managePauseFlag is called after wg.Wait() so it sees the final
+		// state of all four phases before deciding the correct IsPause value.
 		log.Printf("maintenance %s: starting Group 2 (A+B+C+D)", inst.Name)
+
+		var pauseOnce sync.Once
+		setPause := func() {
+			pauseOnce.Do(func() {
+				if err := d.Execute(ctx, func(tx *ent.Tx) error {
+					_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
+					return e
+				}); err != nil {
+					log.Printf("maintenance %s Group 2: set IsPause=true: %v", inst.Name, err)
+				}
+			})
+		}
+
 		var wg sync.WaitGroup
 		wg.Add(4)
-		go func() { defer wg.Done(); runForwardSeeding(ctx, d, inst) }()
-		go func() { defer wg.Done(); runBackwardGapFill(ctx, d, inst) }()
-		go func() { defer wg.Done(); runPruning(ctx, d, inst) }()
-		go func() { defer wg.Done(); runConsistencyCheck(ctx, d, inst) }()
+		go func() { defer wg.Done(); runForwardSeeding(ctx, d, inst, setPause) }()
+		go func() { defer wg.Done(); runBackwardGapFill(ctx, d, inst, setPause) }()
+		go func() { defer wg.Done(); runPruning(ctx, d, inst, setPause) }()
+		go func() { defer wg.Done(); runConsistencyCheck(ctx, d, inst, setPause) }()
 		wg.Wait()
+
+		managePauseFlag(ctx, d, inst)
 		log.Printf("maintenance %s: Group 2 complete", inst.Name)
 		return nil
 	})
@@ -208,7 +229,7 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 // runForwardSeeding inserts PENDING rows from MAX(timestamp)+interval up to
 // time.Now() for both TICK and CANDLE, in batches. No upper-window cap —
 // the full range is always covered in one maintenance cycle.
-func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/forward-seeding")
 
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
@@ -235,6 +256,10 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := maxTS.Add(interval); !ts.After(nowNorm); ts = ts.Add(interval) {
 			candidates = append(candidates, ts)
 		}
+		if len(candidates) == 0 {
+			continue
+		}
+		setPause()
 		log.Printf("forward seeding %s %s: inserting %d new rows", inst.Name, jobType, len(candidates))
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("forward-seeding %s %s", inst.Name, jobType))
 	}
@@ -247,7 +272,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 // ignored — only the existence of a row at a given timestamp matters.
 // After filling gaps, managePauseFlag checks for hard-stuck TICK rows and
 // updates Instrument.IsPause accordingly.
-func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/backward-gap-fill")
 
 	startDate := inst.StartDate.UTC()
@@ -273,11 +298,13 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := minTS.Add(-interval); !ts.Before(startNorm); ts = ts.Add(-interval) {
 			candidates = append(candidates, ts)
 		}
+		if len(candidates) == 0 {
+			continue
+		}
+		setPause()
 		log.Printf("backward gap fill %s %s: filling %d rows toward StartDate", inst.Name, jobType, len(candidates))
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("backward-gap-fill %s %s", inst.Name, jobType))
 	}
-
-	managePauseFlag(ctx, d, inst)
 }
 
 // managePauseFlag sets Instrument.IsPause based on whether the TICK historical
@@ -321,9 +348,30 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 // runPruning soft-deletes rows below StartDate (Phase 1), sweeps the
 // corresponding R2 objects (Phase 2), then hard-deletes the succeeded group
 // from the DB (Phase 3). Both phases are per-instrument and batched.
-func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/pruning")
 
+	var hasWork bool
+	if err := d.Execute(ctx, func(tx *ent.Tx) error {
+		var e error
+		hasWork, e = tx.State.Query().
+			Where(
+				state.InstrumentID(inst.ID),
+				state.Or(
+					state.And(state.TimestampLT(inst.StartDate), state.IsDeletedEQ(false)),
+					state.IsDeletedEQ(true),
+				),
+			).
+			Exist(ctx)
+		return e
+	}); err != nil {
+		log.Printf("pruning %s: check: %v", inst.Name, err)
+		return
+	}
+	if !hasWork {
+		return
+	}
+	setPause()
 	runPruningPhase1Mark(ctx, d, inst)
 	runPruningPhase2Sweep(ctx, d, inst)
 }
@@ -457,18 +505,18 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 // runConsistencyCheck verifies that every timestamp slot between MIN and MAX
 // has a row in states. It runs independently for TICK (hourly) and CANDLE
 // (daily). Missing slots are inserted as PENDING in batches.
-func runConsistencyCheck(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+func runConsistencyCheck(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/consistency-check")
 
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
 			return
 		}
-		checkConsistencyForJobType(ctx, d, inst, jobType)
+		checkConsistencyForJobType(ctx, d, inst, jobType, setPause)
 	}
 }
 
-func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instrument, jobType state.JobType) {
+func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instrument, jobType state.JobType, setPause func()) {
 	interval := jobTypeInterval(jobType)
 
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
@@ -509,6 +557,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 		return
 	}
 
+	setPause()
 	log.Printf("consistency check %s %s: expected=%d actual=%d — inserting %d missing rows",
 		inst.Name, jobType, expected, actual, expected-actual)
 
