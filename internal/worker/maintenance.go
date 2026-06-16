@@ -79,12 +79,16 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 		return true
 	}
 
+	log.Printf("maintenance: %d instrument(s) to process", len(instruments))
+
 	for _, inst := range instruments {
 		if ctx.Err() != nil {
 			return true
 		}
 		runMaintenanceForInstrument(ctx, d, inst)
 	}
+
+	log.Printf("maintenance: complete")
 	return true
 }
 
@@ -111,11 +115,13 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		}
 
 		if empty {
+			log.Printf("maintenance %s: starting Group 1 (bootstrap)", inst.Name)
 			runBootstrap(ctx, d, inst)
 			return nil
 		}
 
 		// Group 2: A + B + C + D run concurrently for this instrument.
+		log.Printf("maintenance %s: starting Group 2 (A+B+C+D)", inst.Name)
 		var wg sync.WaitGroup
 		wg.Add(4)
 		go func() { defer wg.Done(); runForwardSeeding(ctx, d, inst) }()
@@ -123,6 +129,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		go func() { defer wg.Done(); runPruning(ctx, d, inst) }()
 		go func() { defer wg.Done(); runConsistencyCheck(ctx, d, inst) }()
 		wg.Wait()
+		log.Printf("maintenance %s: Group 2 complete", inst.Name)
 		return nil
 	})
 	if err != nil {
@@ -182,6 +189,7 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := startNorm; !ts.After(nowNorm); ts = ts.Add(interval) {
 			candidates = append(candidates, ts)
 		}
+		log.Printf("maintenance bootstrap %s: seeding %d %s slots", inst.Name, len(candidates), jobType)
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("bootstrap %s", inst.Name))
 	}
 
@@ -227,6 +235,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := maxTS.Add(interval); !ts.After(nowNorm); ts = ts.Add(interval) {
 			candidates = append(candidates, ts)
 		}
+		log.Printf("forward seeding %s %s: inserting %d new rows", inst.Name, jobType, len(candidates))
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("forward-seeding %s %s", inst.Name, jobType))
 	}
 }
@@ -264,6 +273,7 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := minTS.Add(-interval); !ts.Before(startNorm); ts = ts.Add(-interval) {
 			candidates = append(candidates, ts)
 		}
+		log.Printf("backward gap fill %s %s: filling %d rows toward StartDate", inst.Name, jobType, len(candidates))
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("backward-gap-fill %s %s", inst.Name, jobType))
 	}
 
@@ -297,6 +307,12 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		return e
 	}); err != nil {
 		log.Printf("manage pause %s: set IsPause=%v: %v", inst.Name, shouldPause, err)
+	} else {
+		log.Printf("manage pause %s: IsPause=%v (MIN=%s StartDate=%s)",
+			inst.Name, shouldPause,
+			minTS.Format(time.RFC3339),
+			normalizeTS(inst.StartDate.UTC(), state.JobTypeTICK).Format(time.RFC3339),
+		)
 	}
 }
 
@@ -315,6 +331,7 @@ func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 // runPruningPhase1Mark soft-deletes rows WHERE timestamp < StartDate AND
 // is_deleted=false for this instrument, in batches of 100.
 func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+	totalMarked := 0
 	for ctx.Err() == nil {
 		var batchLen int
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
@@ -346,9 +363,13 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 			log.Printf("pruning phase1 mark %s: %v", inst.Name, err)
 			break
 		}
+		totalMarked += batchLen
 		if batchLen == 0 {
 			break
 		}
+	}
+	if totalMarked > 0 {
+		log.Printf("pruning phase1 %s: marked %d rows as soft-deleted", inst.Name, totalMarked)
 	}
 }
 
@@ -403,11 +424,16 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 		}
 	}
 
+	failed := len(allRows) - len(succeeded)
+	log.Printf("pruning phase2 %s: swept %d rows — succeeded=%d failed=%d",
+		inst.Name, len(allRows), len(succeeded), failed)
+
 	// ── Phase 3: DB Hard Delete (succeeded group only) ───────────────────────
 	if len(succeeded) == 0 {
 		return
 	}
 	const pruneBatch = 500
+	totalDeleted := 0
 	for i := 0; i < len(succeeded); i += pruneBatch {
 		end := i + pruneBatch
 		if end > len(succeeded) {
@@ -419,8 +445,11 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			return e
 		}); err != nil {
 			log.Printf("pruning phase3 %s: hard-delete: %v", inst.Name, err)
+		} else {
+			totalDeleted += len(chunk)
 		}
 	}
+	log.Printf("pruning phase3 %s: hard-deleted %d rows", inst.Name, totalDeleted)
 }
 
 // ── GROUP 2D — CONSISTENCY CHECK ─────────────────────────────────────────────
