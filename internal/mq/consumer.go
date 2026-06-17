@@ -37,31 +37,36 @@ func jobNameFromQueue(queue string) string {
 // A dedicated channel is opened per queue so one slow consumer cannot starve
 // the others. If a channel or connection dies, each consumer goroutine
 // independently retries with exponential back-off (1 s → 32 s cap).
+//
+// After each successful handler run, queues marked publishEvent=true emit a
+// "state_changed" signal on the events.ingestion fanout exchange so the
+// admin-backend dashboard updates without constant DB polling.
 func SetupConsumers(c *Client, d *dal.DAL, logger *activitylog.Logger) error {
 	type subscription struct {
-		queue   string
-		handler func(ctx context.Context, onStarted func()) bool
+		queue        string
+		handler      func(ctx context.Context, onStarted func()) bool
+		publishEvent bool
 	}
 
 	subs := []subscription{
 		{QueueTicksRegular, func(ctx context.Context, onStarted func()) bool {
 			return worker.RunTickParentHandler(ctx, "REGULAR", d, onStarted)
-		}},
+		}, true},
 		{QueueTicksBackfill, func(ctx context.Context, onStarted func()) bool {
 			return worker.RunTickParentHandler(ctx, "BACKFILL", d, onStarted)
-		}},
+		}, true},
 		{QueueCandlesRegular, func(ctx context.Context, onStarted func()) bool {
 			return worker.RunCandleParentHandler(ctx, "REGULAR", d, onStarted)
-		}},
+		}, true},
 		{QueueCandlesBackfill, func(ctx context.Context, onStarted func()) bool {
 			return worker.RunCandleParentHandler(ctx, "BACKFILL", d, onStarted)
-		}},
+		}, true},
 		{QueueMaintenance, func(ctx context.Context, onStarted func()) bool {
 			return worker.RunMaintenanceHandler(ctx, d, onStarted)
-		}},
+		}, true},
 		{QueueSync, func(ctx context.Context, onStarted func()) bool {
 			return worker.RunSyncHandler(ctx, d, onStarted)
-		}},
+		}, false}, // sync touches ClickHouse, not the states table
 	}
 
 	// Perform one synchronous probe per queue at startup, so any misconfiguration
@@ -75,7 +80,13 @@ func SetupConsumers(c *Client, d *dal.DAL, logger *activitylog.Logger) error {
 
 	// Start a persistent, self-healing consumer goroutine for each queue.
 	for _, sub := range subs {
-		go consumeLoop(c, sub.queue, sub.handler, logger)
+		var onComplete func()
+		if sub.publishEvent {
+			onComplete = func() { c.PublishEvent("state_changed") }
+		} else {
+			onComplete = func() {}
+		}
+		go consumeLoop(c, sub.queue, sub.handler, logger, onComplete)
 	}
 
 	return nil
@@ -97,10 +108,10 @@ func probeQueue(c *Client, queue string) error {
 // consumeLoop runs forever, restarting the inner consumption session whenever the
 // channel drops (network blip, broker restart, channel-level error).
 // Back-off starts at 1 s and doubles up to 32 s to avoid thundering herds.
-func consumeLoop(c *Client, queue string, handler func(ctx context.Context, onStarted func()) bool, logger *activitylog.Logger) {
+func consumeLoop(c *Client, queue string, handler func(ctx context.Context, onStarted func()) bool, logger *activitylog.Logger, onComplete func()) {
 	backoff := time.Second
 	for {
-		err := runConsumer(c, queue, handler, logger)
+		err := runConsumer(c, queue, handler, logger, onComplete)
 		if err != nil {
 			log.Printf("mq: consumer %q error: %v — retrying in %s", queue, err, backoff)
 		} else {
@@ -118,7 +129,7 @@ func consumeLoop(c *Client, queue string, handler func(ctx context.Context, onSt
 // runConsumer opens one channel, declares the queue, sets QoS, and drains
 // messages until the channel closes. It returns nil on a clean channel close
 // and an error on any setup or protocol failure.
-func runConsumer(c *Client, queue string, handler func(ctx context.Context, onStarted func()) bool, logger *activitylog.Logger) error {
+func runConsumer(c *Client, queue string, handler func(ctx context.Context, onStarted func()) bool, logger *activitylog.Logger, onComplete func()) error {
 	ch, err := c.channel()
 	if err != nil {
 		return err
@@ -173,6 +184,7 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 				})
 				if ran {
 					logger.Complete(logID)
+					onComplete()
 				}
 			}(ctx)
 

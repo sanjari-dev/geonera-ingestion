@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -26,9 +27,22 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("RABBITMQ_URL is not set")
 	}
 
-	conn, err := amqp.Dial(url)
+	var conn *amqp.Connection
+	var err error
+
+	// Retry up to 15 times (approx 30 seconds) to allow RabbitMQ to fully boot.
+	// RabbitMQ's health check might pass before its AMQP listeners are ready.
+	for i := 0; i < 15; i++ {
+		conn, err = amqp.Dial(url)
+		if err == nil {
+			break
+		}
+		log.Printf("mq: dial failed, retrying in 2s... (%v)", err)
+		time.Sleep(2 * time.Second)
+	}
+
 	if err != nil {
-		return nil, fmt.Errorf("mq: dial: %w", err)
+		return nil, fmt.Errorf("mq: dial timeout: %w", err)
 	}
 
 	return &Client{url: url, conn: conn}, nil
@@ -39,6 +53,55 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn.Close()
+}
+
+// stateChangedExchange is the fanout exchange used to signal state changes to
+// admin-backend consumers. Messages are transient (signal-only); only the
+// exchange itself is durable so it survives a broker restart.
+const stateChangedExchange = "events.ingestion"
+
+// PublishEvent publishes a fire-and-forget signal on the fanout exchange
+// "events.ingestion". The body carries the event type but consumers treat
+// any arriving message as a "dirty" signal and re-query the database
+// themselves — so the body is informational only.
+//
+// Errors are logged and swallowed. A missed publish delays a dashboard
+// refresh by at most one 60-second fallback cycle on the subscriber side.
+func (c *Client) PublishEvent(eventType string) {
+	ch, err := c.channel()
+	if err != nil {
+		log.Printf("mq: PublishEvent: open channel: %v", err)
+		return
+	}
+	defer ch.Close()
+
+	if err := ch.ExchangeDeclare(
+		stateChangedExchange,
+		"fanout",
+		true,  // durable — survives broker restart
+		false, // auto-delete
+		false, // internal
+		false, // no-wait
+		nil,
+	); err != nil {
+		log.Printf("mq: PublishEvent: declare exchange: %v", err)
+		return
+	}
+
+	body := []byte(`{"event":"` + eventType + `"}`)
+	if err := ch.Publish(
+		stateChangedExchange,
+		"",    // routing key (ignored for fanout)
+		false, // mandatory
+		false, // immediate
+		amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Transient,
+			Body:         body,
+		},
+	); err != nil {
+		log.Printf("mq: PublishEvent: publish: %v", err)
+	}
 }
 
 // Channel opens a new AMQP channel. If the connection has been closed, it

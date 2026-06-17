@@ -120,6 +120,16 @@ var tickProcessSem = make(chan struct{}, runtime.NumCPU())
 // canceled so it does not block the next trigger window.
 const regularTimeout = 50 * time.Minute
 
+// backfillTimeout is the maximum wall-clock time allowed for one BACKFILL
+// master-claim batch. Without this, goroutines that block waiting for a slot in
+// the download queue have no escape valve: as triggers accumulate (each adding
+// up to backfillMasterClaimLimit goroutines), goroutines pile up indefinitely
+// because context.Background() (passed by the MQ consumer) has no deadline.
+// 9 minutes gives a full batch of 120 rows enough time to complete at the
+// sustained download rate (12 req/s, ~2.4 completed/s under Dukascopy timeouts)
+// while still bounding goroutine lifetime to a predictable window.
+const backfillTimeout = 9 * time.Minute
+
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
 // Mode must be either "REGULAR" or "BACKFILL".
 func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
@@ -129,9 +139,13 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	log.Printf("ticks: handler start mode=%s", mode)
 
 	runCtx := ctx
-	if mode == "REGULAR" {
-		var cancel context.CancelFunc
+	var cancel context.CancelFunc
+	switch mode {
+	case "REGULAR":
 		runCtx, cancel = context.WithTimeout(ctx, regularTimeout)
+		defer cancel()
+	case "BACKFILL":
+		runCtx, cancel = context.WithTimeout(ctx, backfillTimeout)
 		defer cancel()
 	}
 
@@ -150,8 +164,13 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	}
 	wg.Wait()
 
-	if mode == "REGULAR" && runCtx.Err() == context.DeadlineExceeded {
-		log.Printf("ticks/REGULAR: deadline exceeded (%s) — cycle was abnormal, all phases canceled", regularTimeout)
+	if runCtx.Err() == context.DeadlineExceeded {
+		switch mode {
+		case "REGULAR":
+			log.Printf("ticks/REGULAR: deadline exceeded (%s) — cycle was abnormal, all phases canceled", regularTimeout)
+		case "BACKFILL":
+			log.Printf("ticks/BACKFILL: deadline exceeded (%s) — batch goroutines canceled, goroutine leak prevented", backfillTimeout)
+		}
 	}
 
 	log.Printf("ticks: handler done mode=%s", mode)
