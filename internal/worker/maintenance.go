@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -563,43 +562,15 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	log.Printf("consistency check %s %s: expected=%d actual=%d — inserting %d missing rows",
 		inst.Name, jobType, expected, actual, expected-actual)
 
-	// Fetch all existing timestamps in the [minTS, maxTS] range to compute the
-	// set difference in memory. This is efficient for typical ranges (years of
-	// data) because we only transfer timestamps, not full row payloads.
-	var existingRows []*ent.State
-	if err := d.Execute(ctx, func(tx *ent.Tx) error {
-		var e error
-		existingRows, e = tx.State.Query().
-			Where(
-				state.InstrumentID(inst.ID),
-				state.JobTypeEQ(jobType),
-				state.TimestampGTE(minTS),
-				state.TimestampLTE(maxTS),
-				state.IsDeletedEQ(false),
-			).
-			All(ctx)
-		return e
-	}); err != nil {
-		log.Printf("consistency check %s %s: query existing: %v", inst.Name, jobType, err)
+	missing, err := d.QueryMissingTimestamps(ctx, inst.ID, string(jobType), minTS, maxTS, interval)
+	if err != nil {
+		log.Printf("consistency check %s %s: query missing: %v", inst.Name, jobType, err)
 		return
-	}
-
-	existingSet := make(map[time.Time]struct{}, len(existingRows))
-	for _, row := range existingRows {
-		existingSet[normalizeTS(row.Timestamp.UTC(), jobType)] = struct{}{}
-	}
-
-	var missing []time.Time
-	for ts := minTS; !ts.After(maxTS); ts = ts.Add(interval) {
-		if _, ok := existingSet[ts]; !ok {
-			missing = append(missing, ts)
-		}
 	}
 	if len(missing) == 0 {
 		return
 	}
 
-	sort.Slice(missing, func(i, j int) bool { return missing[i].Before(missing[j]) })
 	insertBatched(ctx, d, inst.ID, jobType, missing, fmt.Sprintf("consistency-check %s %s", inst.Name, jobType))
 }
 

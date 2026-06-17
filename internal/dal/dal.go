@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 )
 
@@ -64,4 +66,41 @@ func (d *DAL) WithAdvisoryLock(ctx context.Context, key int64, fn func() error) 
 	}()
 
 	return true, fn()
+}
+
+// QueryMissingTimestamps returns all timestamps in [minTS, maxTS] at the given
+// interval that have no corresponding non-deleted row in ingestion.states for
+// the given instrument and job type.
+//
+// The set-difference is computed entirely in PostgreSQL via generate_series +
+// NOT EXISTS, using the unique index on (instrument_id, timestamp, job_type).
+// Only the missing timestamps are transferred to Go — typically zero rows on the
+// happy path, avoiding O(N) memory allocation for the full existing-row set.
+func (d *DAL) QueryMissingTimestamps(ctx context.Context, instID uuid.UUID, jobType string, minTS, maxTS time.Time, interval time.Duration) ([]time.Time, error) {
+	rows, err := d.sqlDB.QueryContext(ctx, `
+		SELECT ts
+		FROM generate_series($1::timestamptz, $2::timestamptz, $3::interval) AS ts
+		WHERE NOT EXISTS (
+			SELECT 1 FROM ingestion.states
+			WHERE instrument_id = $4
+			  AND job_type      = $5::ingestion.job_type_enum
+			  AND timestamp     = ts
+			  AND is_deleted    = false
+		)
+		ORDER BY ts
+	`, minTS, maxTS, fmt.Sprintf("%d seconds", int(interval.Seconds())), instID, jobType)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var missing []time.Time
+	for rows.Next() {
+		var ts time.Time
+		if err := rows.Scan(&ts); err != nil {
+			return nil, err
+		}
+		missing = append(missing, ts)
+	}
+	return missing, rows.Err()
 }
