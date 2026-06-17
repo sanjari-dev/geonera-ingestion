@@ -4,9 +4,11 @@
 package runtimecollector
 
 import (
+	"fmt"
 	"math"
 	"runtime"
 	"runtime/metrics"
+	"strings"
 	"sync"
 	"time"
 )
@@ -49,6 +51,29 @@ var (
 	latest    Snapshot
 	startTime time.Time
 )
+
+// PrometheusText returns the current snapshot serialized in Prometheus text
+// exposition format (version 0.0.4). Safe to call before the first sample
+// interval — cpu_percent will be -1 (rendered as -1) which Prometheus accepts.
+func PrometheusText() string {
+	s := Get()
+	var b strings.Builder
+	g := func(name, help string, v float64) {
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n%s %.6g\n", name, help, name, name, v)
+	}
+	c := func(name, help string, v float64) {
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s counter\n%s %.6g\n", name, help, name, name, v)
+	}
+	g("ingestion_cpu_percent", "CPU utilization percentage (0-100; -1 = first sample pending).", s.CPUPercent)
+	g("ingestion_heap_alloc_bytes", "Live heap object bytes.", s.HeapAllocMB*1024*1024)
+	g("ingestion_heap_inuse_bytes", "Heap bytes in use by the allocator.", s.HeapInuseMB*1024*1024)
+	g("ingestion_sys_bytes", "Total bytes obtained from the OS.", s.SysMB*1024*1024)
+	g("ingestion_goroutines", "Current number of live goroutines.", float64(s.NumGoroutine))
+	g("ingestion_gc_pause_ms_avg", "Average stop-the-world GC pause in milliseconds (last 256 cycles).", s.AvgGCPauseMs)
+	c("ingestion_gc_cycles_total", "Cumulative completed GC cycles since startup.", float64(s.GCCycles))
+	c("ingestion_uptime_seconds_total", "Seconds elapsed since the process started.", float64(s.UptimeSeconds))
+	return b.String()
+}
 
 // Get returns the most recent snapshot. Returns a zero Snapshot if Start has
 // not been called or the first sample interval has not elapsed yet.

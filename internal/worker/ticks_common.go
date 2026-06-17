@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -113,6 +114,12 @@ func InitDownloadRateLimiter() {
 // Shared across all tick phases.
 var tickProcessSem = make(chan struct{}, runtime.NumCPU())
 
+// regularTimeout is the maximum wall-clock time allowed for one REGULAR cycle
+// (T-0 + T-1 + T-2). A cycle that exceeds this is considered abnormal — likely
+// a hung R2 operation or an undetected stale connection — and is forcibly
+// canceled so it does not block the next trigger window.
+const regularTimeout = 50 * time.Minute
+
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
 // Mode must be either "REGULAR" or "BACKFILL".
 func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
@@ -120,20 +127,33 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 		onStarted()
 	}
 	log.Printf("ticks: handler start mode=%s", mode)
+
+	runCtx := ctx
+	if mode == "REGULAR" {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, regularTimeout)
+		defer cancel()
+	}
+
 	var wg sync.WaitGroup
 	switch mode {
 	case "REGULAR":
 		wg.Add(3)
-		go runT0Phase(ctx, d, &wg)
-		go runT1Phase(ctx, d, &wg)
-		go runT2Phase(ctx, d, &wg)
+		go runT0Phase(runCtx, d, &wg)
+		go runT1Phase(runCtx, d, &wg)
+		go runT2Phase(runCtx, d, &wg)
 	case "BACKFILL":
 		wg.Add(1)
-		go runBackfillMasterLoop(ctx, d, &wg)
+		go runBackfillMasterLoop(runCtx, d, &wg)
 	default:
 		log.Printf("ticks: unknown mode %q", mode)
 	}
 	wg.Wait()
+
+	if mode == "REGULAR" && runCtx.Err() == context.DeadlineExceeded {
+		log.Printf("ticks/REGULAR: deadline exceeded (%s) — cycle was abnormal, all phases canceled", regularTimeout)
+	}
+
 	log.Printf("ticks: handler done mode=%s", mode)
 	return true
 }
@@ -181,6 +201,7 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotFound func(context.Context, *dal.DAL, *ent.State), highPriority bool) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	start := time.Now()
 	log.Printf("ticks/ETL: start instrument=%s ts=%s", inst, ts)
 
 	// Phase 1: Download BI5 — submitted to the download gate worker pool.
@@ -190,13 +211,13 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	dl := RequestDownload(ctx, row, highPriority)
 	switch dl.Status {
 	case DownloadNotFound:
-		log.Printf("ticks/ETL: download NOT_FOUND instrument=%s ts=%s", inst, ts)
+		log.Printf("ticks/ETL: download NOT_FOUND instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		onNotFound(ctx, d, row)
 		return
 	case DownloadOK:
-		log.Printf("ticks/ETL: download OK instrument=%s ts=%s bytes=%d", inst, ts, len(dl.Data))
+		log.Printf("ticks/ETL: download OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(dl.Data), time.Since(start).Round(time.Millisecond))
 	default: // DownloadRateLimited, DownloadError, or ctx canceled
-		log.Printf("ticks/ETL: download ERROR instrument=%s ts=%s err=%v → FAILED", inst, ts, dl.Err)
+		log.Printf("ticks/ETL: download ERROR instrument=%s ts=%s err=%v elapsed=%s → FAILED", inst, ts, dl.Err, time.Since(start).Round(time.Millisecond))
 		updateStateFailed(ctx, d, row)
 		return
 	}
@@ -208,6 +229,7 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 
 	// Phase 2: Convert + Upload — semaphore capped at runtime.NumCPU().
 	executeConvertUpload(ctx, d, row, dl.Data)
+	log.Printf("ticks/ETL: pipeline done instrument=%s ts=%s total_elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 }
 
 // executeNotFoundRecheck re-checks the Dukascopy API for a claimed NOT_FOUND row.
@@ -406,16 +428,17 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	start := time.Now()
 	log.Printf("ticks/validate: reading R2 instrument=%s ts=%s", inst, ts)
 
 	fileBytes, err := readFromR2(ctx, row)
 	if err != nil {
-		log.Printf("ticks/validate: R2 read FAILED instrument=%s ts=%s err=%v → BROKEN", inst, ts, err)
+		log.Printf("ticks/validate: R2 read FAILED instrument=%s ts=%s err=%v elapsed=%s → BROKEN", inst, ts, err, time.Since(start).Round(time.Millisecond))
 		// Unable to read the file — treat as BROKEN so Backfill can retry.
 		updateStateBroken(ctx, d, row)
 		return
 	}
-	log.Printf("ticks/validate: validating instrument=%s ts=%s bytes=%d", inst, ts, len(fileBytes))
+	log.Printf("ticks/validate: validating instrument=%s ts=%s bytes=%d read_elapsed=%s", inst, ts, len(fileBytes), time.Since(start).Round(time.Millisecond))
 
 	validationErr := validateParquetFile(ctx, row, fileBytes)
 	if validationErr != nil {
@@ -425,6 +448,7 @@ func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaim
 	if err := updateValidatedTickStatus(ctx, d, row, validationErr, preclaimPrev); err != nil {
 		log.Printf("ticks/validate: status update FAILED instrument=%s ts=%s err=%v", inst, ts, err)
 	}
+	log.Printf("ticks/validate: done instrument=%s ts=%s total_elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 }
 
 func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, validationErr error, preclaimPrev *state.PreviousStatus) error {
@@ -605,6 +629,7 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 
 	tickProcessSem <- struct{}{}
 	defer func() { <-tickProcessSem }()
+	start := time.Now()
 
 	parquet, err := convertBI5ToParquet(data, row)
 	if err != nil {
@@ -612,14 +637,14 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "convert failed")
 		return
 	}
-	log.Printf("ticks/ETL: convert OK instrument=%s ts=%s parquet_bytes=%d", inst, ts, len(parquet))
+	log.Printf("ticks/ETL: convert OK instrument=%s ts=%s parquet_bytes=%d elapsed=%s", inst, ts, len(parquet), time.Since(start).Round(time.Millisecond))
 
 	if err := uploadToR2(ctx, row, parquet); err != nil {
-		log.Printf("ticks/ETL: upload FAILED instrument=%s ts=%s err=%v", inst, ts, err)
+		log.Printf("ticks/ETL: upload FAILED instrument=%s ts=%s err=%v elapsed=%s", inst, ts, err, time.Since(start).Round(time.Millisecond))
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload failed")
 		return
 	}
-	log.Printf("ticks/ETL: upload OK instrument=%s ts=%s → COMPLETED", inst, ts)
+	log.Printf("ticks/ETL: upload OK instrument=%s ts=%s elapsed=%s → COMPLETED", inst, ts, time.Since(start).Round(time.Millisecond))
 	updateStateCompleted(ctx, d, row)
 }
 
@@ -783,6 +808,6 @@ func buildZeroRowParquet() []byte {
 // It must be deferred AFTER wg.Done().
 func recoverGoroutine(ctx context.Context, name string) {
 	if r := recover(); r != nil {
-		log.Printf("FATAL: panic in %s: %v", name, r)
+		log.Printf("FATAL: panic in %s: %v\n%s", name, r, debug.Stack())
 	}
 }

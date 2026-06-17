@@ -61,6 +61,10 @@ start
 note right
   Triggered by queue jobs.ticks.regular,
   expected to fire every hour at minute :05 (e.g., 10:05 UTC).
+  **50-minute handler timeout** is enforced via context.WithTimeout
+  — if T-0 + T-1 + T-2 combined exceed this limit, all three phases
+  are canceled and the abnormal run is logged. Normal cycles finish
+  in seconds to a few minutes.
 end note
 
 split
@@ -90,6 +94,8 @@ split
     a token-bucket token (12 req/s) before sending the HTTP request.
     Context-cancellation-safe at every blocking point:
     enqueue wait, rate-gate wait, and result wait.
+    Each HTTP request has a **5-second timeout** — BI5 files are small (10–200 KB);
+    a slow response signals a server problem, not a large payload.
   end note
 
   if (Download result?) then (2xx — data received)
@@ -148,7 +154,7 @@ split again
     end note
   else (NOT_FOUND)
     :Download raw BI5 file from Dukascopy API;<<api>>
-    note right: Download gate — same 12-worker pool as T-0
+    note right: Download gate — same 12-worker pool as T-0\n(5-second HTTP timeout per request)
     if (Download result?) then (2xx — data now available)
       :SetNotFoundStreak = 0 — atomic;<<db>>
       :Status -> PENDING (re-attempt on next cycle);
@@ -179,7 +185,7 @@ split again
   :Claim: Status IN (COMPLETED, NOT_FOUND),
   Instrument.IsActive=true AND IsPause=false;
   :Download raw BI5 file from Dukascopy API;<<api>>
-  note right: Download gate — same 12-worker pool as T-0
+  note right: Download gate — same 12-worker pool as T-0\n(5-second HTTP timeout per request)
 
   if (Claimed status + Download result?) then (COMPLETED + 2xx)
     note right: Re-download matches T-0 source — cross-validation
@@ -232,7 +238,7 @@ split again
   endif
 end split
 
-:wg.Done() x3 — join point (Parent Handler's wg.Wait() returns);
+:wg.Done() x3 — join; Parent Handler wg.Wait() returns (or 50-min deadline fires);
 stop
 
 @enduml

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
@@ -176,28 +177,29 @@ func processDownloadRequest(req downloadRequest) {
 func doDownload(ctx context.Context, row *ent.State) DownloadResult {
 	inst := instrName(row)
 	ts := row.Timestamp.Format("2006-01-02T15:04Z")
+	start := time.Now()
 	log.Printf("ticks/download: fetching instrument=%s ts=%s", inst, ts)
 
 	data, err := downloadBI5(ctx, row)
 	if err == nil {
-		log.Printf("ticks/download: OK instrument=%s ts=%s bytes=%d", inst, ts, len(data))
+		log.Printf("ticks/download: OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(data), time.Since(start).Round(time.Millisecond))
 		return DownloadResult{Status: DownloadOK, Data: data}
 	}
 	switch {
 	case isNotFoundError(err):
-		log.Printf("ticks/download: NOT_FOUND HTTP 404 instrument=%s ts=%s", inst, ts)
+		log.Printf("ticks/download: NOT_FOUND HTTP 404 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		return DownloadResult{Status: DownloadNotFound, Err: err}
 	case isRateLimitedError(err):
-		log.Printf("ticks/download: RATE_LIMITED HTTP 429 instrument=%s ts=%s", inst, ts)
+		log.Printf("ticks/download: RATE_LIMITED HTTP 429 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		return DownloadResult{Status: DownloadRateLimited, Err: err}
 	default:
 		var httpErr *dukascopy.HTTPError
 		if errors.As(err, &httpErr) {
-			log.Printf("ticks/download: ERROR %s instrument=%s ts=%s err=%v",
-				httpClass(httpErr.StatusCode), inst, ts, err)
+			log.Printf("ticks/download: ERROR %s instrument=%s ts=%s err=%v elapsed=%s",
+				httpClass(httpErr.StatusCode), inst, ts, err, time.Since(start).Round(time.Millisecond))
 		} else {
 			// Network error, timeout, or context cancellation — no HTTP status code.
-			log.Printf("ticks/download: ERROR instrument=%s ts=%s err=%v", inst, ts, err)
+			log.Printf("ticks/download: ERROR instrument=%s ts=%s err=%v elapsed=%s", inst, ts, err, time.Since(start).Round(time.Millisecond))
 		}
 		return DownloadResult{Status: DownloadError, Err: err}
 	}

@@ -27,6 +27,20 @@ func isR2NotFound(err error) bool { return errors.Is(err, r2.ErrNotFound) }
 // and statement timeouts.
 const maintenanceSeedBatchSize = 720
 
+// consistencyBatchSize is the maximum number of missing timestamps fetched
+// from PostgreSQL in a single QueryMissingTimestamps call. 1 000 000 rows ≈
+// 114 years of TICK data — large enough to cover any single instrument in one
+// or two calls under normal conditions, while bounding Go-side memory usage.
+const consistencyBatchSize = 1_000_000
+
+// maintenanceParallelLimit caps the number of instruments processed concurrently.
+// Each concurrent instrument holds one dedicated advisory-lock connection plus up
+// to 4 pool connections (one per Group-2 phase goroutine). At the limit of 8:
+//   8 advisory + 8×4 pool = 40 connections reserved for maintenance.
+// This keeps total usage well within PostgreSQL's default max_connections (100),
+// even when other services (admin-backend, ch-sync) hold their own connections.
+const maintenanceParallelLimit = 8
+
 // deleteTickParquetFromR2 removes the hourly Tick Parquet file for this state
 // row from Cloudflare R2.
 func deleteTickParquetFromR2(ctx context.Context, row *ent.State) error {
@@ -78,14 +92,24 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 		return true
 	}
 
-	log.Printf("maintenance: %d instrument(s) to process", len(instruments))
+	log.Printf("maintenance: %d instrument(s) to process (parallel, limit %d)", len(instruments), maintenanceParallelLimit)
 
+	sem := make(chan struct{}, maintenanceParallelLimit)
+	var wg sync.WaitGroup
 	for _, inst := range instruments {
 		if ctx.Err() != nil {
-			return true
+			break
 		}
-		runMaintenanceForInstrument(ctx, d, inst)
+		inst := inst
+		sem <- struct{}{} // blocks when maintenanceParallelLimit goroutines are active
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			runMaintenanceForInstrument(ctx, d, inst)
+		}()
 	}
+	wg.Wait()
 
 	log.Printf("maintenance: complete")
 	return true
@@ -559,19 +583,30 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	}
 
 	setPause()
-	log.Printf("consistency check %s %s: expected=%d actual=%d — inserting %d missing rows",
-		inst.Name, jobType, expected, actual, expected-actual)
+	log.Printf("consistency check %s %s: expected=%d actual=%d — %d missing, filling in batches of %d",
+		inst.Name, jobType, expected, actual, expected-actual, consistencyBatchSize)
 
-	missing, err := d.QueryMissingTimestamps(ctx, inst.ID, string(jobType), minTS, maxTS, interval)
-	if err != nil {
-		log.Printf("consistency check %s %s: query missing: %v", inst.Name, jobType, err)
-		return
+	// Cursor-based scan: afterTS starts one step before minTS so the first
+	// batch includes minTS itself. Each iteration fetches up to consistencyBatchSize
+	// missing timestamps, inserts them, then advances the cursor to the last
+	// timestamp returned. Loop exits when the batch is smaller than the limit
+	// (no more gaps) or ctx is canceled.
+	cursor := minTS.Add(-interval)
+	for ctx.Err() == nil {
+		missing, err := d.QueryMissingTimestamps(ctx, inst.ID, string(jobType), minTS, maxTS, interval, cursor, consistencyBatchSize)
+		if err != nil {
+			log.Printf("consistency check %s %s: query missing: %v", inst.Name, jobType, err)
+			return
+		}
+		if len(missing) == 0 {
+			break
+		}
+		insertBatched(ctx, d, inst.ID, jobType, missing, fmt.Sprintf("consistency-check %s %s", inst.Name, jobType))
+		if len(missing) < consistencyBatchSize {
+			break
+		}
+		cursor = missing[len(missing)-1]
 	}
-	if len(missing) == 0 {
-		return
-	}
-
-	insertBatched(ctx, d, inst.ID, jobType, missing, fmt.Sprintf("consistency-check %s %s", inst.Name, jobType))
 }
 
 // ── SHARED HELPERS ────────────────────────────────────────────────────────────

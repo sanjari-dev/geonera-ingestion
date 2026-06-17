@@ -41,11 +41,28 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "runCandleBackfill")
 
 	boundary := backfillCandleBoundary()
+	log.Printf("candle/backfill: start boundary=%s claim_limit=%d", boundary.Format(time.DateOnly), candleBackfillClaimLimit)
 
 	batch, err := claimCandleBackfillBatch(ctx, d, boundary)
 	if err != nil {
 		log.Printf("candle backfill: master claim: %v", err)
 		return
+	}
+
+	if len(batch) == 0 {
+		log.Printf("candle/backfill: no rows to process boundary=%s", boundary.Format(time.DateOnly))
+	} else {
+		layerCounts := map[candleBackfillLayer]int{}
+		for _, item := range batch {
+			layerCounts[item.layer]++
+		}
+		log.Printf("candle/backfill: claimed %d row(s) aggregate=%d reset=%d validation=%d none=%d",
+			len(batch),
+			layerCounts[candleLayerAggregate],
+			layerCounts[candleLayerReset],
+			layerCounts[candleLayerValidation],
+			layerCounts[candleLayerNone],
+		)
 	}
 
 	var batchWg sync.WaitGroup
@@ -63,6 +80,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	if len(batch) == 0 {
 		resetCandleAbandonedRows(ctx, d, boundary)
 	}
+	log.Printf("candle/backfill: done boundary=%s rows=%d", boundary.Format(time.DateOnly), len(batch))
 }
 
 // ── Backfill helpers ──────────────────────────────────────────────────────────
@@ -117,10 +135,14 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 
 			case state.StatusPROCESSED:
 				// Zombie: resolved at claim time, no goroutine dispatched.
+				log.Printf("candle/backfill: claim zombie instrument=%s date=%s → PENDING",
+					instrName(row), row.Timestamp.Format(time.DateOnly))
 				newPrev, newStatus, layer = state.PreviousStatusPROCESSED, state.StatusPENDING, candleLayerNone
 
 			case state.StatusFAILED:
 				if row.RetryCount > candleMaxRetryCount {
+					log.Printf("candle/backfill: claim FAILED→ABANDONED instrument=%s date=%s retry_count=%d",
+						instrName(row), row.Timestamp.Format(time.DateOnly), row.RetryCount)
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusABANDONED, candleLayerNone
 				} else {
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusPROCESSED, candleLayerReset
@@ -128,6 +150,8 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 
 			case state.StatusBROKEN:
 				if row.RetryCount > candleMaxRetryCount {
+					log.Printf("candle/backfill: claim BROKEN→ABANDONED instrument=%s date=%s retry_count=%d",
+						instrName(row), row.Timestamp.Format(time.DateOnly), row.RetryCount)
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusABANDONED, candleLayerNone
 				} else {
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusPROCESSED, candleLayerReset
@@ -164,12 +188,17 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 // dispatchCandleBackfillRow runs the handler chosen at master-claim time.
 // Rows with candleLayerNone were fully resolved inside the claim transaction.
 func dispatchCandleBackfillRow(ctx context.Context, d *dal.DAL, item candleRoutedRow) {
+	inst := instrName(item.row)
+	date := item.row.Timestamp.Format(time.DateOnly)
 	switch item.layer {
 	case candleLayerAggregate:
+		log.Printf("candle/backfill: dispatch aggregate instrument=%s date=%s", inst, date)
 		executeCandleAggregation(ctx, d, item.row)
 	case candleLayerReset:
+		log.Printf("candle/backfill: dispatch reset instrument=%s date=%s retry_count=%d", inst, date, item.row.RetryCount)
 		executeCandleRetryReset(ctx, d, item.row)
 	case candleLayerValidation:
+		log.Printf("candle/backfill: dispatch validation instrument=%s date=%s", inst, date)
 		executeCandleValidation(ctx, d, item.row)
 	case candleLayerNone:
 		// Already fully resolved inside the claim transaction.

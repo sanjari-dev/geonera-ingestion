@@ -101,6 +101,7 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, t
 // Claims use FOR UPDATE SKIP LOCKED so Regular and Backfill runs safely route work by status.
 func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 	var loopWg sync.WaitGroup
+	count := 0
 	for ctx.Err() == nil {
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			return candleStateRows(q,
@@ -118,6 +119,10 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 			break
 		}
 
+		count++
+		log.Printf("candle agg: claimed instrument=%s date=%s row_id=%s",
+			instrName(claimed), claimed.Timestamp.Format(time.DateOnly), claimed.ID)
+
 		loopWg.Add(1)
 		go func(r *ent.State) {
 			defer loopWg.Done()
@@ -126,6 +131,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 		}(claimed)
 	}
 	loopWg.Wait()
+	log.Printf("candle agg: loop complete rows=%d", count)
 }
 
 // ── Aggregation pipeline ──────────────────────────────────────────────────────
@@ -148,6 +154,11 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 	instrName := row.Edges.Instrument.Name
 	dayStart := row.Timestamp.UTC() // CANDLE timestamp is already 00:00:00 UTC
+	start := time.Now()
+	log.Printf("candle agg: start instrument=%s date=%s row_id=%s", instrName, dayStart.Format(time.DateOnly), row.ID)
+	defer func() {
+		log.Printf("candle agg: done instrument=%s date=%s elapsed=%s", instrName, dayStart.Format(time.DateOnly), time.Since(start).Round(time.Millisecond))
+	}()
 
 	// Step 1 — Query the 24 CONFIRMED TICK rows for this instrument and day.
 	dayEnd := dayStart.Add(24 * time.Hour)

@@ -110,6 +110,13 @@ func main() {
 		return c.SendString("Hello World")
 	})
 
+	// Prometheus metrics — scraped by Prometheus at /metrics.
+	// No auth required so the scraper does not need X-Ingestion-Secret.
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		c.Set(fiber.HeaderContentType, "text/plain; version=0.0.4; charset=utf-8")
+		return c.SendString(runtimecollector.PrometheusText())
+	})
+
 	app.Static("/openapi.yaml", "./openapi.yaml")
 
 	app.Get("/docs", func(c *fiber.Ctx) error {

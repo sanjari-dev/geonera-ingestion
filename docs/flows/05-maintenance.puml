@@ -68,12 +68,14 @@ note right
   (every 5 minutes, starting at minute :02).
   All operations are idempotent and batched per-instrument
   to avoid timeouts, OOM, and long table locks.
+  Instruments are processed **in parallel** — each in its own goroutine,
+  protected by a per-instrument advisory lock.
 end note
 
 :Fetch all instruments (active + inactive);<<db>>
 
-repeat
-  ' ── PER-INSTRUMENT ITERATION ──────────────────────────────
+fork
+  ' ── PER-INSTRUMENT GOROUTINE (one goroutine per instrument) ─────
 
   :key = instrumentLockKey(instrument.ID)
   FNV-1a hash of UUID → int64;
@@ -258,6 +260,12 @@ repeat
           Fills any internal gap with PENDING rows
           without touching existing rows (any status).
           TICK counts hourly slots; CANDLE counts daily slots.
+          Missing timestamps are fetched from PostgreSQL using
+          generate_series + NOT EXISTS with a **cursor-based loop**:
+          up to **1 000 000 timestamps per batch**. The cursor advances
+          to the last returned timestamp so each call resumes exactly
+          where the previous one stopped. Inserts are further split
+          into batches of 720 rows per transaction.
         end note
         repeat
           :Fetch MIN(timestamp) and MAX(timestamp)
@@ -270,14 +278,20 @@ repeat
           for current (instrument_id, job_type);<<db>>
           if (ACTUAL < EXPECTED ?) then (yes — missing tasks detected)
             :setPause() — IsPause=true (sync.Once);<<lock>>
-            :Query missing timestamps:
-            expected slots EXCEPT timestamps
-            already present in states;<<db>>
+            :cursor = minTS - interval (initial position);
             repeat
-              :Insert next batch of missing rows
-              as PENDING using
-              INSERT ... ON CONFLICT DO NOTHING;<<db>>
-            repeat while (More missing timestamps?) is (yes) not (no — all gaps filled)
+              :QueryMissingTimestamps(cursor, limit=1 000 000)
+              → generate_series + NOT EXISTS WHERE ts > cursor
+              ORDER BY ts LIMIT 1 000 000;<<db>>
+              if (len(missing) == 0 ?) then (yes — no more gaps)
+                break;
+              endif
+              :insertBatched(missing) — 720 rows/tx;<<db>>
+              if (len(missing) < 1 000 000 ?) then (yes — last batch)
+                break;
+              endif
+              :cursor = missing[last];
+            repeat while (ctx.Err() == nil ?) is (yes) not (no — canceled)
           else (no — counts match, data is consistent)
             :Skip — no action needed;
           endif
@@ -311,9 +325,16 @@ repeat
 
   endif
 
-repeat while (More instruments?) is (yes) not (no — all instruments processed)
+fork again
+  ' ── ... (one goroutine per instrument) ──────────────────────────
+end fork
+note right
+  All instrument goroutines run concurrently.
+  Each goroutine acquires its own advisory lock independently.
+  wg.Wait() at handler level blocks until every instrument finishes.
+end note
 
-:All instruments processed — maintenance cycle complete;
+:wg.Wait() — all instrument goroutines complete — maintenance cycle done;
 stop
 
 @enduml

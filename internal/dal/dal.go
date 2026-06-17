@@ -68,27 +68,32 @@ func (d *DAL) WithAdvisoryLock(ctx context.Context, key int64, fn func() error) 
 	return true, fn()
 }
 
-// QueryMissingTimestamps returns all timestamps in [minTS, maxTS] at the given
-// interval that have no corresponding non-deleted row in ingestion.states for
-// the given instrument and job type.
+// QueryMissingTimestamps returns up to limit timestamps in (afterTS, maxTS] at
+// the given interval that have no corresponding non-deleted row in
+// ingestion.states for the given instrument and job type.
+//
+// afterTS is a cursor: pass minTS.Add(-interval) on the first call so that
+// minTS itself is included; on subsequent calls pass the last timestamp
+// returned by the previous batch. Returns fewer than limit items (possibly
+// zero) when no further gaps exist — that signals the end of the scan.
 //
 // The set-difference is computed entirely in PostgreSQL via generate_series +
 // NOT EXISTS, using the unique index on (instrument_id, timestamp, job_type).
-// Only the missing timestamps are transferred to Go — typically zero rows on the
-// happy path, avoiding O(N) memory allocation for the full existing-row set.
-func (d *DAL) QueryMissingTimestamps(ctx context.Context, instID uuid.UUID, jobType string, minTS, maxTS time.Time, interval time.Duration) ([]time.Time, error) {
+func (d *DAL) QueryMissingTimestamps(ctx context.Context, instID uuid.UUID, jobType string, minTS, maxTS time.Time, interval time.Duration, afterTS time.Time, limit int) ([]time.Time, error) {
 	rows, err := d.sqlDB.QueryContext(ctx, `
 		SELECT ts
 		FROM generate_series($1::timestamptz, $2::timestamptz, $3::interval) AS ts
-		WHERE NOT EXISTS (
+		WHERE ts > $4
+		  AND NOT EXISTS (
 			SELECT 1 FROM ingestion.states
-			WHERE instrument_id = $4
-			  AND job_type      = $5::ingestion.job_type_enum
+			WHERE instrument_id = $5
+			  AND job_type      = $6::ingestion.job_type_enum
 			  AND timestamp     = ts
 			  AND is_deleted    = false
-		)
+		  )
 		ORDER BY ts
-	`, minTS, maxTS, fmt.Sprintf("%d seconds", int(interval.Seconds())), instID, jobType)
+		LIMIT $7
+	`, minTS, maxTS, fmt.Sprintf("%d seconds", int(interval.Seconds())), afterTS, instID, jobType, limit)
 	if err != nil {
 		return nil, err
 	}
