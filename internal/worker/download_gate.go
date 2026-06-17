@@ -2,9 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
+	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
 )
 
 // DownloadStatus is the typed outcome of a Dukascopy BI5 download request.
@@ -182,13 +185,26 @@ func doDownload(ctx context.Context, row *ent.State) DownloadResult {
 	}
 	switch {
 	case isNotFoundError(err):
-		log.Printf("ticks/download: NOT_FOUND instrument=%s ts=%s", inst, ts)
+		log.Printf("ticks/download: NOT_FOUND HTTP 404 instrument=%s ts=%s", inst, ts)
 		return DownloadResult{Status: DownloadNotFound, Err: err}
 	case isRateLimitedError(err):
-		log.Printf("ticks/download: RATE_LIMITED instrument=%s ts=%s", inst, ts)
+		log.Printf("ticks/download: RATE_LIMITED HTTP 429 instrument=%s ts=%s", inst, ts)
 		return DownloadResult{Status: DownloadRateLimited, Err: err}
 	default:
-		log.Printf("ticks/download: ERROR instrument=%s ts=%s err=%v", inst, ts, err)
+		var httpErr *dukascopy.HTTPError
+		if errors.As(err, &httpErr) {
+			log.Printf("ticks/download: ERROR %s instrument=%s ts=%s err=%v",
+				httpClass(httpErr.StatusCode), inst, ts, err)
+		} else {
+			// Network error, timeout, or context cancellation — no HTTP status code.
+			log.Printf("ticks/download: ERROR instrument=%s ts=%s err=%v", inst, ts, err)
+		}
 		return DownloadResult{Status: DownloadError, Err: err}
 	}
+}
+
+// httpClass returns the HTTP status code class label for log output.
+// e.g. 503 → "HTTP 503 (5xx)", 403 → "HTTP 403 (4xx)", 301 → "HTTP 301 (3xx)".
+func httpClass(code int) string {
+	return fmt.Sprintf("HTTP %d (%dxx)", code, code/100)
 }

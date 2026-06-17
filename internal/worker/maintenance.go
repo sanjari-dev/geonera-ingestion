@@ -187,8 +187,6 @@ func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (boo
 func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/bootstrap")
 
-	log.Printf("maintenance bootstrap %s: seeding from %s", inst.Name, inst.StartDate.UTC().Format(time.RFC3339))
-
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
 		return e
@@ -196,6 +194,10 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		log.Printf("maintenance bootstrap %s: set IsPause=true: %v", inst.Name, err)
 		return
 	}
+
+	// Log after IsPause is committed — if the DB write above fails and is retried
+	// on the next maintenance cycle, this line will not appear twice in the logs.
+	log.Printf("maintenance bootstrap %s: seeding from %s", inst.Name, inst.StartDate.UTC().Format(time.RFC3339))
 
 	now := time.Now().UTC()
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {

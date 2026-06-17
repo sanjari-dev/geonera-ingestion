@@ -20,6 +20,19 @@ var ErrNotFound = errors.New("dukascopy: 404 not found")
 // ErrTooManyRequests is returned when Dukascopy responds with HTTP 429.
 var ErrTooManyRequests = errors.New("dukascopy: 429 too many requests")
 
+// HTTPError is returned for any HTTP response whose status code is not
+// handled by a named sentinel (i.e. not 200, 404, or 429).
+// It carries the raw status code so callers can log or route by code class
+// (3xx redirect, 4xx client error, 5xx server error) without string-parsing.
+type HTTPError struct {
+	StatusCode int
+	URL        string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("dukascopy: HTTP %d %s url=%s", e.StatusCode, http.StatusText(e.StatusCode), e.URL)
+}
+
 const baseURL = "https://datafeed.dukascopy.com/datafeed/"
 
 // Client fetches BI5 tick files from Dukascopy's public data feed.
@@ -88,6 +101,6 @@ func (c *Client) FetchBI5(ctx context.Context, instrument string, ts time.Time) 
 	case http.StatusTooManyRequests:
 		return nil, ErrTooManyRequests
 	default:
-		return nil, fmt.Errorf("dukascopy: status %d for %s", resp.StatusCode, url)
+		return nil, &HTTPError{StatusCode: resp.StatusCode, URL: url}
 	}
 }
