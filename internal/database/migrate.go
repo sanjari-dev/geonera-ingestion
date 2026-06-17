@@ -100,7 +100,7 @@ func RunMigrations(ctx context.Context) error {
 		CREATE SCHEMA IF NOT EXISTS internal;
 		CREATE TABLE IF NOT EXISTS internal.schema_migrations (
 			version    INT         NOT NULL,
-			desc       TEXT        NOT NULL,
+			"desc"     TEXT        NOT NULL,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			CONSTRAINT schema_migrations_pkey PRIMARY KEY (version)
 		)
@@ -130,7 +130,7 @@ func RunMigrations(ctx context.Context) error {
 		}
 		if schemaExists {
 			if _, err := db.ExecContext(ctx, `
-				INSERT INTO internal.schema_migrations (version, desc)
+				INSERT INTO internal.schema_migrations (version, "desc")
 				VALUES (1, 'baseline — schema existed before migration tracking was introduced')
 				ON CONFLICT DO NOTHING
 			`); err != nil {
@@ -187,7 +187,7 @@ func applyMigration(ctx context.Context, db *sql.DB, m schemaMigration) error {
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO internal.schema_migrations (version, desc) VALUES ($1, $2)`,
+		`INSERT INTO internal.schema_migrations (version, "desc") VALUES ($1, $2)`,
 		m.version, m.desc,
 	); err != nil {
 		return fmt.Errorf("record migration: %w", err)
