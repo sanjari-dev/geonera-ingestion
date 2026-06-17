@@ -159,12 +159,12 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 		).
 			WithInstrument(). // needed by the ETL / validation / recheck pipelines
 			Order(orderStateStatuses(
-				state.StatusPENDING,
-				state.StatusPROCESSED,
-				state.StatusFAILED,
-				state.StatusBROKEN,
 				state.StatusCOMPLETED,
 				state.StatusNOT_FOUND,
+				state.StatusBROKEN,
+				state.StatusFAILED,
+				state.StatusPROCESSED,
+				state.StatusPENDING,
 				// ABANDONED is intentionally omitted — the ELSE clause places it last.
 			)).
 			Order(state.ByTimestamp()).
