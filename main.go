@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"os"
-
-	"database/sql"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -20,7 +20,6 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/mq"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/runtimecollector"
-	"github.com/sanjari-dev/geonera-ingestion/internal/seed"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
 )
 
@@ -65,14 +64,9 @@ func main() {
 	// ── Wire external clients into worker package ─────────────────────────────
 	worker.InitClients(r2Client, dukClient)
 
-	// ── Database: ensure schema is initialized ────────────────────────────────
-	if err := database.EnsureSchema(ctx); err != nil {
+	// ── Database: run pending schema migrations ───────────────────────────────
+	if err := database.RunMigrations(ctx); err != nil {
 		log.Fatalf("database migrate: %v", err)
-	}
-
-	// ── Database: ensure activity log table exists ────────────────────────────
-	if err := database.EnsureActivityLogTable(ctx); err != nil {
-		log.Fatalf("activity log migrate: %v", err)
 	}
 
 	// ── Activity Logger ───────────────────────────────────────────────────────
@@ -82,15 +76,11 @@ func main() {
 		log.Fatalf("activity log db: %v", err)
 	}
 	defer func() { _ = logDB.Close() }()
+	logDB.SetMaxIdleConns(3)
+	logDB.SetConnMaxLifetime(30 * time.Minute)
 	activityLogger := activitylog.New(logDB)
 	activityLogger.CloseOrphans(ctx)
 	worker.InitActivityLogger(activityLogger)
-
-	// ── Seed: timeframes ──────────────────────────────────────────────────────
-	if err := seed.Timeframes(ctx, dbClient); err != nil {
-		log.Fatalf("seed timeframes: %v", err)
-	}
-	log.Print("timeframe seed complete")
 
 	// ── RabbitMQ ──────────────────────────────────────────────────────────────
 	mqClient, err := mq.NewClient()

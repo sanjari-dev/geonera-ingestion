@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
 	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
@@ -30,7 +31,7 @@ func NewEntClient(ctx context.Context) (*ent.Client, *sql.DB, error) {
 
 // openEnt opens an ent.Client for the given DSN without pinging (caller already pinged).
 // It returns both the ent.Client and the underlying *sql.DB so callers that need
-// raw connection access (e.g. advisory locks) do not have to reach through ent internals.
+// raw connection access (e.g., advisory locks) do not have to reach through ent internals.
 func openEnt(dsn string) (_ *ent.Client, _ *sql.DB, err error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -43,6 +44,14 @@ func openEnt(dsn string) (_ *ent.Client, _ *sql.DB, err error) {
 			_ = db.Close()
 		}
 	}()
+
+	// Keep enough idle connections to serve concurrent workers without
+	// connection churn. Peak usage: ~12 download workers + ~20 advisory
+	// lock sessions + a few regular pipeline transactions ≈ 40 concurrent.
+	// MaxIdleConns=15 covers the download workers; advisory locks use
+	// dedicated Conn() calls so they are less affected by idle pool size.
+	db.SetMaxIdleConns(15)
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	return ent.NewClient(ent.Driver(entsql.OpenDB(dialect.Postgres, db))), db, nil
 }

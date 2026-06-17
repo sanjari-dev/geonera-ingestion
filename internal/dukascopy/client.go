@@ -40,11 +40,13 @@ type Client struct {
 	http *http.Client
 }
 
-// NewClient returns a Dukascopy Client with a 30-second per-request timeout.
+// NewClient returns a Dukascopy Client with a 5-second per-request timeout.
+// BI5 files are small (typically 10–200 KB); a slow response signals a server
+// problem, not a large payload — fail fast and let the retry pipeline handle it.
 func NewClient() *Client {
 	return &Client{
 		http: &http.Client{
-			Timeout:   30 * time.Second,
+			Timeout:   5 * time.Second,
 			Transport: http.DefaultTransport,
 		},
 	}
