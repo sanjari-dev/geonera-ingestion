@@ -2,8 +2,9 @@ package worker
 
 import (
 	"errors"
-	"log"
 	"os"
+
+	"github.com/sirupsen/logrus"
 	"strconv"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
@@ -45,11 +46,11 @@ func initBackfillConfig() {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
-		log.Printf("worker: invalid BACKFILL_CLAIM_LIMIT=%q (must be a positive integer) — using default %d", v, backfillMasterClaimLimit)
+		logrus.Warnf("worker: invalid BACKFILL_CLAIM_LIMIT=%q (must be a positive integer) — using default %d", v, backfillMasterClaimLimit)
 		return
 	}
 	backfillMasterClaimLimit = n
-	log.Printf("worker: backfill claim limit set to %d (from BACKFILL_CLAIM_LIMIT)", n)
+	logrus.Infof("worker: backfill claim limit set to %d (from BACKFILL_CLAIM_LIMIT)", n)
 }
 
 // InitActivityLogger wires up the activity log logger so that RunMaintenanceHandler

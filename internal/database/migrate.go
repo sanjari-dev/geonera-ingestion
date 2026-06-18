@@ -4,8 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
+
+	"github.com/sirupsen/logrus"
 )
 
 // schemaMigration describes a single, ordered schema change.
@@ -136,7 +137,7 @@ func RunMigrations(ctx context.Context) error {
 			`); err != nil {
 				return fmt.Errorf("baseline migration 1: %w", err)
 			}
-			log.Println("database: existing schema detected — baseline at migration v1")
+			logrus.Info("database: existing schema detected — baseline at migration v1")
 		}
 	}
 
@@ -165,7 +166,7 @@ func RunMigrations(ctx context.Context) error {
 	}
 
 	if pending == 0 {
-		log.Println("database: schema up to date")
+		logrus.Info("database: schema up to date")
 	}
 	return nil
 }
@@ -197,6 +198,6 @@ func applyMigration(ctx context.Context, db *sql.DB, m schemaMigration) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	log.Printf("database: migration v%d applied — %s", m.version, m.desc)
+	logrus.Infof("database: migration v%d applied — %s", m.version, m.desc)
 	return nil
 }

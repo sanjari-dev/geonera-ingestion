@@ -2,9 +2,10 @@ package mq
 
 import (
 	"context"
-	"log"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -113,10 +114,10 @@ func consumeLoop(c *Client, queue string, handler func(ctx context.Context, onSt
 	for {
 		err := runConsumer(c, queue, handler, logger, onComplete)
 		if err != nil {
-			log.Printf("mq: consumer %q error: %v — retrying in %s", queue, err, backoff)
+			logrus.WithError(err).Errorf("mq: consumer %q error — retrying in %s", queue, backoff)
 		} else {
 			// Channel closed cleanly (broker-side shutdown); reset back-off.
-			log.Printf("mq: consumer %q channel closed — reconnecting", queue)
+			logrus.Infof("mq: consumer %q channel closed — reconnecting", queue)
 			backoff = time.Second
 		}
 		time.Sleep(backoff)
@@ -162,7 +163,7 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 	// Watch for channel-level errors (e.g., broker-forced close) alongside messages.
 	chClose := ch.NotifyClose(make(chan *amqp.Error, 1))
 
-	log.Printf("mq: consumer %q ready", queue)
+	logrus.Infof("mq: consumer %q ready", queue)
 	for {
 		select {
 		case msg, ok := <-msgs:

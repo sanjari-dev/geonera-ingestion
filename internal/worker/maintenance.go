@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 	"sync"
 	"time"
 
@@ -76,7 +77,7 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 	if onStarted != nil {
 		onStarted()
 	}
-	log.Printf("maintenance: running!")
+	logrus.Info("maintenance: running!")
 
 	if actLogger != nil {
 		actLogger.Purge(ctx)
@@ -88,11 +89,11 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 		instruments, e = tx.Instrument.Query().All(ctx)
 		return e
 	}); err != nil {
-		log.Printf("maintenance: query instruments: %v", err)
+		logrus.WithError(err).Error("maintenance: query instruments")
 		return true
 	}
 
-	log.Printf("maintenance: %d instrument(s) to process (parallel, limit %d)", len(instruments), maintenanceParallelLimit)
+	logrus.Infof("maintenance: %d instrument(s) to process (parallel, limit %d)", len(instruments), maintenanceParallelLimit)
 
 	sem := make(chan struct{}, maintenanceParallelLimit)
 	var wg sync.WaitGroup
@@ -111,7 +112,7 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 	}
 	wg.Wait()
 
-	log.Printf("maintenance: complete")
+	logrus.Info("maintenance: complete")
 	return true
 }
 
@@ -133,12 +134,12 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 	locked, err := d.WithAdvisoryLock(ctx, instrumentLockKey(inst.ID), func() error {
 		empty, err := isStatesEmpty(ctx, d, inst.ID)
 		if err != nil {
-			log.Printf("maintenance %s: check empty: %v", inst.Name, err)
+			logrus.WithError(err).Errorf("maintenance %s: check empty", inst.Name)
 			return nil
 		}
 
 		if empty {
-			log.Printf("maintenance %s: starting Group 1 (bootstrap)", inst.Name)
+			logrus.Infof("maintenance %s: starting Group 1 (bootstrap)", inst.Name)
 			runBootstrap(ctx, d, inst)
 			return nil
 		}
@@ -150,7 +151,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		// leave IsPause untouched for this cycle.
 		// managePauseFlag is called after wg.Wait() so it sees the final
 		// state of all four phases before deciding the correct IsPause value.
-		log.Printf("maintenance %s: starting Group 2 (A+B+C+D)", inst.Name)
+		logrus.Infof("maintenance %s: starting Group 2 (A+B+C+D)", inst.Name)
 
 		var pauseOnce sync.Once
 		setPause := func() {
@@ -159,7 +160,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 					_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
 					return e
 				}); err != nil {
-					log.Printf("maintenance %s Group 2: set IsPause=true: %v", inst.Name, err)
+					logrus.WithError(err).Errorf("maintenance %s Group 2: set IsPause=true", inst.Name)
 				}
 			})
 		}
@@ -173,15 +174,15 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		wg.Wait()
 
 		managePauseFlag(ctx, d, inst)
-		log.Printf("maintenance %s: Group 2 complete", inst.Name)
+		logrus.Infof("maintenance %s: Group 2 complete", inst.Name)
 		return nil
 	})
 	if err != nil {
-		log.Printf("maintenance %s: advisory lock: %v", inst.Name, err)
+		logrus.WithError(err).Errorf("maintenance %s: advisory lock", inst.Name)
 		return
 	}
 	if !locked {
-		log.Printf("maintenance %s: skipped — lock held by concurrent worker", inst.Name)
+		logrus.Infof("maintenance %s: skipped — lock held by concurrent worker", inst.Name)
 	}
 }
 
@@ -214,13 +215,13 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("maintenance bootstrap %s: set IsPause=true: %v", inst.Name, err)
+		logrus.WithError(err).Errorf("maintenance bootstrap %s: set IsPause=true", inst.Name)
 		return
 	}
 
 	// Log after IsPause is committed — if the DB write above fails and is retried
 	// on the next maintenance cycle, this line will not appear twice in the logs.
-	log.Printf("maintenance bootstrap %s: seeding from %s", inst.Name, inst.StartDate.UTC().Format(time.RFC3339))
+	logrus.Infof("maintenance bootstrap %s: seeding from %s", inst.Name, inst.StartDate.UTC().Format(time.RFC3339))
 
 	now := time.Now().UTC()
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
@@ -235,7 +236,7 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := startNorm; !ts.After(nowNorm); ts = ts.Add(interval) {
 			candidates = append(candidates, ts)
 		}
-		log.Printf("maintenance bootstrap %s: seeding %d %s slots", inst.Name, len(candidates), jobType)
+		logrus.Infof("maintenance bootstrap %s: seeding %d %s slots", inst.Name, len(candidates), jobType)
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("bootstrap %s", inst.Name))
 	}
 
@@ -243,10 +244,10 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(false).Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("maintenance bootstrap %s: set IsPause=false: %v", inst.Name, err)
+		logrus.WithError(err).Errorf("maintenance bootstrap %s: set IsPause=false", inst.Name)
 		return
 	}
-	log.Printf("maintenance bootstrap %s: complete", inst.Name)
+	logrus.Infof("maintenance bootstrap %s: complete", inst.Name)
 }
 
 // ── GROUP 2A — FORWARD SEEDING ────────────────────────────────────────────────
@@ -265,7 +266,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, se
 
 		maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
 		if err != nil {
-			log.Printf("forward seeding %s %s: query max: %v", inst.Name, jobType, err)
+			logrus.WithError(err).Errorf("forward seeding %s %s: query max", inst.Name, jobType)
 			continue
 		}
 		if maxTS.IsZero() {
@@ -285,7 +286,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, se
 			continue
 		}
 		setPause()
-		log.Printf("forward seeding %s %s: inserting %d new rows", inst.Name, jobType, len(candidates))
+		logrus.Infof("forward seeding %s %s: inserting %d new rows", inst.Name, jobType, len(candidates))
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("forward-seeding %s %s", inst.Name, jobType))
 	}
 }
@@ -311,7 +312,7 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, s
 
 		minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
 		if err != nil {
-			log.Printf("backward gap fill %s %s: query min: %v", inst.Name, jobType, err)
+			logrus.WithError(err).Errorf("backward gap fill %s %s: query min", inst.Name, jobType)
 			continue
 		}
 
@@ -327,7 +328,7 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, s
 			continue
 		}
 		setPause()
-		log.Printf("backward gap fill %s %s: filling %d rows toward StartDate", inst.Name, jobType, len(candidates))
+		logrus.Infof("backward gap fill %s %s: filling %d rows toward StartDate", inst.Name, jobType, len(candidates))
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("backward-gap-fill %s %s", inst.Name, jobType))
 	}
 }
@@ -344,7 +345,7 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, s
 func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, state.JobTypeTICK)
 	if err != nil {
-		log.Printf("manage pause %s: query min tick: %v", inst.Name, err)
+		logrus.WithError(err).Errorf("manage pause %s: query min tick", inst.Name)
 		return
 	}
 	if minTS.IsZero() {
@@ -358,9 +359,9 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(shouldPause).Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("manage pause %s: set IsPause=%v: %v", inst.Name, shouldPause, err)
+		logrus.WithError(err).Errorf("manage pause %s: set IsPause=%v", inst.Name, shouldPause)
 	} else {
-		log.Printf("manage pause %s: IsPause=%v (MIN=%s StartDate=%s)",
+		logrus.Infof("manage pause %s: IsPause=%v (MIN=%s StartDate=%s)",
 			inst.Name, shouldPause,
 			minTS.Format(time.RFC3339),
 			normalizeTS(inst.StartDate.UTC(), state.JobTypeTICK).Format(time.RFC3339),
@@ -390,7 +391,7 @@ func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause 
 			Exist(ctx)
 		return e
 	}); err != nil {
-		log.Printf("pruning %s: check: %v", inst.Name, err)
+		logrus.WithError(err).Errorf("pruning %s: check", inst.Name)
 		return
 	}
 	if !hasWork {
@@ -433,7 +434,7 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 				SetUpdatedAt(time.Now().UTC()).
 				Exec(ctx)
 		}); err != nil {
-			log.Printf("pruning phase1 mark %s: %v", inst.Name, err)
+			logrus.WithError(err).Errorf("pruning phase1 mark %s", inst.Name)
 			break
 		}
 		totalMarked += batchLen
@@ -442,7 +443,7 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 		}
 	}
 	if totalMarked > 0 {
-		log.Printf("pruning phase1 %s: marked %d rows as soft-deleted", inst.Name, totalMarked)
+		logrus.Infof("pruning phase1 %s: marked %d rows as soft-deleted", inst.Name, totalMarked)
 	}
 }
 
@@ -470,7 +471,7 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			All(ctx)
 		return e
 	}); err != nil {
-		log.Printf("pruning phase2 %s: query IsDeleted rows: %v", inst.Name, err)
+		logrus.WithError(err).Errorf("pruning phase2 %s: query IsDeleted rows", inst.Name)
 		return
 	}
 	if len(allRows) == 0 {
@@ -490,15 +491,15 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			r2Err = deleteCandleParquetFromR2(ctx, row)
 		}
 		if r2Err != nil && !isR2NotFound(r2Err) {
-			log.Printf("pruning phase2 %s: R2 delete %s (%s): %v (will retry next cycle)",
-				inst.Name, row.ID, row.JobType, r2Err)
+			logrus.WithError(r2Err).Errorf("pruning phase2 %s: R2 delete %s (%s) — will retry next cycle",
+				inst.Name, row.ID, row.JobType)
 		} else {
 			succeeded = append(succeeded, row.ID)
 		}
 	}
 
 	failed := len(allRows) - len(succeeded)
-	log.Printf("pruning phase2 %s: swept %d rows — succeeded=%d failed=%d",
+	logrus.Infof("pruning phase2 %s: swept %d rows — succeeded=%d failed=%d",
 		inst.Name, len(allRows), len(succeeded), failed)
 
 	// ── Phase 3: DB Hard Delete (succeeded group only) ───────────────────────
@@ -517,12 +518,12 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			_, e := tx.State.Delete().Where(state.IDIn(chunk...)).Exec(ctx)
 			return e
 		}); err != nil {
-			log.Printf("pruning phase3 %s: hard-delete: %v", inst.Name, err)
+			logrus.WithError(err).Errorf("pruning phase3 %s: hard-delete", inst.Name)
 		} else {
 			totalDeleted += len(chunk)
 		}
 	}
-	log.Printf("pruning phase3 %s: hard-deleted %d rows", inst.Name, totalDeleted)
+	logrus.Infof("pruning phase3 %s: hard-deleted %d rows", inst.Name, totalDeleted)
 }
 
 // ── GROUP 2D — CONSISTENCY CHECK ─────────────────────────────────────────────
@@ -546,7 +547,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
 	if err != nil {
-		log.Printf("consistency check %s %s: query min: %v", inst.Name, jobType, err)
+		logrus.WithError(err).Errorf("consistency check %s %s: query min", inst.Name, jobType)
 		return
 	}
 	if minTS.IsZero() {
@@ -554,7 +555,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	}
 	maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
 	if err != nil {
-		log.Printf("consistency check %s %s: query max: %v", inst.Name, jobType, err)
+		logrus.WithError(err).Errorf("consistency check %s %s: query max", inst.Name, jobType)
 		return
 	}
 
@@ -574,7 +575,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 			Count(ctx)
 		return e
 	}); err != nil {
-		log.Printf("consistency check %s %s: count actual: %v", inst.Name, jobType, err)
+		logrus.WithError(err).Errorf("consistency check %s %s: count actual", inst.Name, jobType)
 		return
 	}
 
@@ -583,7 +584,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	}
 
 	setPause()
-	log.Printf("consistency check %s %s: expected=%d actual=%d — %d missing, filling in batches of %d",
+	logrus.Infof("consistency check %s %s: expected=%d actual=%d — %d missing, filling in batches of %d",
 		inst.Name, jobType, expected, actual, expected-actual, consistencyBatchSize)
 
 	// Cursor-based scan: afterTS starts one step before minTS so the first
@@ -595,7 +596,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	for ctx.Err() == nil {
 		missing, err := d.QueryMissingTimestamps(ctx, inst.ID, string(jobType), minTS, maxTS, interval, cursor, consistencyBatchSize)
 		if err != nil {
-			log.Printf("consistency check %s %s: query missing: %v", inst.Name, jobType, err)
+			logrus.WithError(err).Errorf("consistency check %s %s: query missing", inst.Name, jobType)
 			return
 		}
 		if len(missing) == 0 {
@@ -646,7 +647,7 @@ func insertBatched(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobT
 			}
 			return nil
 		}); err != nil {
-			log.Printf("maintenance %s: insert: %v", phase, err)
+			logrus.WithError(err).Errorf("maintenance %s: insert", phase)
 		}
 	}
 }

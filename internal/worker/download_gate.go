@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
@@ -71,10 +72,10 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	// return immediately without consuming a rate-gate token.
 	select {
 	case queue <- req:
-		log.Printf("ticks/download: queued instrument=%s ts=%s queue=%s",
+		logrus.Infof("ticks/download: queued instrument=%s ts=%s queue=%s",
 			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), queueName)
 	case <-ctx.Done():
-		log.Printf("ticks/download: enqueue canceled instrument=%s ts=%s queue=%s err=%v",
+		logrus.Warnf("ticks/download: enqueue canceled instrument=%s ts=%s queue=%s err=%v",
 			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), queueName, ctx.Err())
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
@@ -85,7 +86,7 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	case result := <-resultCh:
 		return result
 	case <-ctx.Done():
-		log.Printf("ticks/download: wait canceled instrument=%s ts=%s err=%v",
+		logrus.Warnf("ticks/download: wait canceled instrument=%s ts=%s err=%v",
 			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), ctx.Err())
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
@@ -100,7 +101,7 @@ func startDownloadWorkers() {
 	for i := 0; i < dukascopyBurst; i++ {
 		go runDownloadWorker()
 	}
-	log.Printf("worker: %d download workers started (max %d req/s, backfill queue cap %d, regular queue prioritised over backfill)", dukascopyBurst, dukascopyMaxRPS, backfillMasterClaimLimit)
+	logrus.Infof("worker: %d download workers started (max %d req/s, backfill queue cap %d, regular queue prioritised over backfill)", dukascopyBurst, dukascopyMaxRPS, backfillMasterClaimLimit)
 }
 
 // runDownloadWorker is the body of each download worker goroutine.
@@ -144,7 +145,7 @@ func processDownloadRequest(req downloadRequest) {
 	// Discard already-canceled requests so they don't consume rate tokens.
 	select {
 	case <-req.ctx.Done():
-		log.Printf("ticks/download: discard pre-rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
+		logrus.Warnf("ticks/download: discard pre-rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	default:
@@ -154,9 +155,9 @@ func processDownloadRequest(req downloadRequest) {
 	// Caps global throughput at dukascopyMaxRPS req/s.
 	select {
 	case <-tickDownloadRateGate:
-		log.Printf("ticks/download: rate-gate acquired instrument=%s ts=%s", inst, ts)
+		logrus.Infof("ticks/download: rate-gate acquired instrument=%s ts=%s", inst, ts)
 	case <-req.ctx.Done():
-		log.Printf("ticks/download: discard at rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
+		logrus.Warnf("ticks/download: discard at rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	}
@@ -168,7 +169,7 @@ func processDownloadRequest(req downloadRequest) {
 	select {
 	case req.resultCh <- result:
 	case <-req.ctx.Done():
-		log.Printf("ticks/download: result discarded caller-canceled instrument=%s ts=%s", inst, ts)
+		logrus.Warnf("ticks/download: result discarded caller-canceled instrument=%s ts=%s", inst, ts)
 	}
 }
 
@@ -178,28 +179,28 @@ func doDownload(ctx context.Context, row *ent.State) DownloadResult {
 	inst := instrName(row)
 	ts := row.Timestamp.Format("2006-01-02T15:04Z")
 	start := time.Now()
-	log.Printf("ticks/download: fetching instrument=%s ts=%s", inst, ts)
+	logrus.Infof("ticks/download: fetching instrument=%s ts=%s", inst, ts)
 
 	data, err := downloadBI5(ctx, row)
 	if err == nil {
-		log.Printf("ticks/download: OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(data), time.Since(start).Round(time.Millisecond))
+		logrus.Infof("ticks/download: OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(data), time.Since(start).Round(time.Millisecond))
 		return DownloadResult{Status: DownloadOK, Data: data}
 	}
 	switch {
 	case isNotFoundError(err):
-		log.Printf("ticks/download: NOT_FOUND HTTP 404 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+		logrus.Infof("ticks/download: NOT_FOUND HTTP 404 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		return DownloadResult{Status: DownloadNotFound, Err: err}
 	case isRateLimitedError(err):
-		log.Printf("ticks/download: RATE_LIMITED HTTP 429 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+		logrus.Warnf("ticks/download: RATE_LIMITED HTTP 429 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		return DownloadResult{Status: DownloadRateLimited, Err: err}
 	default:
 		var httpErr *dukascopy.HTTPError
 		if errors.As(err, &httpErr) {
-			log.Printf("ticks/download: ERROR %s instrument=%s ts=%s err=%v elapsed=%s",
-				httpClass(httpErr.StatusCode), inst, ts, err, time.Since(start).Round(time.Millisecond))
+			logrus.WithError(err).Errorf("ticks/download: ERROR %s instrument=%s ts=%s elapsed=%s",
+				httpClass(httpErr.StatusCode), inst, ts, time.Since(start).Round(time.Millisecond))
 		} else {
 			// Network error, timeout, or context cancellation — no HTTP status code.
-			log.Printf("ticks/download: ERROR instrument=%s ts=%s err=%v elapsed=%s", inst, ts, err, time.Since(start).Round(time.Millisecond))
+			logrus.WithError(err).Errorf("ticks/download: ERROR instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		}
 		return DownloadResult{Status: DownloadError, Err: err}
 	}

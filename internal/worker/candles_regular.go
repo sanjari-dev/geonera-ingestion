@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sort"
+
+	"github.com/sirupsen/logrus"
 	"sync"
 	"time"
 
@@ -57,7 +58,7 @@ func seedTodayCandleRows(ctx context.Context, d *dal.DAL) {
 			All(ctx)
 		return e
 	}); err != nil {
-		log.Printf("candle seed: list instruments: %v", err)
+		logrus.WithError(err).Error("candle seed: list instruments")
 		return
 	}
 
@@ -90,7 +91,7 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, t
 			time.Now().UTC(),
 		)
 	}); err != nil {
-		log.Printf("candle seed %s %s: %v", instrumentID, today.Format(time.DateOnly), err)
+		logrus.WithError(err).Errorf("candle seed %s %s", instrumentID, today.Format(time.DateOnly))
 	}
 }
 
@@ -115,12 +116,12 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("candle aggregation claim: %v", err)
+			logrus.WithError(err).Error("candle aggregation claim")
 			break
 		}
 
 		count++
-		log.Printf("candle agg: claimed instrument=%s date=%s row_id=%s",
+		logrus.Infof("candle agg: claimed instrument=%s date=%s row_id=%s",
 			instrName(claimed), claimed.Timestamp.Format(time.DateOnly), claimed.ID)
 
 		loopWg.Add(1)
@@ -131,7 +132,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 		}(claimed)
 	}
 	loopWg.Wait()
-	log.Printf("candle agg: loop complete rows=%d", count)
+	logrus.Infof("candle agg: loop complete rows=%d", count)
 }
 
 // ── Aggregation pipeline ──────────────────────────────────────────────────────
@@ -155,9 +156,9 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	instrName := row.Edges.Instrument.Name
 	dayStart := row.Timestamp.UTC() // CANDLE timestamp is already 00:00:00 UTC
 	start := time.Now()
-	log.Printf("candle agg: start instrument=%s date=%s row_id=%s", instrName, dayStart.Format(time.DateOnly), row.ID)
+	logrus.Infof("candle agg: start instrument=%s date=%s row_id=%s", instrName, dayStart.Format(time.DateOnly), row.ID)
 	defer func() {
-		log.Printf("candle agg: done instrument=%s date=%s elapsed=%s", instrName, dayStart.Format(time.DateOnly), time.Since(start).Round(time.Millisecond))
+		logrus.Infof("candle agg: done instrument=%s date=%s elapsed=%s", instrName, dayStart.Format(time.DateOnly), time.Since(start).Round(time.Millisecond))
 	}()
 
 	// Step 1 — Query the 24 CONFIRMED TICK rows for this instrument and day.
@@ -179,7 +180,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 			All(ctx)
 		return e
 	}); err != nil {
-		log.Printf("candle agg %s: query tick states: %v", row.ID, err)
+		logrus.WithError(err).Errorf("candle agg %s: query tick states", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "query tick states failed")
 		return
 	}
@@ -207,17 +208,17 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 					continue
 				}
 				// BROKEN Storage: file should exist but doesn't.
-				log.Printf("candle agg %s: NoSuchKey for tick %s (not deleted)", row.ID, tickState.ID)
+				logrus.Infof("candle agg %s: NoSuchKey for tick %s (not deleted)", row.ID, tickState.ID)
 				broken = true
 				break
 			}
-			log.Printf("candle agg %s: read tick parquet %s: %v", row.ID, tickState.ID, err)
+			logrus.WithError(err).Errorf("candle agg %s: read tick parquet %s", row.ID, tickState.ID)
 			updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "read tick parquet failed")
 			return
 		}
 
 		if err := acc.AccumulateTickParquet(data); err != nil {
-			log.Printf("candle agg %s: accumulate tick %s: %v", row.ID, tickState.ID, err)
+			logrus.WithError(err).Errorf("candle agg %s: accumulate tick %s", row.ID, tickState.ID)
 			updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "accumulate tick parquet failed")
 			return
 		}
@@ -231,14 +232,14 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	// Step 3 — Build the daily Candles Parquet (all 19 timeframes).
 	candleData, err := buildCandleParquet(ctx, row, acc)
 	if err != nil {
-		log.Printf("candle agg %s: build candle parquet: %v", row.ID, err)
+		logrus.WithError(err).Errorf("candle agg %s: build candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "build candle parquet failed")
 		return
 	}
 
 	// Step 4a — Upload to R2.
 	if err := uploadCandleParquetToR2(ctx, row, candleData); err != nil {
-		log.Printf("candle agg %s: upload candle parquet: %v", row.ID, err)
+		logrus.WithError(err).Errorf("candle agg %s: upload candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload candle parquet failed")
 		return
 	}
@@ -247,13 +248,13 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	// Step 4b — Read back and validate.
 	stored, err := readCandleParquetFromR2(ctx, row)
 	if err != nil {
-		log.Printf("candle agg %s: read back candle parquet: %v", row.ID, err)
+		logrus.WithError(err).Errorf("candle agg %s: read back candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "read-back candle parquet failed")
 		return
 	}
 
 	if err := validateCandleParquet(ctx, row, stored); err != nil {
-		log.Printf("candle agg %s: validate candle parquet: %v", row.ID, err)
+		logrus.WithError(err).Errorf("candle agg %s: validate candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "validate candle parquet failed")
 		return
 	}

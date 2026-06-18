@@ -3,8 +3,9 @@ package worker
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
+
+	"github.com/sirupsen/logrus"
 	"time"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
@@ -20,12 +21,12 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T0")
 
 	target := time.Now().UTC().Truncate(time.Hour)
-	log.Printf("ticks/T0: start target=%s", target.Format(time.RFC3339))
+	logrus.Infof("ticks/T0: start target=%s", target.Format(time.RFC3339))
 
 	ensureT0TickTasks(ctx, d, target)
 	runIngestionLoop(ctx, d, &target)
 
-	log.Printf("ticks/T0: done target=%s", target.Format(time.RFC3339))
+	logrus.Infof("ticks/T0: done target=%s", target.Format(time.RFC3339))
 }
 
 // ensureT0TickTasks inserts a PENDING TICK row at target for every instrument
@@ -43,7 +44,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 		if err != nil {
 			return fmt.Errorf("query instruments: %w", err)
 		}
-		log.Printf("ticks/T0: seeding PENDING task(s) for %d instrument(s) at %s", len(instruments), target.Format(time.RFC3339))
+		logrus.Infof("ticks/T0: seeding PENDING task(s) for %d instrument(s) at %s", len(instruments), target.Format(time.RFC3339))
 		insertedAt := time.Now().UTC()
 		for _, inst := range instruments {
 			if err := insertStatePendingOnConflictDoNothing(ctx, tx, inst.ID, state.JobTypeTICK, target, insertedAt); err != nil {
@@ -52,7 +53,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 		}
 		return nil
 	}); err != nil {
-		log.Printf("ticks/T0: ensure tasks error target=%s err=%v", target.Format(time.RFC3339), err)
+		logrus.WithError(err).Errorf("ticks/T0: ensure tasks error target=%s", target.Format(time.RFC3339))
 	}
 }
 
@@ -63,9 +64,9 @@ func runT1Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T1")
 
 	target := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	log.Printf("ticks/T1: start target=%s", target.Format(time.RFC3339))
+	logrus.Infof("ticks/T1: start target=%s", target.Format(time.RFC3339))
 	runRecoveryLoop(ctx, d, target)
-	log.Printf("ticks/T1: done target=%s", target.Format(time.RFC3339))
+	logrus.Infof("ticks/T1: done target=%s", target.Format(time.RFC3339))
 }
 
 // ── T-2: two-hours-ago physical validation ────────────────────────────────────
@@ -75,12 +76,12 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T2")
 
 	target := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
-	log.Printf("ticks/T2: start target=%s", target.Format(time.RFC3339))
+	logrus.Infof("ticks/T2: start target=%s", target.Format(time.RFC3339))
 	// T-2 Regular: claims COMPLETED + NOT_FOUND, re-downloads BI5 for cross-validation.
 	// COMPLETED → re-download matches → CONFIRMED; NOT_FOUND → streak+1, at ≥3 → CONFIRMED.
 	// IsPause=false enforced, consistent with T-0 and T-1.
 	runValidationLoop(ctx, d, &target)
-	log.Printf("ticks/T2: done target=%s", target.Format(time.RFC3339))
+	logrus.Infof("ticks/T2: done target=%s", target.Format(time.RFC3339))
 }
 
 // runIngestionLoop claims PENDING TICK rows one at a time for the given hour
@@ -114,12 +115,12 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("ticks/T0: ingestion claim error err=%v", err)
+			logrus.WithError(err).Error("ticks/T0: ingestion claim error")
 			break
 		}
 
 		count++
-		log.Printf("ticks/T0: claimed instrument=%s ts=%s state_id=%s",
+		logrus.Infof("ticks/T0: claimed instrument=%s ts=%s state_id=%s",
 			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID)
 
 		loopWg.Add(1)
@@ -131,7 +132,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	}
 	loopWg.Wait()
 	if timestamp != nil {
-		log.Printf("ticks/T0: ingestion loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
+		logrus.Infof("ticks/T0: ingestion loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
 	}
 }
 
@@ -169,12 +170,12 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("ticks/T1: recovery claim error target=%s err=%v", target.Format(time.RFC3339), err)
+			logrus.WithError(err).Errorf("ticks/T1: recovery claim error target=%s", target.Format(time.RFC3339))
 			break
 		}
 
 		count++
-		log.Printf("ticks/T1: claimed instrument=%s ts=%s state_id=%s prev_status=%s",
+		logrus.Infof("ticks/T1: claimed instrument=%s ts=%s state_id=%s prev_status=%s",
 			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID, prevStatusStr(claimed.PreviousStatus))
 
 		prevStatus := claimed.PreviousStatus
@@ -186,7 +187,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 		}(claimed, prevStatus)
 	}
 	loopWg.Wait()
-	log.Printf("ticks/T1: recovery loop complete rows=%d target=%s", count, target.Format(time.RFC3339))
+	logrus.Infof("ticks/T1: recovery loop complete rows=%d target=%s", count, target.Format(time.RFC3339))
 }
 
 // runValidationLoop claims COMPLETED and NOT_FOUND rows for the given hour
@@ -227,12 +228,12 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			log.Printf("ticks/T2: validation claim error err=%v", err)
+			logrus.WithError(err).Error("ticks/T2: validation claim error")
 			break
 		}
 
 		count++
-		log.Printf("ticks/T2: claimed instrument=%s ts=%s state_id=%s preclaim_prev=%s",
+		logrus.Infof("ticks/T2: claimed instrument=%s ts=%s state_id=%s preclaim_prev=%s",
 			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID, prevStatusStr(preclaimPrev))
 
 		loopWg.Add(1)
@@ -244,7 +245,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	}
 	loopWg.Wait()
 	if timestamp != nil {
-		log.Printf("ticks/T2: validation loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
+		logrus.Infof("ticks/T2: validation loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
 	}
 }
 
@@ -259,17 +260,17 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 	switch *prev {
 	case state.PreviousStatusPROCESSED, state.PreviousStatusPENDING:
 		// Stuck PROCESSED or stale PENDING → reset to PENDING for the next T-0 run.
-		log.Printf("ticks/T1: zombie instrument=%s ts=%s prev_status=%s → PENDING", inst, ts, *prev)
+		logrus.Infof("ticks/T1: zombie instrument=%s ts=%s prev_status=%s → PENDING", inst, ts, *prev)
 		resetStateToPending(ctx, d, row)
 
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
 		// Increment RetryCount, decrement NotFoundStreak (floor 0), always → PENDING.
-		log.Printf("ticks/T1: retry instrument=%s ts=%s prev_status=%s retry_count=%d → PENDING", inst, ts, *prev, row.RetryCount)
+		logrus.Infof("ticks/T1: retry instrument=%s ts=%s prev_status=%s retry_count=%d → PENDING", inst, ts, *prev, row.RetryCount)
 		handleRetryReset(ctx, d, row)
 
 	case state.PreviousStatusNOT_FOUND:
 		// Re-check API: data → PENDING+streak=0; still 404 → Zero-Row+NOT_FOUND.
-		log.Printf("ticks/T1: recheck instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
+		logrus.Infof("ticks/T1: recheck instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
 		executeNotFoundRecheck(ctx, d, row, true)
 	}
 }

@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
-	"log"
 	"os"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/joho/godotenv"
+	"github.com/sirupsen/logrus"
 
 	_ "github.com/sanjari-dev/geonera-ingestion/ent/runtime"
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
@@ -17,6 +17,7 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/database"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
+	_ "github.com/sanjari-dev/geonera-ingestion/internal/logger"
 	"github.com/sanjari-dev/geonera-ingestion/internal/mq"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/runtimecollector"
@@ -26,7 +27,7 @@ import (
 func main() {
 	// Load variables from .env. If the file is absent (production), OS environment is used.
 	if err := godotenv.Load(); err != nil {
-		log.Printf("warning: .env not loaded (%v), relying on OS environment", err)
+		logrus.Warnf("warning: .env not loaded (%v), relying on OS environment", err)
 	}
 
 	ctx := context.Background()
@@ -34,11 +35,11 @@ func main() {
 	// ── Database ─────────────────────────────────────────────────────────────
 	dbClient, sqlDB, err := database.NewEntClient(ctx)
 	if err != nil {
-		log.Fatalf("database: %v", err)
+		logrus.Fatalf("database: %v", err)
 	}
 	defer func() {
 		if err := dbClient.Close(); err != nil {
-			log.Printf("database close: %v", err)
+			logrus.Errorf("database close: %v", err)
 		}
 	}()
 
@@ -55,7 +56,7 @@ func main() {
 		SecretAccessKey: os.Getenv("R2_SECRET_ACCESS_KEY"),
 	})
 	if err != nil {
-		log.Fatalf("r2 client: %v", err)
+		logrus.Fatalf("r2 client: %v", err)
 	}
 
 	// ── Dukascopy HTTP client ─────────────────────────────────────────────────
@@ -66,14 +67,14 @@ func main() {
 
 	// ── Database: run pending schema migrations ───────────────────────────────
 	if err := database.RunMigrations(ctx); err != nil {
-		log.Fatalf("database migrate: %v", err)
+		logrus.Fatalf("database migrate: %v", err)
 	}
 
 	// ── Activity Logger ───────────────────────────────────────────────────────
 	logDSN := os.Getenv("DATABASE_URL")
 	logDB, err := sql.Open("postgres", logDSN)
 	if err != nil {
-		log.Fatalf("activity log db: %v", err)
+		logrus.Fatalf("activity log db: %v", err)
 	}
 	defer func() { _ = logDB.Close() }()
 	logDB.SetMaxIdleConns(3)
@@ -85,16 +86,16 @@ func main() {
 	// ── RabbitMQ ──────────────────────────────────────────────────────────────
 	mqClient, err := mq.NewClient()
 	if err != nil {
-		log.Fatalf("rabbitmq: %v", err)
+		logrus.Fatalf("rabbitmq: %v", err)
 	}
 	defer func() {
 		if err := mqClient.Close(); err != nil {
-			log.Printf("rabbitmq close: %v", err)
+			logrus.Errorf("rabbitmq close: %v", err)
 		}
 	}()
 
 	if err := mq.SetupConsumers(mqClient, appDAL, activityLogger); err != nil {
-		log.Fatalf("mq consumers: %v", err)
+		logrus.Fatalf("mq consumers: %v", err)
 	}
 
 	// ── Fiber ─────────────────────────────────────────────────────────────────
@@ -144,8 +145,8 @@ func main() {
 		port = "3000"
 	}
 
-	log.Printf("server starting on :%s", port)
+	logrus.Infof("server starting on :%s", port)
 	if err := app.Listen(":" + port); err != nil {
-		log.Fatalf("server error: %v", err)
+		logrus.Fatalf("server error: %v", err)
 	}
 }

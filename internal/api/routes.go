@@ -3,9 +3,9 @@ package api
 import (
 	"context"
 	"crypto/subtle"
-	"log"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/sirupsen/logrus"
 	"github.com/google/uuid"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
@@ -38,7 +38,7 @@ func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c 
 			return c.Next()
 		})
 	} else {
-		log.Print("warning: INGESTION_SECRET not set — /api/v1 routes are unauthenticated")
+		logrus.Warn("warning: INGESTION_SECRET not set — /api/v1 routes are unauthenticated")
 	}
 
 	// ── Auto-Seeder & Pruning ─────────────────────────────────────────────────

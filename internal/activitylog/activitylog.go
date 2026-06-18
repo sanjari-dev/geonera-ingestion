@@ -4,8 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"log"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/google/uuid"
 )
@@ -54,7 +55,7 @@ func (l *Logger) Record(ctx context.Context, src TriggerSrc, jobName string, met
 		id, string(src), jobName, now, traceID, metaJSON,
 	)
 	if err != nil {
-		log.Printf("activitylog: record %s/%s: %v", src, jobName, err)
+		logrus.WithError(err).Errorf("activitylog: record %s/%s", src, jobName)
 	}
 	return id
 }
@@ -72,11 +73,11 @@ func (l *Logger) Purge(ctx context.Context) {
 		WHERE triggered_at < NOW() - ($1 || ' days')::INTERVAL
 	`, retentionDays)
 	if err != nil {
-		log.Printf("activitylog: purge: %v", err)
+		logrus.WithError(err).Error("activitylog: purge")
 		return
 	}
 	if n, _ := result.RowsAffected(); n > 0 {
-		log.Printf("activitylog: purged %d entries older than %d days", n, retentionDays)
+		logrus.Infof("activitylog: purged %d entries older than %d days", n, retentionDays)
 	}
 }
 
@@ -91,12 +92,12 @@ func (l *Logger) CloseOrphans(ctx context.Context) {
 		  AND  triggered_at < NOW() - INTERVAL '5 minutes'
 	`)
 	if err != nil {
-		log.Printf("activitylog: close orphans: %v", err)
+		logrus.WithError(err).Error("activitylog: close orphans")
 		return
 	}
 	n, _ := result.RowsAffected()
 	if n > 0 {
-		log.Printf("activitylog: closed %d orphaned entries from previous run", n)
+		logrus.Infof("activitylog: closed %d orphaned entries from previous run", n)
 	}
 }
 
@@ -125,7 +126,7 @@ func (l *Logger) Complete(id uuid.UUID) {
 			id,
 		)
 		if err != nil {
-			log.Printf("activitylog: complete %s: %v", id, err)
+			logrus.WithError(err).Errorf("activitylog: complete %s", id)
 		}
 	}()
 }

@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"entgo.io/ent/dialect/sql"
 	"github.com/google/uuid"
@@ -104,7 +105,7 @@ func InitDownloadRateLimiter() {
 	// Start fixed pool of download worker goroutines.
 	startDownloadWorkers()
 
-	log.Printf("worker: download rate limiter started — max %d req/s, burst %d, interval %s",
+	logrus.Infof("worker: download rate limiter started — max %d req/s, burst %d, interval %s",
 		dukascopyMaxRPS, dukascopyBurst, interval)
 }
 
@@ -136,7 +137,7 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	if onStarted != nil {
 		onStarted()
 	}
-	log.Printf("ticks: handler start mode=%s", mode)
+	logrus.Infof("ticks: handler start mode=%s", mode)
 
 	runCtx := ctx
 	var cancel context.CancelFunc
@@ -160,20 +161,20 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 		wg.Add(1)
 		go runBackfillMasterLoop(runCtx, d, &wg)
 	default:
-		log.Printf("ticks: unknown mode %q", mode)
+		logrus.Warnf("ticks: unknown mode %q", mode)
 	}
 	wg.Wait()
 
 	if runCtx.Err() == context.DeadlineExceeded {
 		switch mode {
 		case "REGULAR":
-			log.Printf("ticks/REGULAR: deadline exceeded (%s) — cycle was abnormal, all phases canceled", regularTimeout)
+			logrus.Warnf("ticks/REGULAR: deadline exceeded (%s) — cycle was abnormal, all phases canceled", regularTimeout)
 		case "BACKFILL":
-			log.Printf("ticks/BACKFILL: deadline exceeded (%s) — batch goroutines canceled, goroutine leak prevented", backfillTimeout)
+			logrus.Warnf("ticks/BACKFILL: deadline exceeded (%s) — batch goroutines canceled, goroutine leak prevented", backfillTimeout)
 		}
 	}
 
-	log.Printf("ticks: handler done mode=%s", mode)
+	logrus.Infof("ticks: handler done mode=%s", mode)
 	return true
 }
 
@@ -221,7 +222,7 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
 	start := time.Now()
-	log.Printf("ticks/ETL: start instrument=%s ts=%s", inst, ts)
+	logrus.Infof("ticks/ETL: start instrument=%s ts=%s", inst, ts)
 
 	// Phase 1: Download BI5 — submitted to the download gate worker pool.
 	// The gate manages concurrency (dukascopyBurst workers) and rate limiting
@@ -230,13 +231,13 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	dl := RequestDownload(ctx, row, highPriority)
 	switch dl.Status {
 	case DownloadNotFound:
-		log.Printf("ticks/ETL: download NOT_FOUND instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+		logrus.Infof("ticks/ETL: download NOT_FOUND instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		onNotFound(ctx, d, row)
 		return
 	case DownloadOK:
-		log.Printf("ticks/ETL: download OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(dl.Data), time.Since(start).Round(time.Millisecond))
+		logrus.Infof("ticks/ETL: download OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(dl.Data), time.Since(start).Round(time.Millisecond))
 	default: // DownloadRateLimited, DownloadError, or ctx canceled
-		log.Printf("ticks/ETL: download ERROR instrument=%s ts=%s err=%v elapsed=%s → FAILED", inst, ts, dl.Err, time.Since(start).Round(time.Millisecond))
+		logrus.WithError(dl.Err).Errorf("ticks/ETL: download ERROR instrument=%s ts=%s elapsed=%s → FAILED", inst, ts, time.Since(start).Round(time.Millisecond))
 		updateStateFailed(ctx, d, row)
 		return
 	}
@@ -248,7 +249,7 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 
 	// Phase 2: Convert + Upload — semaphore capped at runtime.NumCPU().
 	executeConvertUpload(ctx, d, row, dl.Data)
-	log.Printf("ticks/ETL: pipeline done instrument=%s ts=%s total_elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+	logrus.Infof("ticks/ETL: pipeline done instrument=%s ts=%s total_elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 }
 
 // executeNotFoundRecheck re-checks the Dukascopy API for a claimed NOT_FOUND row.
@@ -263,7 +264,7 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, highPriority bool) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
-	log.Printf("ticks/recheck: start instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
+	logrus.Infof("ticks/recheck: start instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
 
 	dl := RequestDownload(ctx, row, highPriority)
 	if dl.Status != DownloadOK {
@@ -283,19 +284,19 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 					Save(ctx)
 				return e
 			}); dbErr != nil {
-				log.Printf("ticks/recheck: DB update FAILED instrument=%s ts=%s err=%v", inst, ts, dbErr)
+				logrus.WithError(dbErr).Errorf("ticks/recheck: DB update FAILED instrument=%s ts=%s", inst, ts)
 				return
 			}
-			log.Printf("ticks/recheck: still NOT_FOUND instrument=%s ts=%s new_streak=%d → uploading zero-row", inst, ts, newStreak)
+			logrus.Infof("ticks/recheck: still NOT_FOUND instrument=%s ts=%s new_streak=%d → uploading zero-row", inst, ts, newStreak)
 			zeroRow := buildZeroRowParquet()
 			if upErr := uploadToR2(ctx, row, zeroRow); upErr != nil {
-				log.Printf("ticks/recheck: zero-row upload FAILED instrument=%s ts=%s err=%v → FAILED", inst, ts, upErr)
+				logrus.WithError(upErr).Errorf("ticks/recheck: zero-row upload FAILED instrument=%s ts=%s → FAILED", inst, ts)
 				updateStateFailed(ctx, d, row)
 			} else {
-				log.Printf("ticks/recheck: zero-row uploaded instrument=%s ts=%s → NOT_FOUND", inst, ts)
+				logrus.Infof("ticks/recheck: zero-row uploaded instrument=%s ts=%s → NOT_FOUND", inst, ts)
 			}
 		} else {
-			log.Printf("ticks/recheck: download ERROR instrument=%s ts=%s err=%v → FAILED", inst, ts, dl.Err)
+			logrus.WithError(dl.Err).Errorf("ticks/recheck: download ERROR instrument=%s ts=%s → FAILED", inst, ts)
 			updateStateFailed(ctx, d, row)
 		}
 		return
@@ -303,7 +304,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 
 	// Data is available again: reset streak to 0, set PENDING.
 	// The row will be picked up for a full ETL pass on the next cycle.
-	log.Printf("ticks/recheck: data found instrument=%s ts=%s → streak=0 PENDING", inst, ts)
+	logrus.Infof("ticks/recheck: data found instrument=%s ts=%s → streak=0 PENDING", inst, ts)
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
@@ -313,7 +314,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("ticks/recheck: reset to PENDING FAILED instrument=%s ts=%s err=%v", inst, ts, err)
+		logrus.WithError(err).Errorf("ticks/recheck: reset to PENDING FAILED instrument=%s ts=%s", inst, ts)
 	}
 }
 
@@ -331,7 +332,7 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus, highPriority bool) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
-	log.Printf("ticks/T2: action start instrument=%s ts=%s prev_status=%s streak=%d",
+	logrus.Infof("ticks/T2: action start instrument=%s ts=%s prev_status=%s streak=%d",
 		inst, ts, prevStatusStr(row.PreviousStatus), row.NotFoundStreak)
 
 	dl := RequestDownload(ctx, row, highPriority)
@@ -350,7 +351,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 					newRetryCount = 0
 				}
 				if newStreak >= notFoundThreshold {
-					log.Printf("ticks/T2: NOT_FOUND streak=%d >= threshold=%d instrument=%s ts=%s → validate zero-row",
+					logrus.Infof("ticks/T2: NOT_FOUND streak=%d >= threshold=%d instrument=%s ts=%s → validate zero-row",
 						newStreak, notFoundThreshold, inst, ts)
 					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
@@ -360,13 +361,13 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
-						log.Printf("ticks/T2: streak update FAILED instrument=%s ts=%s err=%v", inst, ts, dbErr)
+						logrus.WithError(dbErr).Errorf("ticks/T2: streak update FAILED instrument=%s ts=%s", inst, ts)
 						return
 					}
 					row.NotFoundStreak = newStreak
 					executeValidation(ctx, d, row, preclaimPrev)
 				} else {
-					log.Printf("ticks/T2: NOT_FOUND streak=%d instrument=%s ts=%s → NOT_FOUND (below threshold)", newStreak, inst, ts)
+					logrus.Infof("ticks/T2: NOT_FOUND streak=%d instrument=%s ts=%s → NOT_FOUND (below threshold)", newStreak, inst, ts)
 					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
@@ -377,25 +378,25 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
-						log.Printf("ticks/T2: NOT_FOUND update FAILED instrument=%s ts=%s err=%v", inst, ts, dbErr)
+						logrus.WithError(dbErr).Errorf("ticks/T2: NOT_FOUND update FAILED instrument=%s ts=%s", inst, ts)
 					}
 				}
 			} else {
 				// COMPLETED + unexpected 404: data was there at T-0 time — mark as anomaly.
-				log.Printf("ticks/T2: COMPLETED got 404 instrument=%s ts=%s → BROKEN (data missing anomaly)", inst, ts)
+				logrus.Warnf("ticks/T2: COMPLETED got 404 instrument=%s ts=%s → BROKEN (data missing anomaly)", inst, ts)
 				updateStateBroken(ctx, d, row)
 			}
 		} else {
-			log.Printf("ticks/T2: download ERROR instrument=%s ts=%s err=%v → FAILED", inst, ts, dl.Err)
+			logrus.WithError(dl.Err).Errorf("ticks/T2: download ERROR instrument=%s ts=%s → FAILED", inst, ts)
 			updateStateFailed(ctx, d, row)
 		}
 		return
 	}
 
-	log.Printf("ticks/T2: download OK instrument=%s ts=%s bytes=%d", inst, ts, len(dl.Data))
+	logrus.Infof("ticks/T2: download OK instrument=%s ts=%s bytes=%d", inst, ts, len(dl.Data))
 	if wasNotFound {
 		// NOT_FOUND + data now available: reset streak, hand off to next cycle via PENDING.
-		log.Printf("ticks/T2: NOT_FOUND data recovered instrument=%s ts=%s → streak=0 PENDING", inst, ts)
+		logrus.Infof("ticks/T2: NOT_FOUND data recovered instrument=%s ts=%s → streak=0 PENDING", inst, ts)
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			_, e := tx.State.UpdateOneID(row.ID).
 				SetNotFoundStreak(0).
@@ -405,7 +406,7 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 				Save(ctx)
 			return e
 		}); err != nil {
-			log.Printf("ticks/T2: NOT_FOUND→PENDING FAILED instrument=%s ts=%s err=%v", inst, ts, err)
+			logrus.WithError(err).Errorf("ticks/T2: NOT_FOUND→PENDING FAILED instrument=%s ts=%s", inst, ts)
 		}
 		return
 	}
@@ -420,17 +421,17 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 		defer func() { <-tickProcessSem }()
 		parquet, convErr := convertBI5ToParquet(dl.Data, row)
 		if convErr != nil {
-			log.Printf("ticks/T2: convert FAILED instrument=%s ts=%s err=%v", inst, ts, convErr)
+			logrus.WithError(convErr).Errorf("ticks/T2: convert FAILED instrument=%s ts=%s", inst, ts)
 			uploadErr = convErr
 			return
 		}
-		log.Printf("ticks/T2: convert OK instrument=%s ts=%s parquet_bytes=%d", inst, ts, len(parquet))
+		logrus.Infof("ticks/T2: convert OK instrument=%s ts=%s parquet_bytes=%d", inst, ts, len(parquet))
 		if upErr := uploadToR2(ctx, row, parquet); upErr != nil {
-			log.Printf("ticks/T2: upload FAILED instrument=%s ts=%s err=%v", inst, ts, upErr)
+			logrus.WithError(upErr).Errorf("ticks/T2: upload FAILED instrument=%s ts=%s", inst, ts)
 			uploadErr = upErr
 			return
 		}
-		log.Printf("ticks/T2: upload OK instrument=%s ts=%s → validating", inst, ts)
+		logrus.Infof("ticks/T2: upload OK instrument=%s ts=%s → validating", inst, ts)
 	}()
 	if uploadErr != nil {
 		updateStateFailed(ctx, d, row)
@@ -448,26 +449,26 @@ func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaim
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
 	start := time.Now()
-	log.Printf("ticks/validate: reading R2 instrument=%s ts=%s", inst, ts)
+	logrus.Infof("ticks/validate: reading R2 instrument=%s ts=%s", inst, ts)
 
 	fileBytes, err := readFromR2(ctx, row)
 	if err != nil {
-		log.Printf("ticks/validate: R2 read FAILED instrument=%s ts=%s err=%v elapsed=%s → BROKEN", inst, ts, err, time.Since(start).Round(time.Millisecond))
+		logrus.WithError(err).Errorf("ticks/validate: R2 read FAILED instrument=%s ts=%s elapsed=%s → BROKEN", inst, ts, time.Since(start).Round(time.Millisecond))
 		// Unable to read the file — treat as BROKEN so Backfill can retry.
 		updateStateBroken(ctx, d, row)
 		return
 	}
-	log.Printf("ticks/validate: validating instrument=%s ts=%s bytes=%d read_elapsed=%s", inst, ts, len(fileBytes), time.Since(start).Round(time.Millisecond))
+	logrus.Infof("ticks/validate: validating instrument=%s ts=%s bytes=%d read_elapsed=%s", inst, ts, len(fileBytes), time.Since(start).Round(time.Millisecond))
 
 	validationErr := validateParquetFile(ctx, row, fileBytes)
 	if validationErr != nil {
-		log.Printf("ticks/validate: validation FAILED instrument=%s ts=%s err=%v → BROKEN", inst, ts, validationErr)
+		logrus.WithError(validationErr).Errorf("ticks/validate: validation FAILED instrument=%s ts=%s → BROKEN", inst, ts)
 	}
 
 	if err := updateValidatedTickStatus(ctx, d, row, validationErr, preclaimPrev); err != nil {
-		log.Printf("ticks/validate: status update FAILED instrument=%s ts=%s err=%v", inst, ts, err)
+		logrus.WithError(err).Errorf("ticks/validate: status update FAILED instrument=%s ts=%s", inst, ts)
 	}
-	log.Printf("ticks/validate: done instrument=%s ts=%s total_elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+	logrus.Infof("ticks/validate: done instrument=%s ts=%s total_elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 }
 
 func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, validationErr error, preclaimPrev *state.PreviousStatus) error {
@@ -481,7 +482,7 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 			if e != nil {
 				return e
 			}
-				log.Printf("ticks/validate: CONFIRMED instrument=%s ts=%s",
+			logrus.Infof("ticks/validate: CONFIRMED instrument=%s ts=%s",
 				instrName(row), saved.Timestamp.Format(time.RFC3339))
 			return upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
 		}
@@ -494,7 +495,7 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 		if e != nil {
 			return e
 		}
-		log.Printf(
+		logrus.Infof(
 			"state_transition status=%s state_id=%s job_type=%s previous_status=%s message=%q",
 			state.StatusBROKEN,
 			broken.ID,
@@ -519,7 +520,7 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("%s for %s: %v", logPrefix, row.ID, err)
+		logrus.WithError(err).Errorf("%s for %s", logPrefix, row.ID)
 	}
 }
 
@@ -538,11 +539,11 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("ticks/ETL: NOT_FOUND simple FAILED instrument=%s ts=%s err=%v",
-			instrName(row), row.Timestamp.Format(time.RFC3339), err)
+		logrus.WithError(err).Errorf("ticks/ETL: NOT_FOUND simple FAILED instrument=%s ts=%s",
+			instrName(row), row.Timestamp.Format(time.RFC3339))
 		return
 	}
-	log.Printf("ticks/ETL: NOT_FOUND instrument=%s ts=%s streak=1 (first attempt)",
+	logrus.Infof("ticks/ETL: NOT_FOUND instrument=%s ts=%s streak=1 (first attempt)",
 		instrName(row), row.Timestamp.Format(time.RFC3339))
 }
 
@@ -560,11 +561,11 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("ticks/ETL: NOT_FOUND increment FAILED instrument=%s ts=%s err=%v",
-			instrName(row), row.Timestamp.Format(time.RFC3339), err)
+		logrus.WithError(err).Errorf("ticks/ETL: NOT_FOUND increment FAILED instrument=%s ts=%s",
+			instrName(row), row.Timestamp.Format(time.RFC3339))
 		return
 	}
-	log.Printf("ticks/ETL: NOT_FOUND instrument=%s ts=%s new_streak=%d (backfill increment)",
+	logrus.Infof("ticks/ETL: NOT_FOUND instrument=%s ts=%s new_streak=%d (backfill increment)",
 		instrName(row), row.Timestamp.Format(time.RFC3339), row.NotFoundStreak+1)
 }
 
@@ -592,11 +593,11 @@ func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("ticks/T1: retry_reset FAILED instrument=%s ts=%s err=%v",
-			instrName(row), row.Timestamp.Format(time.RFC3339), err)
+		logrus.WithError(err).Errorf("ticks/T1: retry_reset FAILED instrument=%s ts=%s",
+			instrName(row), row.Timestamp.Format(time.RFC3339))
 		return
 	}
-	log.Printf("ticks/T1: retry_reset instrument=%s ts=%s prev_retry=%d new_retry=%d new_streak=%d → PENDING",
+	logrus.Infof("ticks/T1: retry_reset instrument=%s ts=%s prev_retry=%d new_retry=%d new_streak=%d → PENDING",
 		instrName(row), row.Timestamp.Format(time.RFC3339), row.RetryCount, row.RetryCount+1, newStreak)
 }
 
@@ -652,18 +653,18 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 
 	parquet, err := convertBI5ToParquet(data, row)
 	if err != nil {
-		log.Printf("ticks/ETL: convert FAILED instrument=%s ts=%s err=%v", inst, ts, err)
+		logrus.WithError(err).Errorf("ticks/ETL: convert FAILED instrument=%s ts=%s", inst, ts)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "convert failed")
 		return
 	}
-	log.Printf("ticks/ETL: convert OK instrument=%s ts=%s parquet_bytes=%d elapsed=%s", inst, ts, len(parquet), time.Since(start).Round(time.Millisecond))
+	logrus.Infof("ticks/ETL: convert OK instrument=%s ts=%s parquet_bytes=%d elapsed=%s", inst, ts, len(parquet), time.Since(start).Round(time.Millisecond))
 
 	if err := uploadToR2(ctx, row, parquet); err != nil {
-		log.Printf("ticks/ETL: upload FAILED instrument=%s ts=%s err=%v elapsed=%s", inst, ts, err, time.Since(start).Round(time.Millisecond))
+		logrus.WithError(err).Errorf("ticks/ETL: upload FAILED instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload failed")
 		return
 	}
-	log.Printf("ticks/ETL: upload OK instrument=%s ts=%s elapsed=%s → COMPLETED", inst, ts, time.Since(start).Round(time.Millisecond))
+	logrus.Infof("ticks/ETL: upload OK instrument=%s ts=%s elapsed=%s → COMPLETED", inst, ts, time.Since(start).Round(time.Millisecond))
 	updateStateCompleted(ctx, d, row)
 }
 
@@ -687,10 +688,10 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 			Save(ctx)
 		return e
 	}); err != nil {
-		log.Printf("%s for %s: %v", errMsg, row.ID, err)
+		logrus.WithError(err).Errorf("%s for %s", errMsg, row.ID)
 		return
 	}
-	log.Printf(
+	logrus.Infof(
 		"state_transition status=%s state_id=%s job_type=%s previous_status=%s message=%q",
 		next,
 		row.ID,
@@ -827,6 +828,10 @@ func buildZeroRowParquet() []byte {
 // It must be deferred AFTER wg.Done().
 func recoverGoroutine(ctx context.Context, name string) {
 	if r := recover(); r != nil {
-		log.Printf("FATAL: panic in %s: %v\n%s", name, r, debug.Stack())
+		logrus.WithFields(logrus.Fields{
+			"goroutine": name,
+			"panic":     r,
+			"stack":     string(debug.Stack()),
+		}).Error("recovered panic")
 	}
 }

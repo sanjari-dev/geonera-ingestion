@@ -2,10 +2,11 @@ package mq
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -37,7 +38,7 @@ func NewClient() (*Client, error) {
 		if err == nil {
 			break
 		}
-		log.Printf("mq: dial failed, retrying in 2s... (%v)", err)
+		logrus.WithError(err).Error("mq: dial failed, retrying in 2s")
 		time.Sleep(2 * time.Second)
 	}
 
@@ -70,7 +71,7 @@ const stateChangedExchange = "events.ingestion"
 func (c *Client) PublishEvent(eventType string) {
 	ch, err := c.channel()
 	if err != nil {
-		log.Printf("mq: PublishEvent: open channel: %v", err)
+		logrus.WithError(err).Error("mq: PublishEvent: open channel")
 		return
 	}
 	defer ch.Close()
@@ -84,7 +85,7 @@ func (c *Client) PublishEvent(eventType string) {
 		false, // no-wait
 		nil,
 	); err != nil {
-		log.Printf("mq: PublishEvent: declare exchange: %v", err)
+		logrus.WithError(err).Error("mq: PublishEvent: declare exchange")
 		return
 	}
 
@@ -100,7 +101,7 @@ func (c *Client) PublishEvent(eventType string) {
 			Body:         body,
 		},
 	); err != nil {
-		log.Printf("mq: PublishEvent: publish: %v", err)
+		logrus.WithError(err).Error("mq: PublishEvent: publish")
 	}
 }
 
@@ -115,7 +116,7 @@ func (c *Client) channel() (*amqp.Channel, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mq: reconnect: %w", err)
 		}
-		log.Println("mq: reconnected to RabbitMQ")
+		logrus.Info("mq: reconnected to RabbitMQ")
 		c.conn = conn
 	}
 

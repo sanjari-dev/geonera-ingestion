@@ -3,8 +3,9 @@ package worker
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"entgo.io/ent/dialect/sql"
 
@@ -26,7 +27,7 @@ const syncWorkerTimeout = 5 * time.Minute
 func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 	tasks, err := claimBatchSyncTasks(ctx, d)
 	if err != nil {
-		log.Printf("sync: claim batch: %v", err)
+		logrus.WithError(err).Error("sync: claim batch")
 		return false
 	}
 
@@ -147,12 +148,12 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		}
 		return nil
 	}); err != nil {
-		log.Printf("sync: task %s count/reset: %v", task.ID, err)
+		logrus.WithError(err).Errorf("sync: task %s count/reset", task.ID)
 		return
 	}
 
 	if actualCount < 24 {
-		log.Printf("sync: task %s instrument=%s date=%s hours_count=%d — reset to PENDING",
+		logrus.Infof("sync: task %s instrument=%s date=%s hours_count=%d — reset to PENDING",
 			task.ID, task.InstrumentID, task.TargetDate.Format(time.DateOnly), actualCount)
 		return
 	}
@@ -183,10 +184,10 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		}
 		return nil
 	}); err != nil {
-		log.Printf("sync: task %s finalize: %v", task.ID, err)
+		logrus.WithError(err).Errorf("sync: task %s finalize", task.ID)
 		return
 	}
 
-	log.Printf("sync: task %s complete — candle instrument=%s date=%s resolved (count=%d)",
+	logrus.Infof("sync: task %s complete — candle instrument=%s date=%s resolved (count=%d)",
 		task.ID, task.InstrumentID, task.TargetDate.Format(time.DateOnly), actualCount)
 }

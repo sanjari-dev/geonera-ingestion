@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"runtime"
+
+	"github.com/sirupsen/logrus"
 	"sync"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
@@ -37,7 +38,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL, onStar
 		wg.Add(1)
 		go runCandleBackfill(ctx, d, &wg)
 	default:
-		log.Printf("candles: unknown mode %q", mode)
+		logrus.Warnf("candles: unknown mode %q", mode)
 	}
 	wg.Wait()
 	return true
