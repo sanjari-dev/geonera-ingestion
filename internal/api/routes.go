@@ -5,11 +5,12 @@ import (
 	"crypto/subtle"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/sirupsen/logrus"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
+	ilogger "github.com/sanjari-dev/geonera-ingestion/internal/logger"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/runtimecollector"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
@@ -174,11 +175,20 @@ func max0(v int) int {
 	return v
 }
 
-// extractCtx returns a detached copy of the Fiber request context.
-// context.WithoutCancel is used so the background worker goroutine is not
-// canceled when Fiber closes the HTTP request after returning 202 Accepted.
+// extractCtx returns a detached copy of the Fiber request context with a
+// generated traceId injected. context.WithoutCancel ensures the background
+// worker goroutine is not canceled when Fiber closes the HTTP request after
+// returning 202 Accepted.
 func extractCtx(c *fiber.Ctx) context.Context {
-	return context.WithoutCancel(c.UserContext())
+	traceID := uuid.New().String()
+	ctx := ilogger.WithTraceID(context.WithoutCancel(c.UserContext()), traceID)
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"method":     c.Method(),
+		"path":       c.Path(),
+		"ip":         c.IP(),
+		"trace_id":   traceID,
+	}).Trace("api: trace start")
+	return ctx
 }
 
 func triggered() fiber.Map {

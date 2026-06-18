@@ -12,6 +12,7 @@ import (
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
+	ilogger "github.com/sanjari-dev/geonera-ingestion/internal/logger"
 	"github.com/sanjari-dev/geonera-ingestion/internal/worker"
 )
 
@@ -172,8 +173,10 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 				return nil
 			}
 
-			logrus.WithFields(logrus.Fields{"queue": queue, "delivery_tag": msg.DeliveryTag}).Debug("mq: message received")
-			ctx := context.Background()
+			traceID := uuid.New().String()
+			ctx := ilogger.WithTraceID(context.Background(), traceID)
+			logrus.WithFields(logrus.Fields{"queue": queue, "delivery_tag": msg.DeliveryTag, "trace_id": traceID}).Debug("mq: message received")
+			ilogger.T(ctx).WithFields(logrus.Fields{"queue": queue, "delivery_tag": msg.DeliveryTag}).Trace("mq: trace start")
 
 			// Ack immediately so the broker can deliver the next message.
 			_ = msg.Ack(false)

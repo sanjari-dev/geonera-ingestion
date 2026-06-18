@@ -17,6 +17,7 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
+	ilogger "github.com/sanjari-dev/geonera-ingestion/internal/logger"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 )
 
@@ -45,6 +46,9 @@ const maintenanceParallelLimit = 8
 // deleteTickParquetFromR2 removes the hourly Tick Parquet file for this state
 // row from Cloudflare R2.
 func deleteTickParquetFromR2(ctx context.Context, row *ent.State) error {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "deleteTickParquetFromR2", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "deleteTickParquetFromR2").Trace("fn_exit")
+
 	if r2Client == nil {
 		return errClientsNotInitialized
 	}
@@ -52,12 +56,18 @@ func deleteTickParquetFromR2(ctx context.Context, row *ent.State) error {
 		return fmt.Errorf("deleteTickParquetFromR2: instrument edge not loaded for state %s", row.ID)
 	}
 	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	return r2Client.DeleteObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "deleteTickParquetFromR2", "key": key}).Trace("before r2 delete")
+	err := r2Client.DeleteObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "deleteTickParquetFromR2", "key": key, "err": err != nil}).Trace("after r2 delete")
+	return err
 }
 
 // deleteCandleParquetFromR2 removes the daily Candle Parquet file for this
 // state row from Cloudflare R2.
 func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "deleteCandleParquetFromR2", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "deleteCandleParquetFromR2").Trace("fn_exit")
+
 	if r2Client == nil {
 		return errClientsNotInitialized
 	}
@@ -65,7 +75,10 @@ func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
 		return fmt.Errorf("deleteCandleParquetFromR2: instrument edge not loaded for state %s", row.ID)
 	}
 	key := r2.CandleObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	return r2Client.DeleteObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "deleteCandleParquetFromR2", "key": key}).Trace("before r2 delete")
+	err := r2Client.DeleteObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "deleteCandleParquetFromR2", "key": key, "err": err != nil}).Trace("after r2 delete")
+	return err
 }
 
 // ── RunMaintenanceHandler ─────────────────────────────────────────────────────
@@ -74,24 +87,32 @@ func deleteCandleParquetFromR2(ctx context.Context, row *ent.State) error {
 // Per instrument, it either bootstraps a brand-new states table (Group 1) or
 // runs the four normal-maintenance phases A/B/C/D in parallel (Group 2).
 func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
+	ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("fn_exit")
+
 	if onStarted != nil {
 		onStarted()
 	}
 	logrus.Info("maintenance: running!")
 
 	if actLogger != nil {
+		ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("before call: actLogger.Purge")
 		actLogger.Purge(ctx)
+		ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("after call: actLogger.Purge")
 	}
 
 	var instruments []*ent.Instrument
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All"}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		instruments, e = tx.Instrument.Query().All(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All", "err": true}).Trace("after query")
 		logrus.WithError(err).Error("maintenance: query instruments")
 		return true
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All", "count": len(instruments)}).Trace("after query")
 
 	logrus.WithFields(logrus.Fields{"count": len(instruments), "parallel_limit": maintenanceParallelLimit}).Info("maintenance: instruments to process")
 
@@ -99,18 +120,25 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 	var wg sync.WaitGroup
 	for _, inst := range instruments {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("branch: ctx_canceled_break")
 			break
 		}
 		inst := inst
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "RunMaintenanceHandler", "instrument": inst.Name}).Trace("before channel send: sem")
 		sem <- struct{}{} // blocks when maintenanceParallelLimit goroutines are active
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "RunMaintenanceHandler", "instrument": inst.Name}).Trace("after channel send: sem")
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: maintenance instrument start")
 			runMaintenanceForInstrument(ctx, d, inst)
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: maintenance instrument done")
 		}()
 	}
+	ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("before wg.Wait")
 	wg.Wait()
+	ilogger.T(ctx).WithField("fn", "RunMaintenanceHandler").Trace("after wg.Wait")
 
 	logrus.Info("maintenance: complete")
 	return true
@@ -131,16 +159,26 @@ func instrumentLockKey(id uuid.UUID) int64 {
 // the call returns immediately without doing any work — the other worker is
 // responsible for this instrument in the current cycle.
 func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runMaintenanceForInstrument", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runMaintenanceForInstrument").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runMaintenanceForInstrument", "instrument": inst.Name}).Trace("before call: d.WithAdvisoryLock")
 	locked, err := d.WithAdvisoryLock(ctx, instrumentLockKey(inst.ID), func() error {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runMaintenanceForInstrument", "instrument": inst.Name}).Trace("advisory lock acquired")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runMaintenanceForInstrument", "instrument": inst.Name}).Trace("before call: isStatesEmpty")
 		empty, err := isStatesEmpty(ctx, d, inst.ID)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runMaintenanceForInstrument", "instrument": inst.Name, "empty": empty, "err": err != nil}).Trace("after call: isStatesEmpty")
 		if err != nil {
 			logrus.WithError(err).Errorf("maintenance %s: check empty", inst.Name)
 			return nil
 		}
 
 		if empty {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: maintenance_bootstrap")
 			logrus.WithField("instrument", inst.Name).Info("maintenance: starting Group 1 (bootstrap)")
+			ilogger.T(ctx).WithField("instrument", inst.Name).Trace("before call: runBootstrap")
 			runBootstrap(ctx, d, inst)
+			ilogger.T(ctx).WithField("instrument", inst.Name).Trace("after call: runBootstrap")
 			return nil
 		}
 
@@ -151,43 +189,79 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		// leave IsPause untouched for this cycle.
 		// managePauseFlag is called after wg.Wait() so it sees the final
 		// state of all four phases before deciding the correct IsPause value.
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: maintenance_group2")
 		logrus.WithField("instrument", inst.Name).Info("maintenance: starting Group 2 (A+B+C+D)")
 
 		var pauseOnce sync.Once
 		setPause := func() {
 			pauseOnce.Do(func() {
+				ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "instrument": inst.Name}).Trace("before query")
 				if err := d.Execute(ctx, func(tx *ent.Tx) error {
 					_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
 					return e
 				}); err != nil {
+					ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": true}).Trace("after query")
 					logrus.WithError(err).Errorf("maintenance %s Group 2: set IsPause=true", inst.Name)
+					return
 				}
+				ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": false}).Trace("after query")
 			})
 		}
 
 		var wg sync.WaitGroup
 		wg.Add(4)
-		go func() { defer wg.Done(); runForwardSeeding(ctx, d, inst, setPause) }()
-		go func() { defer wg.Done(); runBackwardGapFill(ctx, d, inst, setPause) }()
-		go func() { defer wg.Done(); runPruning(ctx, d, inst, setPause) }()
-		go func() { defer wg.Done(); runConsistencyCheck(ctx, d, inst, setPause) }()
-		wg.Wait()
+		go func() {
+			defer wg.Done()
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: forward-seeding start")
+			runForwardSeeding(ctx, d, inst, setPause)
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: forward-seeding done")
+		}()
+		go func() {
+			defer wg.Done()
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: backward-gap-fill start")
+			runBackwardGapFill(ctx, d, inst, setPause)
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: backward-gap-fill done")
+		}()
+		go func() {
+			defer wg.Done()
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: pruning start")
+			runPruning(ctx, d, inst, setPause)
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: pruning done")
+		}()
+		go func() {
+			defer wg.Done()
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: consistency-check start")
+			runConsistencyCheck(ctx, d, inst, setPause)
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("goroutine: consistency-check done")
+		}()
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("before wg.Wait Group2")
+		wg.Wait()
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("after wg.Wait Group2")
+
+		ilogger.T(ctx).WithField("instrument", inst.Name).Trace("before call: managePauseFlag")
 		managePauseFlag(ctx, d, inst)
+		ilogger.T(ctx).WithField("instrument", inst.Name).Trace("after call: managePauseFlag")
 		logrus.WithField("instrument", inst.Name).Info("maintenance: Group 2 complete")
 		return nil
 	})
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runMaintenanceForInstrument", "instrument": inst.Name, "locked": locked, "err": err != nil}).Trace("after call: d.WithAdvisoryLock")
 	if err != nil {
 		logrus.WithError(err).Errorf("maintenance %s: advisory lock", inst.Name)
 		return
 	}
 	if !locked {
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: advisory_lock_not_acquired")
 		logrus.WithField("instrument", inst.Name).Info("maintenance: skipped — lock held by concurrent worker")
 	}
 }
 
 func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (bool, error) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "isStatesEmpty"}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "isStatesEmpty").Trace("fn_exit")
+
 	var count int
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count"}).Trace("before query")
 	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		count, e = tx.State.Query().
@@ -198,6 +272,7 @@ func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (boo
 			Count(ctx)
 		return e
 	})
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count", "count": count, "err": err != nil}).Trace("after query")
 	return count == 0, err
 }
 
@@ -211,13 +286,19 @@ func isStatesEmpty(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID) (boo
 func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	defer recoverGoroutine(ctx, "maintenance/bootstrap")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBootstrap", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runBootstrap").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "instrument": inst.Name}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(true).Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("maintenance bootstrap %s: set IsPause=true", inst.Name)
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": false}).Trace("after query")
 
 	// Log after IsPause is committed — if the DB write above fails and is retried
 	// on the next maintenance cycle, this line will not appear twice in the logs.
@@ -226,8 +307,10 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	now := time.Now().UTC()
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: bootstrap_ctx_canceled")
 			break
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: bootstrap job_type iteration start")
 		interval := jobTypeInterval(jobType)
 		startNorm := normalizeTS(inst.StartDate.UTC(), jobType)
 		nowNorm := normalizeTS(now, jobType)
@@ -237,16 +320,22 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 			candidates = append(candidates, ts)
 		}
 		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "slots": len(candidates), "job_type": jobType}).Info("maintenance bootstrap: seeding slots")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBootstrap", "instrument": inst.Name, "job_type": jobType, "slots": len(candidates)}).Trace("before call: insertBatched")
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("bootstrap %s", inst.Name))
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBootstrap", "instrument": inst.Name, "job_type": jobType}).Trace("after call: insertBatched")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: bootstrap job_type iteration end")
 	}
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "instrument": inst.Name}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(false).Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("maintenance bootstrap %s: set IsPause=false", inst.Name)
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": false}).Trace("after query")
 	logrus.WithField("instrument", inst.Name).Info("maintenance bootstrap: complete")
 }
 
@@ -258,13 +347,20 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/forward-seeding")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runForwardSeeding", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runForwardSeeding").Trace("fn_exit")
+
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: forward_seeding_ctx_canceled")
 			return
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: forward seeding job_type iteration start")
 		interval := jobTypeInterval(jobType)
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runForwardSeeding", "instrument": inst.Name, "job_type": jobType}).Trace("before call: queryStateMaxTS")
 		maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runForwardSeeding", "err": err != nil}).Trace("after call: queryStateMaxTS")
 		if err != nil {
 			logrus.WithError(err).Errorf("forward seeding %s %s: query max", inst.Name, jobType)
 			continue
@@ -275,6 +371,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, se
 
 		nowNorm := normalizeTS(time.Now().UTC(), jobType)
 		if !maxTS.Before(nowNorm) {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("branch: forward_seeding_up_to_date")
 			continue
 		}
 
@@ -285,9 +382,15 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, se
 		if len(candidates) == 0 {
 			continue
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Trace("branch: forward_seeding_inserting")
+		ilogger.T(ctx).WithField("fn", "runForwardSeeding").Trace("before call: setPause")
 		setPause()
+		ilogger.T(ctx).WithField("fn", "runForwardSeeding").Trace("after call: setPause")
 		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Info("forward seeding: inserting new rows")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runForwardSeeding", "instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Trace("before call: insertBatched")
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("forward-seeding %s %s", inst.Name, jobType))
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runForwardSeeding", "instrument": inst.Name, "job_type": jobType}).Trace("after call: insertBatched")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: forward seeding job_type iteration end")
 	}
 }
 
@@ -301,22 +404,30 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, se
 func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/backward-gap-fill")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackwardGapFill", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runBackwardGapFill").Trace("fn_exit")
+
 	startDate := inst.StartDate.UTC()
 
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: backward_gap_fill_ctx_canceled")
 			return
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: backward gap fill job_type iteration start")
 		interval := jobTypeInterval(jobType)
 		startNorm := normalizeTS(startDate, jobType)
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackwardGapFill", "instrument": inst.Name, "job_type": jobType}).Trace("before call: queryStateMinTS")
 		minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackwardGapFill", "err": err != nil}).Trace("after call: queryStateMinTS")
 		if err != nil {
 			logrus.WithError(err).Errorf("backward gap fill %s %s: query min", inst.Name, jobType)
 			continue
 		}
 
 		if minTS.IsZero() || !minTS.After(startNorm) {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("branch: backward_gap_fill_at_start")
 			continue
 		}
 
@@ -327,9 +438,15 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, s
 		if len(candidates) == 0 {
 			continue
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Trace("branch: backward_gap_fill_inserting")
+		ilogger.T(ctx).WithField("fn", "runBackwardGapFill").Trace("before call: setPause")
 		setPause()
+		ilogger.T(ctx).WithField("fn", "runBackwardGapFill").Trace("after call: setPause")
 		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Info("backward gap fill: filling rows toward StartDate")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackwardGapFill", "instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Trace("before call: insertBatched")
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("backward-gap-fill %s %s", inst.Name, jobType))
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackwardGapFill", "instrument": inst.Name, "job_type": jobType}).Trace("after call: insertBatched")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: backward gap fill job_type iteration end")
 	}
 }
 
@@ -343,24 +460,34 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, s
 // PENDING rows for every missing slot; whether those rows haven't been processed
 // yet is irrelevant to the pause decision.
 func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "managePauseFlag", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "managePauseFlag").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "managePauseFlag", "instrument": inst.Name}).Trace("before call: queryStateMinTS")
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, state.JobTypeTICK)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "managePauseFlag", "err": err != nil}).Trace("after call: queryStateMinTS")
 	if err != nil {
 		logrus.WithError(err).Errorf("manage pause %s: query min tick", inst.Name)
 		return
 	}
 	if minTS.IsZero() {
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: manage_pause_min_zero")
 		return
 	}
 
 	startNorm := normalizeTS(inst.StartDate.UTC(), state.JobTypeTICK)
 	shouldPause := minTS.After(startNorm)
+	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "should_pause": shouldPause}).Trace("branch: manage_pause_decision")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "instrument": inst.Name, "should_pause": shouldPause}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.Instrument.UpdateOneID(inst.ID).SetIsPause(shouldPause).Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("manage pause %s: set IsPause=%v", inst.Name, shouldPause)
 	} else {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.UpdateOneID.Save", "err": false}).Trace("after query")
 		logrus.WithFields(logrus.Fields{
 			"instrument": inst.Name,
 			"is_pause":   shouldPause,
@@ -378,7 +505,11 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/pruning")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runPruning", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runPruning").Trace("fn_exit")
+
 	var hasWork bool
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Exist", "instrument": inst.Name}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		hasWork, e = tx.State.Query().
@@ -392,24 +523,38 @@ func runPruning(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause 
 			Exist(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Exist", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("pruning %s: check", inst.Name)
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Exist", "has_work": hasWork}).Trace("after query")
 	if !hasWork {
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: pruning_no_work")
 		return
 	}
+	ilogger.T(ctx).WithField("fn", "runPruning").Trace("before call: setPause")
 	setPause()
+	ilogger.T(ctx).WithField("fn", "runPruning").Trace("after call: setPause")
+	ilogger.T(ctx).WithField("fn", "runPruning").Trace("before call: runPruningPhase1Mark")
 	runPruningPhase1Mark(ctx, d, inst)
+	ilogger.T(ctx).WithField("fn", "runPruning").Trace("after call: runPruningPhase1Mark")
+	ilogger.T(ctx).WithField("fn", "runPruning").Trace("before call: runPruningPhase2Sweep")
 	runPruningPhase2Sweep(ctx, d, inst)
+	ilogger.T(ctx).WithField("fn", "runPruning").Trace("after call: runPruningPhase2Sweep")
 }
 
 // runPruningPhase1Mark soft-deletes rows WHERE timestamp < StartDate AND
 // is_deleted=false for this instrument, in batches of 100.
 func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runPruningPhase1Mark", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runPruningPhase1Mark").Trace("fn_exit")
+
 	totalMarked := 0
 	for ctx.Err() == nil {
+		ilogger.T(ctx).WithField("fn", "runPruningPhase1Mark").Trace("loop: iteration start")
 		var batchLen int
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "instrument": inst.Name}).Trace("before query")
 			rows, e := tx.State.Query().
 				Where(
 					state.InstrumentID(inst.ID),
@@ -419,8 +564,10 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 				Limit(100).
 				All(ctx)
 			if e != nil {
+				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "err": true}).Trace("after query")
 				return e
 			}
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "count": len(rows)}).Trace("after query")
 			batchLen = len(rows)
 			if batchLen == 0 {
 				return nil
@@ -429,11 +576,14 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 			for i, r := range rows {
 				ids[i] = r.ID
 			}
-			return tx.State.Update().
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Update.Exec", "count": batchLen}).Trace("before query")
+			err := tx.State.Update().
 				Where(state.IDIn(ids...)).
 				SetIsDeleted(true).
 				SetUpdatedAt(time.Now().UTC()).
 				Exec(ctx)
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Update.Exec", "err": err != nil}).Trace("after query")
+			return err
 		}); err != nil {
 			logrus.WithError(err).Errorf("pruning phase1 mark %s", inst.Name)
 			break
@@ -442,6 +592,7 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 		if batchLen == 0 {
 			break
 		}
+		ilogger.T(ctx).WithField("fn", "runPruningPhase1Mark").Trace("loop: iteration end")
 	}
 	if totalMarked > 0 {
 		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "rows": totalMarked}).Info("pruning phase1: marked rows as soft-deleted")
@@ -457,10 +608,14 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 // Phase 3 — DB Hard Delete: bulk-delete only the succeeding group from the DB.
 // Failed rows remain is_deleted=true and are retried automatically.
 func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runPruningPhase2Sweep", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runPruningPhase2Sweep").Trace("fn_exit")
+
 	// ── Phase 2: R2 Sweep ────────────────────────────────────────────────────
 	// Load all is_deleted=true rows for this instrument. The set is bounded —
 	// only rows below Instrument.StartDate are soft-deleted by Phase 1.
 	var allRows []*ent.State
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "instrument": inst.Name}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		allRows, e = tx.State.Query().
@@ -472,9 +627,11 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			All(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("pruning phase2 %s: query IsDeleted rows", inst.Name)
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "count": len(allRows)}).Trace("after query")
 	if len(allRows) == 0 {
 		return
 	}
@@ -482,14 +639,20 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 	var succeeded []uuid.UUID
 	for _, row := range allRows {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithField("fn", "runPruningPhase2Sweep").Trace("branch: r2_sweep_ctx_canceled")
 			break
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": row.JobType}).Trace("loop: r2 sweep iteration")
 		var r2Err error
 		switch row.JobType {
 		case state.JobTypeTICK:
+			ilogger.T(ctx).WithField("fn", "runPruningPhase2Sweep").Trace("before call: deleteTickParquetFromR2")
 			r2Err = deleteTickParquetFromR2(ctx, row)
+			ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runPruningPhase2Sweep", "err": r2Err != nil}).Trace("after call: deleteTickParquetFromR2")
 		case state.JobTypeCANDLE:
+			ilogger.T(ctx).WithField("fn", "runPruningPhase2Sweep").Trace("before call: deleteCandleParquetFromR2")
 			r2Err = deleteCandleParquetFromR2(ctx, row)
+			ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runPruningPhase2Sweep", "err": r2Err != nil}).Trace("after call: deleteCandleParquetFromR2")
 		}
 		if r2Err != nil && !isR2NotFound(r2Err) {
 			logrus.WithError(r2Err).Errorf("pruning phase2 %s: R2 delete %s (%s) — will retry next cycle",
@@ -509,17 +672,21 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 	const pruneBatch = 500
 	totalDeleted := 0
 	for i := 0; i < len(succeeded); i += pruneBatch {
+		ilogger.T(ctx).WithField("fn", "runPruningPhase2Sweep").Trace("loop: hard delete batch iteration")
 		end := i + pruneBatch
 		if end > len(succeeded) {
 			end = len(succeeded)
 		}
 		chunk := succeeded[i:end]
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Delete.Exec", "count": len(chunk)}).Trace("before query")
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			_, e := tx.State.Delete().Where(state.IDIn(chunk...)).Exec(ctx)
 			return e
 		}); err != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Delete.Exec", "err": true}).Trace("after query")
 			logrus.WithError(err).Errorf("pruning phase3 %s: hard-delete", inst.Name)
 		} else {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Delete.Exec", "err": false, "count": len(chunk)}).Trace("after query")
 			totalDeleted += len(chunk)
 		}
 	}
@@ -534,26 +701,41 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 func runConsistencyCheck(ctx context.Context, d *dal.DAL, inst *ent.Instrument, setPause func()) {
 	defer recoverGoroutine(ctx, "maintenance/consistency-check")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runConsistencyCheck", "instrument": inst.Name}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runConsistencyCheck").Trace("fn_exit")
+
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("branch: consistency_check_ctx_canceled")
 			return
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("loop: consistency check job_type iteration")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runConsistencyCheck", "instrument": inst.Name, "job_type": jobType}).Trace("before call: checkConsistencyForJobType")
 		checkConsistencyForJobType(ctx, d, inst, jobType, setPause)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runConsistencyCheck", "instrument": inst.Name, "job_type": jobType}).Trace("after call: checkConsistencyForJobType")
 	}
 }
 
 func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instrument, jobType state.JobType, setPause func()) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "instrument": inst.Name, "job_type": jobType}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "checkConsistencyForJobType").Trace("fn_exit")
+
 	interval := jobTypeInterval(jobType)
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "instrument": inst.Name, "job_type": jobType}).Trace("before call: queryStateMinTS")
 	minTS, err := queryStateMinTS(ctx, d, inst.ID, jobType)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "err": err != nil}).Trace("after call: queryStateMinTS")
 	if err != nil {
 		logrus.WithError(err).Errorf("consistency check %s %s: query min", inst.Name, jobType)
 		return
 	}
 	if minTS.IsZero() {
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("branch: consistency_check_no_rows")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "instrument": inst.Name, "job_type": jobType}).Trace("before call: queryStateMaxTS")
 	maxTS, err := queryStateMaxTS(ctx, d, inst.ID, jobType)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "err": err != nil}).Trace("after call: queryStateMaxTS")
 	if err != nil {
 		logrus.WithError(err).Errorf("consistency check %s %s: query max", inst.Name, jobType)
 		return
@@ -562,6 +744,7 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	expected := int(maxTS.Sub(minTS)/interval) + 1
 
 	var actual int
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count", "instrument": inst.Name, "job_type": jobType}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		actual, e = tx.State.Query().
@@ -575,15 +758,20 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 			Count(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("consistency check %s %s: count actual", inst.Name, jobType)
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count", "actual": actual, "expected": expected}).Trace("after query")
 
 	if actual >= expected {
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType}).Trace("branch: consistency_check_ok")
 		return
 	}
 
+	ilogger.T(ctx).WithField("fn", "checkConsistencyForJobType").Trace("before call: setPause")
 	setPause()
+	ilogger.T(ctx).WithField("fn", "checkConsistencyForJobType").Trace("after call: setPause")
 	logrus.WithFields(logrus.Fields{
 		"instrument":   inst.Name,
 		"job_type":     jobType,
@@ -600,19 +788,27 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	// (no more gaps) or ctx is canceled.
 	cursor := minTS.Add(-interval)
 	for ctx.Err() == nil {
+		ilogger.T(ctx).WithField("fn", "checkConsistencyForJobType").Trace("loop: consistency cursor iteration start")
+
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "instrument": inst.Name}).Trace("before call: d.QueryMissingTimestamps")
 		missing, err := d.QueryMissingTimestamps(ctx, inst.ID, string(jobType), minTS, maxTS, interval, cursor, consistencyBatchSize)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "missing": len(missing), "err": err != nil}).Trace("after call: d.QueryMissingTimestamps")
 		if err != nil {
 			logrus.WithError(err).Errorf("consistency check %s %s: query missing", inst.Name, jobType)
 			return
 		}
 		if len(missing) == 0 {
+			ilogger.T(ctx).WithField("fn", "checkConsistencyForJobType").Trace("branch: consistency_no_more_gaps")
 			break
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "instrument": inst.Name, "batch": len(missing)}).Trace("before call: insertBatched")
 		insertBatched(ctx, d, inst.ID, jobType, missing, fmt.Sprintf("consistency-check %s %s", inst.Name, jobType))
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "checkConsistencyForJobType", "instrument": inst.Name}).Trace("after call: insertBatched")
 		if len(missing) < consistencyBatchSize {
 			break
 		}
 		cursor = missing[len(missing)-1]
+		ilogger.T(ctx).WithField("fn", "checkConsistencyForJobType").Trace("loop: consistency cursor iteration end")
 	}
 }
 
@@ -641,20 +837,29 @@ func normalizeTS(t time.Time, jobType state.JobType) time.Time {
 // ON CONFLICT DO NOTHING. One SQL statement per batch replaces the previous
 // per-row loop, reducing parse/plan/index overhead by ~720×.
 func insertBatched(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType, candidates []time.Time, phase string) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "insertBatched", "phase": phase, "candidates": len(candidates)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "insertBatched").Trace("fn_exit")
+
 	for i := 0; i < len(candidates) && ctx.Err() == nil; i += maintenanceSeedBatchSize {
+		ilogger.T(ctx).WithField("fn", "insertBatched").Trace("loop: insert batch iteration start")
 		end := i + maintenanceSeedBatchSize
 		if end > len(candidates) {
 			end = len(candidates)
 		}
 		batchIdx := i / maintenanceSeedBatchSize
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "batch_idx": batchIdx, "size": end - i}).Trace("before query")
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			if err := insertBatchPendingOnConflictDoNothing(ctx, tx, instrumentID, jobType, candidates[i:end], time.Now().UTC()); err != nil {
 				return fmt.Errorf("%s batch[%d]: %w", phase, batchIdx, err)
 			}
 			return nil
 		}); err != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": true}).Trace("after query")
 			logrus.WithError(err).Errorf("maintenance %s: insert", phase)
+		} else {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": false, "batch_idx": batchIdx}).Trace("after query")
 		}
+		ilogger.T(ctx).WithField("fn", "insertBatched").Trace("loop: insert batch iteration end")
 	}
 }
 
@@ -734,7 +939,11 @@ func insertStatePendingOnConflictDoNothing(
 // queryStateMinTS returns the earliest normalized timestamp for the given
 // instrument/jobType. Returns zero time when no rows exist.
 func queryStateMinTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType) (time.Time, error) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "queryStateMinTS", "job_type": jobType}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "queryStateMinTS").Trace("fn_exit")
+
 	var minTS time.Time
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First", "job_type": jobType}).Trace("before query")
 	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		row, e := tx.State.Query().
 			Where(
@@ -753,13 +962,18 @@ func queryStateMinTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jo
 		minTS = normalizeTS(row.Timestamp.UTC(), jobType)
 		return nil
 	})
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First", "found": !minTS.IsZero(), "err": err != nil}).Trace("after query")
 	return minTS, err
 }
 
 // queryStateMaxTS returns the latest normalized timestamp for the given
 // instrument/jobType. Returns zero time when no rows exist.
 func queryStateMaxTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jobType state.JobType) (time.Time, error) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "queryStateMaxTS", "job_type": jobType}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "queryStateMaxTS").Trace("fn_exit")
+
 	var maxTS time.Time
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First", "job_type": jobType, "order": "DESC"}).Trace("before query")
 	err := d.Execute(ctx, func(tx *ent.Tx) error {
 		row, e := tx.State.Query().
 			Where(
@@ -778,5 +992,6 @@ func queryStateMaxTS(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, jo
 		maxTS = normalizeTS(row.Timestamp.UTC(), jobType)
 		return nil
 	})
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First", "found": !maxTS.IsZero(), "err": err != nil}).Trace("after query")
 	return maxTS, err
 }

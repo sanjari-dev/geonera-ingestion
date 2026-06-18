@@ -17,6 +17,7 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/ent/state"
 	"github.com/sanjari-dev/geonera-ingestion/internal/candleparquet"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
+	ilogger "github.com/sanjari-dev/geonera-ingestion/internal/logger"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/tickparquet"
 )
@@ -30,11 +31,18 @@ func runCandleRegular(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer recoverGoroutine(ctx, "runCandleRegular")
 
+	ilogger.T(ctx).WithField("fn", "runCandleRegular").Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runCandleRegular").Trace("fn_exit")
+
 	// Step 1 — Seed today's CANDLE row for all active instruments.
+	ilogger.T(ctx).WithField("fn", "runCandleRegular").Trace("before call: seedTodayCandleRows")
 	seedTodayCandleRows(ctx, d)
+	ilogger.T(ctx).WithField("fn", "runCandleRegular").Trace("after call: seedTodayCandleRows")
 
 	// Step 2 — Claim PENDING CANDLE rows with ResolvedTickCount=24 and aggregate.
+	ilogger.T(ctx).WithField("fn", "runCandleRegular").Trace("before call: runCandleAggregationLoop")
 	runCandleAggregationLoop(ctx, d)
+	ilogger.T(ctx).WithField("fn", "runCandleRegular").Trace("after call: runCandleAggregationLoop")
 }
 
 // ── Seeding ───────────────────────────────────────────────────────────────────
@@ -44,10 +52,14 @@ func runCandleRegular(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 // before Stage B's aggregation loop tries to claim it at 05:08 UTC.
 // ON CONFLICT DO NOTHING makes both inserts idempotent.
 func seedTodayCandleRows(ctx context.Context, d *dal.DAL) {
+	ilogger.T(ctx).WithField("fn", "seedTodayCandleRows").Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "seedTodayCandleRows").Trace("fn_exit")
+
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	yesterday := today.AddDate(0, 0, -1)
 
 	var instruments []*ent.Instrument
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All"}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		instruments, e = tx.Instrument.Query().
@@ -58,21 +70,32 @@ func seedTodayCandleRows(ctx context.Context, d *dal.DAL) {
 			All(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All", "err": true}).Trace("after query")
 		logrus.WithError(err).Error("candle seed: list instruments")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All", "count": len(instruments)}).Trace("after query")
 
 	for _, instr := range instruments {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithField("fn", "seedTodayCandleRows").Trace("branch: ctx_canceled")
 			return
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "seedTodayCandleRows", "instrument": instr.Name}).Trace("before call: seedOneCandleRow yesterday")
 		seedOneCandleRow(ctx, d, instr.ID, yesterday)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "seedTodayCandleRows", "instrument": instr.Name}).Trace("after call: seedOneCandleRow yesterday")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "seedTodayCandleRows", "instrument": instr.Name}).Trace("before call: seedOneCandleRow today")
 		seedOneCandleRow(ctx, d, instr.ID, today)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "seedTodayCandleRows", "instrument": instr.Name}).Trace("after call: seedOneCandleRow today")
 	}
 }
 
 // seedOneCandleRow idempotently inserts a CANDLE PENDING row for (instrumentID, today).
 func seedOneCandleRow(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, today time.Time) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "seedOneCandleRow", "date": today.Format(time.DateOnly)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "seedOneCandleRow").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "date": today.Format(time.DateOnly)}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		return tx.ExecContext(ctx, `
 			INSERT INTO ingestion.states (
@@ -91,8 +114,11 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, t
 			time.Now().UTC(),
 		)
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("candle seed %s %s", instrumentID, today.Format(time.DateOnly))
+		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": false}).Trace("after query")
 }
 
 // ── Aggregation loop ──────────────────────────────────────────────────────────
@@ -101,9 +127,15 @@ func seedOneCandleRow(ctx context.Context, d *dal.DAL, instrumentID uuid.UUID, t
 // and dispatches each to executeCandleAggregation in a goroutine.
 // Claims use FOR UPDATE SKIP LOCKED so Regular and Backfill runs safely route work by status.
 func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
+	ilogger.T(ctx).WithField("fn", "runCandleAggregationLoop").Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "runCandleAggregationLoop").Trace("fn_exit")
+
 	var loopWg sync.WaitGroup
 	count := 0
 	for ctx.Err() == nil {
+		ilogger.T(ctx).WithField("fn", "runCandleAggregationLoop").Trace("loop: iteration start")
+
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked"}).Trace("before query")
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
 			return candleStateRows(q,
 				state.StatusEQ(state.StatusPENDING),
@@ -114,11 +146,14 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 		})
 		if err != nil {
 			if ent.IsNotFound(err) {
+				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "found": false}).Trace("after query")
 				break
 			}
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "err": true}).Trace("after query")
 			logrus.WithError(err).Error("candle aggregation claim")
 			break
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "found": true, "instrument": instrName(claimed)}).Trace("after query")
 
 		count++
 		logrus.WithFields(logrus.Fields{
@@ -131,10 +166,16 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 		go func(r *ent.State) {
 			defer loopWg.Done()
 			defer recoverGoroutine(ctx, "candles/aggregation-row")
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r), "date": r.Timestamp.Format(time.DateOnly)}).Trace("goroutine: candle aggregation-row start")
 			executeCandleAggregation(ctx, d, r)
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: candle aggregation-row done")
 		}(claimed)
+
+		ilogger.T(ctx).WithField("fn", "runCandleAggregationLoop").Trace("loop: iteration end")
 	}
+	ilogger.T(ctx).WithField("fn", "runCandleAggregationLoop").Trace("before loopWg.Wait")
 	loopWg.Wait()
+	ilogger.T(ctx).WithField("fn", "runCandleAggregationLoop").Trace("after loopWg.Wait")
 	logrus.WithField("rows", count).Info("candle agg: loop complete")
 }
 
@@ -149,10 +190,16 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 //  4. Upload to R2, read back, validate, promote to CONFIRMED.
 //     On any error: PROCESSED → FAILED or BROKEN depending on cause.
 func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("fn_exit")
+
+	ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("before candleAggSem acquire")
 	candleAggSem <- struct{}{}
+	ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("after candleAggSem acquire")
 	defer func() { <-candleAggSem }()
 
 	if row.Edges.Instrument == nil {
+		ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("branch: instrument_edge_nil")
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "candle agg: instrument not loaded")
 		return
 	}
@@ -168,6 +215,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	dayEnd := dayStart.Add(24 * time.Hour)
 
 	var tickStates []*ent.State
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "instrument": instrName, "date": dayStart.Format(time.DateOnly)}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		var e error
 		tickStates, e = tx.State.Query().
@@ -183,10 +231,12 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 			All(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("candle agg %s: query tick states", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "query tick states failed")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.All", "count": len(tickStates)}).Trace("after query")
 
 	// Step 2 — Stream each hourly Parquet from R2 into the candle accumulator.
 	acc := newCandleAccumulator(dayStart, instrName)
@@ -194,23 +244,31 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 
 	for _, tickState := range tickStates {
 		if ctx.Err() != nil {
+			ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("branch: ctx_canceled_in_tick_loop")
 			return
 		}
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"tick_ts": tickState.Timestamp.Format(time.RFC3339), "is_holiday": tickState.IsHoliday}).Trace("loop: tick state iteration")
+
 		// §4.F-c: skip Zero-Row files (market holidays).
 		if tickState.IsHoliday {
+			ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("branch: skip_holiday_tick")
 			continue
 		}
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "tick_ts": tickState.Timestamp.Format(time.RFC3339)}).Trace("before call: readTickParquetFromR2")
 		data, err := readTickParquetFromR2(ctx, instrName, tickState.Timestamp)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": err != nil}).Trace("after call: readTickParquetFromR2")
 		if err != nil {
 			if isNoSuchKeyError(err) {
 				// §4.F-d: NoSuchKey handling.
 				if tickState.IsDeleted {
 					// Pruned row — safe to skip.
+					ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("branch: no_such_key_deleted_skip")
 					continue
 				}
 				// BROKEN Storage: file should exist but doesn't.
+				ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("branch: no_such_key_not_deleted_broken")
 				logrus.WithFields(logrus.Fields{"state_id": row.ID, "tick_state_id": tickState.ID}).Info("candle agg: NoSuchKey for tick (not deleted)")
 				broken = true
 				break
@@ -220,20 +278,26 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 			return
 		}
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "bytes": len(data)}).Trace("before call: acc.AccumulateTickParquet")
 		if err := acc.AccumulateTickParquet(data); err != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": true}).Trace("after call: acc.AccumulateTickParquet")
 			logrus.WithError(err).Errorf("candle agg %s: accumulate tick %s", row.ID, tickState.ID)
 			updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "accumulate tick parquet failed")
 			return
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": false}).Trace("after call: acc.AccumulateTickParquet")
 	}
 
 	if broken {
+		ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("branch: broken_storage")
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusBROKEN, "broken storage: tick parquet missing")
 		return
 	}
 
 	// Step 3 — Build the daily Candles Parquet (all 19 timeframes).
+	ilogger.T(ctx).WithField("fn", "executeCandleAggregation").Trace("before call: buildCandleParquet")
 	candleData, err := buildCandleParquet(ctx, row, acc)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": err != nil}).Trace("after call: buildCandleParquet")
 	if err != nil {
 		logrus.WithError(err).Errorf("candle agg %s: build candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "build candle parquet failed")
@@ -241,26 +305,38 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	}
 
 	// Step 4a — Upload to R2.
+	r2Key := ""
+	if row.Edges.Instrument != nil {
+		r2Key = r2.CandleObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "key": r2Key}).Trace("before r2 upload")
 	if err := uploadCandleParquetToR2(ctx, row, candleData); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "key": r2Key, "err": true}).Trace("after r2 upload")
 		logrus.WithError(err).Errorf("candle agg %s: upload candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload candle parquet failed")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "key": r2Key, "err": false}).Trace("after r2 upload")
 	updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusCOMPLETED, "set candle COMPLETED")
 
 	// Step 4b — Read back and validate.
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "key": r2Key}).Trace("before r2 read-back")
 	stored, err := readCandleParquetFromR2(ctx, row)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": err != nil}).Trace("after r2 read-back")
 	if err != nil {
 		logrus.WithError(err).Errorf("candle agg %s: read back candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "read-back candle parquet failed")
 		return
 	}
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "bytes": len(stored)}).Trace("before call: validateCandleParquet")
 	if err := validateCandleParquet(ctx, row, stored); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": true}).Trace("after call: validateCandleParquet")
 		logrus.WithError(err).Errorf("candle agg %s: validate candle parquet", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "validate candle parquet failed")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleAggregation", "err": false}).Trace("after call: validateCandleParquet")
 
 	// Step 4c — Promote to CONFIRMED after readback validation.
 	updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusCONFIRMED, "set candle CONFIRMED")
@@ -269,11 +345,16 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 // readTickParquetFromR2 fetches the hourly tick Parquet for the specified instrument and timestamp.
 // Returns errNoSuchKey if the R2 object is absent.
 func readTickParquetFromR2(ctx context.Context, instrument string, ts time.Time) ([]byte, error) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "readTickParquetFromR2", "instrument": instrument, "ts": ts.Format(time.RFC3339)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "readTickParquetFromR2").Trace("fn_exit")
+
 	if r2Client == nil {
 		return nil, errClientsNotInitialized
 	}
 	key := r2.TickObjectKey(instrument, ts)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "readTickParquetFromR2", "key": key}).Trace("before r2 read")
 	data, err := r2Client.GetObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "readTickParquetFromR2", "key": key, "err": err != nil}).Trace("after r2 read")
 	if errors.Is(err, r2.ErrNotFound) {
 		return nil, errNoSuchKey
 	}
@@ -336,6 +417,9 @@ func buildCandleParquet(_ context.Context, _ *ent.State, acc *candleAccumulator)
 // uploadCandleParquetToR2 puts the daily Candle Parquet bytes at the canonical
 // R2 object path for this candle row.
 func uploadCandleParquetToR2(ctx context.Context, row *ent.State, data []byte) error {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "uploadCandleParquetToR2", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "uploadCandleParquetToR2").Trace("fn_exit")
+
 	if r2Client == nil {
 		return errClientsNotInitialized
 	}
@@ -343,7 +427,10 @@ func uploadCandleParquetToR2(ctx context.Context, row *ent.State, data []byte) e
 		return fmt.Errorf("uploadCandleParquetToR2: instrument not loaded for %s", row.ID)
 	}
 	key := r2.CandleObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	return r2Client.PutObject(ctx, key, data)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "uploadCandleParquetToR2", "key": key, "bytes": len(data)}).Trace("before r2 upload")
+	err := r2Client.PutObject(ctx, key, data)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "uploadCandleParquetToR2", "key": key, "err": err != nil}).Trace("after r2 upload")
+	return err
 }
 
 // ── Candle accumulator ────────────────────────────────────────────────────────

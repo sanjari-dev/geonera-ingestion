@@ -21,6 +21,7 @@ import (
 	"github.com/sanjari-dev/geonera-ingestion/ent/synctask"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dal"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"
+	ilogger "github.com/sanjari-dev/geonera-ingestion/internal/logger"
 	"github.com/sanjari-dev/geonera-ingestion/internal/r2"
 	"github.com/sanjari-dev/geonera-ingestion/internal/tickparquet"
 )
@@ -137,6 +138,9 @@ const backfillTimeout = 9 * time.Minute
 // RunTickParentHandler is the single entry point for all tick-ingestion work.
 // Mode must be either "REGULAR" or "BACKFILL".
 func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarted func()) bool {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "RunTickParentHandler", "mode": mode}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "RunTickParentHandler").Trace("fn_exit")
+
 	if onStarted != nil {
 		onStarted()
 	}
@@ -146,9 +150,11 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	var cancel context.CancelFunc
 	switch mode {
 	case "REGULAR":
+		ilogger.T(ctx).WithField("timeout", regularTimeout).Trace("branch: REGULAR timeout set")
 		runCtx, cancel = context.WithTimeout(ctx, regularTimeout)
 		defer cancel()
 	case "BACKFILL":
+		ilogger.T(ctx).WithField("timeout", backfillTimeout).Trace("branch: BACKFILL timeout set")
 		runCtx, cancel = context.WithTimeout(ctx, backfillTimeout)
 		defer cancel()
 	}
@@ -156,17 +162,22 @@ func RunTickParentHandler(ctx context.Context, mode string, d *dal.DAL, onStarte
 	var wg sync.WaitGroup
 	switch mode {
 	case "REGULAR":
+		ilogger.T(ctx).Trace("branch: launching T0+T1+T2 goroutines")
 		wg.Add(3)
 		go runT0Phase(runCtx, d, &wg)
 		go runT1Phase(runCtx, d, &wg)
 		go runT2Phase(runCtx, d, &wg)
 	case "BACKFILL":
+		ilogger.T(ctx).Trace("branch: launching backfill master loop goroutine")
 		wg.Add(1)
 		go runBackfillMasterLoop(runCtx, d, &wg)
 	default:
 		logrus.WithField("mode", mode).Warn("ticks: unknown mode")
 	}
+
+	ilogger.T(ctx).WithField("mode", mode).Trace("before wg.Wait")
 	wg.Wait()
+	ilogger.T(ctx).WithField("mode", mode).Trace("after wg.Wait")
 
 	if runCtx.Err() == context.DeadlineExceeded {
 		switch mode {
@@ -224,6 +235,9 @@ func orderStateStatuses(statuses ...state.Status) func(*sql.Selector) {
 func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotFound func(context.Context, *dal.DAL, *ent.State), highPriority bool) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeIngestionETL", "instrument": inst, "ts": ts, "high_priority": highPriority}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "executeIngestionETL").Trace("fn_exit")
+
 	start := time.Now()
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/ETL: start")
 
@@ -231,27 +245,41 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 	// The gate manages concurrency (dukascopyBurst workers) and rate limiting
 	// (dukascopyMaxRPS tokens/s). The call respects ctx cancellation at every
 	// blocking point: enqueue, rate-gate wait, and result wait.
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeIngestionETL", "instrument": inst}).Trace("before call: RequestDownload")
 	dl := RequestDownload(ctx, row, highPriority)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeIngestionETL", "status": dl.Status}).Trace("after call: RequestDownload")
+
 	switch dl.Status {
 	case DownloadNotFound:
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: download_not_found")
 		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/ETL: download NOT_FOUND")
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeIngestionETL"}).Trace("before call: onNotFound")
 		onNotFound(ctx, d, row)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeIngestionETL"}).Trace("after call: onNotFound")
 		return
 	case DownloadOK:
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(dl.Data)}).Trace("branch: download_ok")
 		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(dl.Data), "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/ETL: download OK")
 	default: // DownloadRateLimited, DownloadError, or ctx canceled
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: download_error")
 		logrus.WithError(dl.Err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Error("ticks/ETL: download ERROR → FAILED")
+		ilogger.T(ctx).WithField("fn", "executeIngestionETL").Trace("before call: updateStateFailed")
 		updateStateFailed(ctx, d, row)
+		ilogger.T(ctx).WithField("fn", "executeIngestionETL").Trace("after call: updateStateFailed")
 		return
 	}
 
 	// Data was found: reset NotFoundStreak to 0 if it was previously non-zero.
 	if row.NotFoundStreak > 0 {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeIngestionETL", "streak": row.NotFoundStreak}).Trace("before call: resetNotFoundStreak")
 		resetNotFoundStreak(ctx, d, row, "reset streak")
+		ilogger.T(ctx).WithField("fn", "executeIngestionETL").Trace("after call: resetNotFoundStreak")
 	}
 
 	// Phase 2: Convert + Upload — semaphore capped at runtime.NumCPU().
+	ilogger.T(ctx).WithField("fn", "executeIngestionETL").Trace("before call: executeConvertUpload")
 	executeConvertUpload(ctx, d, row, dl.Data)
+	ilogger.T(ctx).WithField("fn", "executeIngestionETL").Trace("after call: executeConvertUpload")
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/ETL: pipeline done")
 }
 
@@ -267,16 +295,24 @@ func executeIngestionETL(ctx context.Context, d *dal.DAL, row *ent.State, onNotF
 func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, highPriority bool) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeNotFoundRecheck", "instrument": inst, "ts": ts, "streak": row.NotFoundStreak}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "executeNotFoundRecheck").Trace("fn_exit")
+
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": row.NotFoundStreak}).Info("ticks/recheck: start")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeNotFoundRecheck", "instrument": inst}).Trace("before call: RequestDownload")
 	dl := RequestDownload(ctx, row, highPriority)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeNotFoundRecheck", "status": dl.Status}).Trace("after call: RequestDownload")
+
 	if dl.Status != DownloadOK {
 		if dl.Status == DownloadNotFound {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: recheck_still_not_found")
 			// Still 404: increment streak, mark holiday, upload Zero-Row Parquet.
 			// DB commit happens before R2 upload, so IsHoliday flag persists even on
 			// upload failure. If the upload fails, the row is set to FAILED so that
 			// T-1/Backfill can retry the full pipeline on the next cycle.
 			newStreak := row.NotFoundStreak + 1
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "instrument": inst}).Trace("before query")
 			if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 				_, e := tx.State.UpdateOneID(row.ID).
 					AddNotFoundStreak(1).
@@ -287,27 +323,37 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 					Save(ctx)
 				return e
 			}); dbErr != nil {
+				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 				logrus.WithError(dbErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/recheck: DB update FAILED")
 				return
 			}
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false, "new_streak": newStreak}).Trace("after query")
 			logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "new_streak": newStreak}).Info("ticks/recheck: still NOT_FOUND → uploading zero-row")
 			zeroRow := buildZeroRowParquet()
-			if upErr := uploadToR2(ctx, row, zeroRow); upErr != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeNotFoundRecheck", "instrument": inst}).Trace("before r2 upload: zero-row")
+			upErr := uploadToR2(ctx, row, zeroRow)
+			ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeNotFoundRecheck", "err": upErr != nil}).Trace("after r2 upload: zero-row")
+			if upErr != nil {
 				logrus.WithError(upErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/recheck: zero-row upload FAILED → FAILED")
 				updateStateFailed(ctx, d, row)
 			} else {
 				logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/recheck: zero-row uploaded → NOT_FOUND")
 			}
 		} else {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: recheck_download_error")
 			logrus.WithError(dl.Err).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/recheck: download ERROR → FAILED")
+			ilogger.T(ctx).WithField("fn", "executeNotFoundRecheck").Trace("before call: updateStateFailed")
 			updateStateFailed(ctx, d, row)
+			ilogger.T(ctx).WithField("fn", "executeNotFoundRecheck").Trace("after call: updateStateFailed")
 		}
 		return
 	}
 
 	// Data is available again: reset streak to 0, set PENDING.
 	// The row will be picked up for a full ETL pass on the next cycle.
+	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: recheck_data_found")
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/recheck: data found → streak=0 PENDING")
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "instrument": inst}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
@@ -317,8 +363,11 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 			Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/recheck: reset to PENDING FAILED")
+		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 }
 
 // executeT2Action implements the T-2 cross-validation pipeline.
@@ -335,6 +384,9 @@ func executeNotFoundRecheck(ctx context.Context, d *dal.DAL, row *ent.State, hig
 func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus, highPriority bool) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "instrument": inst, "ts": ts, "prev_status": prevStatusStr(preclaimPrev), "streak": row.NotFoundStreak}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("fn_exit")
+
 	logrus.WithFields(logrus.Fields{
 		"instrument":  inst,
 		"ts":          ts,
@@ -342,12 +394,15 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 		"streak":      row.NotFoundStreak,
 	}).Info("ticks/T2: action start")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "instrument": inst}).Trace("before call: RequestDownload")
 	dl := RequestDownload(ctx, row, highPriority)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "status": dl.Status}).Trace("after call: RequestDownload")
 	wasNotFound := row.PreviousStatus != nil && *row.PreviousStatus == state.PreviousStatusNOT_FOUND
 
 	if dl.Status != DownloadOK {
 		if dl.Status == DownloadNotFound {
 			if wasNotFound {
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "streak": row.NotFoundStreak}).Trace("branch: T2_not_found+was_not_found")
 				// NOT_FOUND + 404: increment streak.
 				// At ≥ notFoundThreshold: validate the Zero-Row Parquet that T-1 already
 				// uploaded to R2 → CONFIRMED (same validation path as COMPLETED+2xx).
@@ -358,12 +413,14 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 					newRetryCount = 0
 				}
 				if newStreak >= notFoundThreshold {
+					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "streak": newStreak, "threshold": notFoundThreshold}).Trace("branch: T2_streak_ge_threshold")
 					logrus.WithFields(logrus.Fields{
 						"instrument": inst,
 						"ts":         ts,
 						"streak":     newStreak,
 						"threshold":  notFoundThreshold,
 					}).Info("ticks/T2: NOT_FOUND streak >= threshold → validate zero-row")
+					ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
@@ -372,13 +429,19 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
+						ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 						logrus.WithError(dbErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/T2: streak update FAILED")
 						return
 					}
+					ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 					row.NotFoundStreak = newStreak
+					ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before call: executeValidation")
 					executeValidation(ctx, d, row, preclaimPrev)
+					ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after call: executeValidation")
 				} else {
+					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "streak": newStreak}).Trace("branch: T2_streak_below_threshold")
 					logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": newStreak}).Info("ticks/T2: NOT_FOUND → NOT_FOUND (below threshold)")
+					ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 					if dbErr := d.Execute(ctx, func(tx *ent.Tx) error {
 						_, e := tx.State.UpdateOneID(row.ID).
 							SetNotFoundStreak(newStreak).
@@ -389,25 +452,37 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 							Save(ctx)
 						return e
 					}); dbErr != nil {
+						ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 						logrus.WithError(dbErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/T2: NOT_FOUND update FAILED")
+						return
 					}
+					ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 				}
 			} else {
 				// COMPLETED + unexpected 404: data was there at T-0 time — mark as anomaly.
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: T2_completed+404_broken")
 				logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Warn("ticks/T2: COMPLETED got 404 → BROKEN (data missing anomaly)")
+				ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before call: updateStateBroken")
 				updateStateBroken(ctx, d, row)
+				ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after call: updateStateBroken")
 			}
 		} else {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: T2_download_error")
 			logrus.WithError(dl.Err).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/T2: download ERROR → FAILED")
+			ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before call: updateStateFailed")
 			updateStateFailed(ctx, d, row)
+			ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after call: updateStateFailed")
 		}
 		return
 	}
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(dl.Data)}).Trace("branch: T2_download_ok")
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(dl.Data)}).Info("ticks/T2: download OK")
 	if wasNotFound {
 		// NOT_FOUND + data now available: reset streak, hand off to next cycle via PENDING.
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: T2_not_found_recovered")
 		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/T2: NOT_FOUND data recovered → streak=0 PENDING")
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 		if err := d.Execute(ctx, func(tx *ent.Tx) error {
 			_, e := tx.State.UpdateOneID(row.ID).
 				SetNotFoundStreak(0).
@@ -417,27 +492,40 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 				Save(ctx)
 			return e
 		}); err != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 			logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/T2: NOT_FOUND→PENDING FAILED")
+			return
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 		return
 	}
 
 	// COMPLETED + 2xx: full convert + upload (overwrite) + validate → CONFIRMED.
+	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: T2_completed_revalidate")
 	if row.NotFoundStreak > 0 {
+		ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before call: resetNotFoundStreak")
 		resetNotFoundStreak(ctx, d, row, "T2 reset streak")
+		ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after call: resetNotFoundStreak")
 	}
 	var uploadErr error
 	func() {
+		ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before tickProcessSem acquire")
 		tickProcessSem <- struct{}{}
+		ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after tickProcessSem acquire")
 		defer func() { <-tickProcessSem }()
-		parquet, convErr := convertBI5ToParquet(dl.Data, row)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "instrument": inst}).Trace("before call: convertBI5ToParquet")
+		parquet, convErr := convertBI5ToParquet(ctx, dl.Data, row)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "err": convErr != nil}).Trace("after call: convertBI5ToParquet")
 		if convErr != nil {
 			logrus.WithError(convErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/T2: convert FAILED")
 			uploadErr = convErr
 			return
 		}
 		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(parquet)}).Info("ticks/T2: convert OK")
-		if upErr := uploadToR2(ctx, row, parquet); upErr != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "instrument": inst}).Trace("before r2 upload")
+		upErr := uploadToR2(ctx, row, parquet)
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeT2Action", "err": upErr != nil}).Trace("after r2 upload")
+		if upErr != nil {
 			logrus.WithError(upErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/T2: upload FAILED")
 			uploadErr = upErr
 			return
@@ -445,10 +533,14 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/T2: upload OK → validating")
 	}()
 	if uploadErr != nil {
+		ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before call: updateStateFailed")
 		updateStateFailed(ctx, d, row)
+		ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after call: updateStateFailed")
 		return
 	}
+	ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("before call: executeValidation")
 	executeValidation(ctx, d, row, preclaimPrev)
+	ilogger.T(ctx).WithField("fn", "executeT2Action").Trace("after call: executeValidation")
 }
 
 // executeValidation reads the Parquet file from R2 and validates it physically.
@@ -459,52 +551,77 @@ func executeT2Action(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPr
 func executeValidation(ctx context.Context, d *dal.DAL, row *ent.State, preclaimPrev *state.PreviousStatus) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "instrument": inst, "ts": ts}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "executeValidation").Trace("fn_exit")
+
 	start := time.Now()
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/validate: reading R2")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "instrument": inst}).Trace("before r2 read")
 	fileBytes, err := readFromR2(ctx, row)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "err": err != nil}).Trace("after r2 read")
 	if err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Error("ticks/validate: R2 read FAILED → BROKEN")
 		// Unable to read the file — treat as BROKEN so Backfill can retry.
+		ilogger.T(ctx).WithField("fn", "executeValidation").Trace("before call: updateStateBroken")
 		updateStateBroken(ctx, d, row)
+		ilogger.T(ctx).WithField("fn", "executeValidation").Trace("after call: updateStateBroken")
 		return
 	}
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(fileBytes), "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/validate: validating")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "instrument": inst, "bytes": len(fileBytes)}).Trace("before call: validateParquetFile")
 	validationErr := validateParquetFile(ctx, row, fileBytes)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "err": validationErr != nil}).Trace("after call: validateParquetFile")
 	if validationErr != nil {
 		logrus.WithError(validationErr).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/validate: validation FAILED → BROKEN")
 	}
 
+	ilogger.T(ctx).WithField("fn", "executeValidation").Trace("before call: updateValidatedTickStatus")
 	if err := updateValidatedTickStatus(ctx, d, row, validationErr, preclaimPrev); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "err": true}).Trace("after call: updateValidatedTickStatus")
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/validate: status update FAILED")
+	} else {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeValidation", "err": false}).Trace("after call: updateValidatedTickStatus")
 	}
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/validate: done")
 }
 
 func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, validationErr error, preclaimPrev *state.PreviousStatus) error {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "updateValidatedTickStatus", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "updateValidatedTickStatus").Trace("fn_exit")
+
 	return d.Execute(ctx, func(tx *ent.Tx) error {
 		if validationErr == nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "next": "CONFIRMED"}).Trace("before query")
 			saved, e := tx.State.UpdateOneID(row.ID).
 				SetPreviousStatus(state.PreviousStatusPROCESSED).
 				SetStatus(state.StatusCONFIRMED).
 				SetUpdatedAt(time.Now().UTC()).
 				Save(ctx)
 			if e != nil {
+				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 				return e
 			}
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 			logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": saved.Timestamp.Format(time.RFC3339)}).Info("ticks/validate: CONFIRMED")
-			return upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "fn": "upsertSyncTaskInTx"}).Trace("before query")
+			err := upsertSyncTaskInTx(ctx, tx, saved.InstrumentID, saved.Timestamp)
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": err != nil}).Trace("after query")
+			return err
 		}
 
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "next": "BROKEN"}).Trace("before query")
 		broken, e := tx.State.UpdateOneID(row.ID).
 			SetPreviousStatus(state.PreviousStatusPROCESSED).
 			SetStatus(state.StatusBROKEN).
 			SetUpdatedAt(time.Now().UTC()).
 			Save(ctx)
 		if e != nil {
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 			return e
 		}
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 		logrus.WithFields(logrus.Fields{
 			"status":          state.StatusBROKEN,
 			"state_id":        broken.ID,
@@ -513,7 +630,10 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 			"message":         "tick parquet validation failed",
 		}).Info("state_transition")
 		if preclaimPrev != nil && *preclaimPrev == state.PreviousStatusCONFIRMED {
-			return upsertSyncTaskInTx(ctx, tx, broken.InstrumentID, broken.Timestamp)
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "fn": "upsertSyncTaskInTx"}).Trace("before query")
+			err := upsertSyncTaskInTx(ctx, tx, broken.InstrumentID, broken.Timestamp)
+			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": err != nil}).Trace("after query")
+			return err
 		}
 		return nil
 	})
@@ -522,6 +642,10 @@ func updateValidatedTickStatus(ctx context.Context, d *dal.DAL, row *ent.State, 
 // ── State transition helpers ──────────────────────────────────────────────────
 
 func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPrefix string) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "resetNotFoundStreak", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "resetNotFoundStreak").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(0).
@@ -529,8 +653,11 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 			Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("%s for %s", logPrefix, row.ID)
+		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 }
 
 // handleNotFoundSimple sets NotFoundStreak = 1 and status = NOT_FOUND.
@@ -539,6 +666,10 @@ func resetNotFoundStreak(ctx context.Context, d *dal.DAL, row *ent.State, logPre
 // and makes the first-attempt intent explicit.
 // It never touches RetryCount and never triggers the Zero-Row Parquet flow.
 func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "handleNotFoundSimple", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "handleNotFoundSimple").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetNotFoundStreak(1).
@@ -548,9 +679,11 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Error("ticks/ETL: NOT_FOUND simple FAILED")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 	logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339), "streak": 1}).Info("ticks/ETL: NOT_FOUND (first attempt)")
 }
 
@@ -559,6 +692,10 @@ func handleNotFoundSimple(ctx context.Context, d *dal.DAL, row *ent.State) {
 // a NOT_FOUND path (streak > 0), so Add is required instead of Set.
 // Like the handleNotFoundSimple, it never touches RetryCount and never triggers Zero-Row.
 func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "handleNotFoundIncrement", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "handleNotFoundIncrement").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			AddNotFoundStreak(1).
@@ -568,9 +705,11 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Error("ticks/ETL: NOT_FOUND increment FAILED")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 	logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339), "new_streak": row.NotFoundStreak + 1}).Info("ticks/ETL: NOT_FOUND (backfill increment)")
 }
 
@@ -583,11 +722,15 @@ func handleNotFoundIncrement(ctx context.Context, d *dal.DAL, row *ent.State) {
 // (e.g., a row that alternates between 404s and 503s).
 // T-1 recovery never transitions to ABANDONED — retry is unbounded.
 func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "handleRetryReset", "instrument": instrName(row), "retry_count": row.RetryCount}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "handleRetryReset").Trace("fn_exit")
+
 	newStreak := row.NotFoundStreak - 1
 	if newStreak < 0 {
 		newStreak = 0
 	}
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save"}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			AddRetryCount(1).
@@ -598,9 +741,11 @@ func handleRetryReset(ctx context.Context, d *dal.DAL, row *ent.State) {
 			Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Error("ticks/T1: retry_reset FAILED")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 	logrus.WithFields(logrus.Fields{
 		"instrument":  instrName(row),
 		"ts":          row.Timestamp.Format(time.RFC3339),
@@ -654,12 +799,18 @@ func upsertSyncTaskInTx(ctx context.Context, tx *ent.Tx, instrumentID uuid.UUID,
 func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data []byte) {
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeConvertUpload", "instrument": inst, "ts": ts}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "executeConvertUpload").Trace("fn_exit")
 
+	ilogger.T(ctx).WithField("fn", "executeConvertUpload").Trace("before tickProcessSem acquire")
 	tickProcessSem <- struct{}{}
+	ilogger.T(ctx).WithField("fn", "executeConvertUpload").Trace("after tickProcessSem acquire")
 	defer func() { <-tickProcessSem }()
 	start := time.Now()
 
-	parquet, err := convertBI5ToParquet(data, row)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeConvertUpload", "instrument": inst}).Trace("before call: convertBI5ToParquet")
+	parquet, err := convertBI5ToParquet(ctx, data, row)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeConvertUpload", "err": err != nil}).Trace("after call: convertBI5ToParquet")
 	if err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Error("ticks/ETL: convert FAILED")
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "convert failed")
@@ -670,13 +821,22 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 	if row.Edges.Instrument != nil {
 		logrus.WithFields(logrus.Fields{"key": r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp), "bytes": len(parquet)}).Debug("ticks/ETL: uploading")
 	}
+	r2Key := ""
+	if row.Edges.Instrument != nil {
+		r2Key = r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
+	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeConvertUpload", "key": r2Key}).Trace("before r2 upload")
 	if err := uploadToR2(ctx, row, parquet); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeConvertUpload", "key": r2Key, "err": true}).Trace("after r2 upload")
 		logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Error("ticks/ETL: upload FAILED")
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusPROCESSED, state.StatusFAILED, "upload failed")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeConvertUpload", "key": r2Key, "err": false}).Trace("after r2 upload")
 	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/ETL: upload OK → COMPLETED")
+	ilogger.T(ctx).WithField("fn", "executeConvertUpload").Trace("before call: updateStateCompleted")
 	updateStateCompleted(ctx, d, row)
+	ilogger.T(ctx).WithField("fn", "executeConvertUpload").Trace("after call: updateStateCompleted")
 }
 
 // updateSimpleStatus writes a single status transition to the DB.
@@ -691,6 +851,10 @@ func executeConvertUpload(ctx context.Context, d *dal.DAL, row *ent.State, data 
 // in the same pipeline (e.g., executeIngestionETL resets streak to 0 on data-found,
 // then executeConvertUpload fails — touching streak here would undo that reset).
 func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev state.PreviousStatus, next state.Status, errMsg string) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "updateSimpleStatus", "prev": prev, "next": next}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "updateSimpleStatus").Trace("fn_exit")
+
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "prev": prev, "next": next}).Trace("before query")
 	if err := d.Execute(ctx, func(tx *ent.Tx) error {
 		_, e := tx.State.UpdateOneID(row.ID).
 			SetPreviousStatus(prev).
@@ -699,9 +863,11 @@ func updateSimpleStatus(ctx context.Context, d *dal.DAL, row *ent.State, prev st
 			Save(ctx)
 		return e
 	}); err != nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 		logrus.WithError(err).Errorf("%s for %s", errMsg, row.ID)
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false}).Trace("after query")
 	logrus.WithFields(logrus.Fields{
 		"instrument":  instrName(row),
 		"ts":          row.Timestamp.Format(time.RFC3339),
@@ -740,13 +906,18 @@ func isRateLimitedError(err error) bool { return errors.Is(err, errRateLimited) 
 // Must only be called from a download gate worker (runDownloadWorker) after a
 // rate-gate token has been consumed. Direct calls bypass the concurrency budget.
 func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "downloadBI5", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "downloadBI5").Trace("fn_exit")
+
 	if dukClient == nil {
 		return nil, errClientsNotInitialized
 	}
 	if row.Edges.Instrument == nil {
 		return nil, fmt.Errorf("downloadBI5: instrument edge not loaded for state %s", row.ID)
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "downloadBI5", "instrument": row.Edges.Instrument.Name}).Trace("before call: dukClient.FetchBI5")
 	data, err := dukClient.FetchBI5(ctx, row.Edges.Instrument.Name, row.Timestamp)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "downloadBI5", "err": err != nil}).Trace("after call: dukClient.FetchBI5")
 	if errors.Is(err, dukascopy.ErrNotFound) {
 		return nil, errNotFound
 	}
@@ -765,16 +936,22 @@ func downloadBI5(ctx context.Context, row *ent.State) ([]byte, error) {
 //
 // The instrument's Divider field is used to convert integer prices to actual
 // decimal prices (e.g., divider=100,000 for EUR/USD, 1,000 for XAU/USD).
-func convertBI5ToParquet(raw []byte, row *ent.State) ([]byte, error) {
+func convertBI5ToParquet(ctx context.Context, raw []byte, row *ent.State) ([]byte, error) {
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "convertBI5ToParquet", "instrument": instrName(row)}).Trace("fn_entry")
+	defer ilogger.T(ctx).WithField("fn", "convertBI5ToParquet").Trace("fn_exit")
+
 	if row.Edges.Instrument == nil {
 		return nil, fmt.Errorf("convertBI5ToParquet: instrument edge not loaded for state %s", row.ID)
 	}
 	inst := row.Edges.Instrument
 
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "convertBI5ToParquet", "instrument": inst.Name}).Trace("before call: dukascopy.ParseBI5")
 	ticks, err := dukascopy.ParseBI5(raw, row.Timestamp, inst.Divider)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "convertBI5ToParquet", "err": err != nil}).Trace("after call: dukascopy.ParseBI5")
 	if err != nil {
 		return nil, fmt.Errorf("convertBI5ToParquet: parse BI5: %w", err)
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "convertBI5ToParquet", "instrument": inst.Name, "ticks": len(ticks)}).Trace("parsed ticks count")
 	logrus.WithFields(logrus.Fields{"instrument": inst.Name, "ts": row.Timestamp.Format(time.RFC3339), "ticks": len(ticks)}).Debug("ticks/ETL: parsed")
 	if logrus.IsLevelEnabled(logrus.TraceLevel) && len(ticks) > 0 {
 		first, last := ticks[0], ticks[len(ticks)-1]
@@ -793,7 +970,10 @@ func convertBI5ToParquet(raw []byte, row *ent.State) ([]byte, error) {
 			AskVolume:  int64(t.AskVolume),
 		}
 	}
-	return tickparquet.Write(rows)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "convertBI5ToParquet", "instrument": inst.Name, "rows": len(rows)}).Trace("before call: tickparquet.Write")
+	result, writeErr := tickparquet.Write(rows)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "convertBI5ToParquet", "err": writeErr != nil}).Trace("after call: tickparquet.Write")
+	return result, writeErr
 }
 
 // uploadToR2 puts the Parquet bytes at the canonical R2 object path for this row.
@@ -810,7 +990,10 @@ func uploadToR2(ctx context.Context, row *ent.State, data []byte) error {
 		return fmt.Errorf("uploadToR2: instrument edge not loaded for state %s", row.ID)
 	}
 	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	return r2Client.PutObject(ctx, key, data)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "uploadToR2", "key": key, "bytes": len(data)}).Trace("before r2 upload")
+	err := r2Client.PutObject(ctx, key, data)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "uploadToR2", "key": key, "err": err != nil}).Trace("after r2 upload")
+	return err
 }
 
 // readFromR2 downloads the Parquet file for this row from R2 so it can be
@@ -823,7 +1006,10 @@ func readFromR2(ctx context.Context, row *ent.State) ([]byte, error) {
 		return nil, fmt.Errorf("readFromR2: instrument edge not loaded for state %s", row.ID)
 	}
 	key := r2.TickObjectKey(row.Edges.Instrument.Name, row.Timestamp)
-	return r2Client.GetObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "readFromR2", "key": key}).Trace("before r2 read")
+	data, err := r2Client.GetObject(ctx, key)
+	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "readFromR2", "key": key, "err": err != nil}).Trace("after r2 read")
+	return data, err
 }
 
 // validateParquetFile runs the four-step physical validation from §6.3:
