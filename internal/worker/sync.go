@@ -33,9 +33,10 @@ func RunSyncHandler(ctx context.Context, d *dal.DAL, onStarted func()) bool {
 	tasks, err := claimBatchSyncTasks(ctx, d)
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "RunSyncHandler", "tasks": len(tasks), "err": err != nil}).Trace("after call: claimBatchSyncTasks")
 	if err != nil {
-		logrus.WithError(err).Error("sync: claim batch")
+		ilogger.T(ctx).WithError(err).Error("sync: claim batch")
 		return false
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"tasks_claimed": len(tasks), "batch_size": syncBatchSize}).Debug("sync: claim vars")
 
 	if len(tasks) == 0 {
 		ilogger.T(ctx).WithField("fn", "RunSyncHandler").Trace("branch: no tasks claimed")
@@ -97,6 +98,7 @@ func claimBatchSyncTasks(ctx context.Context, d *dal.DAL) ([]*ent.SyncTask, erro
 		defer func(rows *sql.Rows) { _ = rows.Close() }(rows)
 
 		for rows.Next() {
+			ilogger.T(ctx).WithField("fn", "claimBatchSyncTasks").Trace("loop: scan sync task row")
 			task := &ent.SyncTask{}
 			var status string
 			if err := rows.Scan(
@@ -106,6 +108,7 @@ func claimBatchSyncTasks(ctx context.Context, d *dal.DAL) ([]*ent.SyncTask, erro
 				return err
 			}
 			task.Status = synctask.Status(status)
+			ilogger.T(ctx).WithFields(logrus.Fields{"task_id": task.ID, "instrument": task.InstrumentID, "date": task.TargetDate.Format(time.DateOnly), "hours_count": task.HoursCount, "status": task.Status}).Debug("sync: scanned task row vars")
 			tasks = append(tasks, task)
 		}
 		return rows.Err()
@@ -131,6 +134,11 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 
 	windowStart := task.TargetDate
 	windowEnd := task.TargetDate.Add(24 * time.Hour)
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"task_id": task.ID, "instrument": task.InstrumentID,
+		"window_start": windowStart.Format(time.DateOnly), "window_end": windowEnd.Format(time.DateOnly),
+		"hours_count_before": task.HoursCount,
+	}).Debug("sync: task vars")
 
 	// Step 1: count + branch.
 	var actualCount int
@@ -172,14 +180,17 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		return nil
 	}); err != nil {
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count", "err": true}).Trace("after query")
-		logrus.WithError(err).WithField("state_id", task.ID).Error("sync: task count/reset")
+		ilogger.T(ctx).WithError(err).WithField("state_id", task.ID).Error("sync: task count/reset")
 		return
 	}
 	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.Count", "actual_count": actualCount}).Trace("after query")
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"task_id": task.ID, "actual_count": actualCount, "threshold": 24, "is_ready": actualCount >= 24,
+	}).Debug("sync: count vars")
 
 	if actualCount < 24 {
 		ilogger.T(ctx).WithFields(logrus.Fields{"task_id": task.ID, "actual_count": actualCount}).Trace("branch: sync_task_pending_reset")
-		logrus.WithFields(logrus.Fields{
+		ilogger.T(ctx).WithFields(logrus.Fields{
 			"state_id":   task.ID,
 			"instrument": task.InstrumentID,
 			"date":       task.TargetDate.Format(time.DateOnly),
@@ -217,12 +228,12 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		return nil
 	}); err != nil {
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Update.Exec + SyncTask.Delete.Exec", "err": true}).Trace("after query")
-		logrus.WithError(err).WithField("state_id", task.ID).Error("sync: task finalize")
+		ilogger.T(ctx).WithError(err).WithField("state_id", task.ID).Error("sync: task finalize")
 		return
 	}
 	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Update.Exec + SyncTask.Delete.Exec", "err": false}).Trace("after query")
 
-	logrus.WithFields(logrus.Fields{
+	ilogger.T(ctx).WithFields(logrus.Fields{
 		"state_id":   task.ID,
 		"instrument": task.InstrumentID,
 		"date":       task.TargetDate.Format(time.DateOnly),

@@ -32,9 +32,7 @@ func RegisterRoutes(app *fiber.App, d *dal.DAL, logger *activitylog.Logger, r2c 
 		v1.Use(func(c *fiber.Ctx) error {
 			incoming := c.Get("X-Ingestion-Secret")
 			if subtle.ConstantTimeCompare([]byte(incoming), secretBytes) != 1 {
-				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-					"error": "unauthorized: missing or invalid X-Ingestion-Secret",
-				})
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized: missing or invalid X-Ingestion-Secret"})
 			}
 			return c.Next()
 		})
@@ -183,10 +181,10 @@ func extractCtx(c *fiber.Ctx) context.Context {
 	traceID := uuid.New().String()
 	ctx := ilogger.WithTraceID(context.WithoutCancel(c.UserContext()), traceID)
 	ilogger.T(ctx).WithFields(logrus.Fields{
-		"method":     c.Method(),
-		"path":       c.Path(),
-		"ip":         c.IP(),
-		"trace_id":   traceID,
+		"method":   c.Method(),
+		"path":     c.Path(),
+		"ip":       c.IP(),
+		"trace_id": traceID,
 	}).Trace("api: trace start")
 	return ctx
 }

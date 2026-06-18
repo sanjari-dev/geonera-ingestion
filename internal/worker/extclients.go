@@ -3,9 +3,9 @@ package worker
 import (
 	"errors"
 	"os"
+	"strconv"
 
 	"github.com/sirupsen/logrus"
-	"strconv"
 
 	"github.com/sanjari-dev/geonera-ingestion/internal/activitylog"
 	"github.com/sanjari-dev/geonera-ingestion/internal/dukascopy"

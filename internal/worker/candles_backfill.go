@@ -46,31 +46,34 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runCandleBackfill", "boundary": boundary.Format(time.DateOnly)}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "runCandleBackfill").Trace("fn_exit")
 
-	logrus.WithFields(logrus.Fields{"boundary": boundary.Format(time.DateOnly), "claim_limit": candleBackfillClaimLimit}).Info("candle/backfill: start")
+	ilogger.T(ctx).WithFields(logrus.Fields{"boundary": boundary.Format(time.DateOnly), "claim_limit": candleBackfillClaimLimit}).Info("candle/backfill: start")
 
 	ilogger.T(ctx).WithField("fn", "runCandleBackfill").Trace("before call: claimCandleBackfillBatch")
 	batch, err := claimCandleBackfillBatch(ctx, d, boundary)
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runCandleBackfill", "batch_size": len(batch), "err": err != nil}).Trace("after call: claimCandleBackfillBatch")
 	if err != nil {
-		logrus.WithError(err).Error("candle backfill: master claim")
+		ilogger.T(ctx).WithError(err).Error("candle backfill: master claim")
 		return
 	}
 
 	if len(batch) == 0 {
 		ilogger.T(ctx).WithField("fn", "runCandleBackfill").Trace("branch: empty_batch")
-		logrus.WithField("boundary", boundary.Format(time.DateOnly)).Info("candle/backfill: no rows to process")
+		ilogger.T(ctx).WithField("boundary", boundary.Format(time.DateOnly)).Info("candle/backfill: no rows to process")
 	} else {
 		layerCounts := map[candleBackfillLayer]int{}
 		for _, item := range batch {
 			layerCounts[item.layer]++
 		}
-		logrus.WithFields(logrus.Fields{
-			"batch_size":  len(batch),
-			"aggregate":   layerCounts[candleLayerAggregate],
-			"reset":       layerCounts[candleLayerReset],
-			"validation":  layerCounts[candleLayerValidation],
-			"none":        layerCounts[candleLayerNone],
-		}).Info("candle/backfill: claimed rows")
+		ilogger.T(ctx).WithFields(
+			logrus.Fields{
+				"batch_size": len(batch),
+				"aggregate":  layerCounts[candleLayerAggregate],
+				"reset":      layerCounts[candleLayerReset],
+				"validation": layerCounts[candleLayerValidation],
+				"none":       layerCounts[candleLayerNone],
+			},
+		).
+			Info("candle/backfill: claimed rows")
 	}
 
 	var batchWg sync.WaitGroup
@@ -94,7 +97,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 		resetCandleAbandonedRows(ctx, d, boundary)
 		ilogger.T(ctx).WithField("fn", "runCandleBackfill").Trace("after call: resetCandleAbandonedRows")
 	}
-	logrus.WithFields(logrus.Fields{"boundary": boundary.Format(time.DateOnly), "rows": len(batch)}).Info("candle/backfill: done")
+	ilogger.T(ctx).WithFields(logrus.Fields{"boundary": boundary.Format(time.DateOnly), "rows": len(batch)}).Info("candle/backfill: done")
 }
 
 // ── Backfill helpers ──────────────────────────────────────────────────────────
@@ -140,8 +143,18 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 			return e
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "count": len(rows)}).Trace("after query")
+		ilogger.T(ctx).WithFields(
+			logrus.Fields{
+				"boundary":      boundary.Format(time.DateOnly),
+				"rows_returned": len(rows),
+				"claim_limit":   candleBackfillClaimLimit,
+			},
+		).
+			Debug("candle/backfill: query result vars")
 
 		for _, row := range rows {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "status": row.Status, "date": row.Timestamp.Format(time.DateOnly)}).Trace("loop: candle claim row start")
+
 			originalStatus := row.Status
 
 			var newPrev state.PreviousStatus
@@ -157,13 +170,13 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 			case state.StatusPROCESSED:
 				// Zombie: resolved at claim time, no goroutine dispatched.
 				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row)}).Trace("branch: candle_claim_routing_zombie")
-				logrus.WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly)}).Info("candle/backfill: claim zombie → PENDING")
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly)}).Info("candle/backfill: claim zombie → PENDING")
 				newPrev, newStatus, layer = state.PreviousStatusPROCESSED, state.StatusPENDING, candleLayerNone
 
 			case state.StatusFAILED:
 				if row.RetryCount > candleMaxRetryCount {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: candle_claim_routing_failed_abandoned")
-					logrus.WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "retry_count": row.RetryCount}).Info("candle/backfill: claim FAILED→ABANDONED")
+					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "retry_count": row.RetryCount}).Info("candle/backfill: claim FAILED→ABANDONED")
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusABANDONED, candleLayerNone
 				} else {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: candle_claim_routing_failed_reset")
@@ -173,7 +186,7 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 			case state.StatusBROKEN:
 				if row.RetryCount > candleMaxRetryCount {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: candle_claim_routing_broken_abandoned")
-					logrus.WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "retry_count": row.RetryCount}).Info("candle/backfill: claim BROKEN→ABANDONED")
+					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "retry_count": row.RetryCount}).Info("candle/backfill: claim BROKEN→ABANDONED")
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusABANDONED, candleLayerNone
 				} else {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: candle_claim_routing_broken_reset")
@@ -189,20 +202,13 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 				continue
 			}
 
-			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "instrument": instrName(row), "new_status": newStatus}).Trace("before query")
-			updated, ue := tx.State.UpdateOneID(row.ID).
-				SetPreviousStatus(newPrev).
-				SetStatus(newStatus).
-				SetUpdatedAt(time.Now().UTC()).
-				Save(ctx)
+			updated, ue := applyStateClaimUpdate(ctx, tx, row, newPrev, newStatus, layer)
 			if ue != nil {
-				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 				return ue
 			}
-			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false, "layer": layer}).Trace("after query")
-			updated.Edges = row.Edges
 
 			routed = append(routed, candleRoutedRow{row: updated, layer: layer})
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(updated), "layer": layer, "new_status": newStatus}).Trace("loop: candle claim row end")
 		}
 		return nil
 	})
@@ -220,22 +226,33 @@ func dispatchCandleBackfillRow(ctx context.Context, d *dal.DAL, item candleRoute
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "dispatchCandleBackfillRow", "instrument": inst, "layer": item.layer}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("fn_exit")
 
+	ilogger.T(ctx).WithFields(
+		logrus.Fields{
+			"state_id":    item.row.ID,
+			"date":        date,
+			"retry_count": item.row.RetryCount,
+			"prev_status": prevStatusStr(item.row.PreviousStatus),
+			"layer":       item.layer,
+		},
+	).
+		Debug("candle/backfill: dispatch row vars")
+
 	switch item.layer {
 	case candleLayerAggregate:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "date": date}).Trace("branch: candle_dispatch_aggregate")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "date": date}).Info("candle/backfill: dispatch aggregate")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "date": date}).Info("candle/backfill: dispatch aggregate")
 		ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("before call: executeCandleAggregation")
 		executeCandleAggregation(ctx, d, item.row)
 		ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("after call: executeCandleAggregation")
 	case candleLayerReset:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "date": date, "retry_count": item.row.RetryCount}).Trace("branch: candle_dispatch_reset")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "date": date, "retry_count": item.row.RetryCount}).Info("candle/backfill: dispatch reset")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "date": date, "retry_count": item.row.RetryCount}).Info("candle/backfill: dispatch reset")
 		ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("before call: executeCandleRetryReset")
 		executeCandleRetryReset(ctx, d, item.row)
 		ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("after call: executeCandleRetryReset")
 	case candleLayerValidation:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "date": date}).Trace("branch: candle_dispatch_validation")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "date": date}).Info("candle/backfill: dispatch validation")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "date": date}).Info("candle/backfill: dispatch validation")
 		ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("before call: executeCandleValidation")
 		executeCandleValidation(ctx, d, item.row)
 		ilogger.T(ctx).WithField("fn", "dispatchCandleBackfillRow").Trace("after call: executeCandleValidation")
@@ -262,15 +279,16 @@ func executeCandleValidation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	stored, err := readCandleParquetFromR2(ctx, row)
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleValidation", "err": err != nil}).Trace("after r2 read-back")
 	if err != nil {
-		logrus.WithError(err).Errorf("candle validation %s: read-back", row.ID)
+		ilogger.T(ctx).WithError(err).Errorf("candle validation %s: read-back", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "read-back candle parquet failed")
 		return
 	}
+	ilogger.T(ctx).WithFields(logrus.Fields{"state_id": row.ID, "instrument": instrName(row), "bytes": len(stored)}).Debug("candle/validation: read-back vars")
 
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleValidation", "bytes": len(stored)}).Trace("before call: validateCandleParquet")
 	if err := validateCandleParquet(ctx, row, stored); err != nil {
 		ilogger.T(ctx).WithFields(logrus.Fields{"fn": "executeCandleValidation", "err": true}).Trace("after call: validateCandleParquet")
-		logrus.WithError(err).Errorf("candle validation %s: validate", row.ID)
+		ilogger.T(ctx).WithError(err).Errorf("candle validation %s: validate", row.ID)
 		updateSimpleStatus(ctx, d, row, state.PreviousStatusCOMPLETED, state.StatusBROKEN, "validate candle parquet failed")
 		return
 	}
@@ -289,23 +307,29 @@ func resetCandleAbandonedRows(ctx context.Context, d *dal.DAL, boundary time.Tim
 
 	for ctx.Err() == nil {
 		ilogger.T(ctx).WithField("fn", "resetCandleAbandonedRows").Trace("loop: iteration start")
-
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First+UpdateOneID.Save"}).Trace("before query")
 		err := d.Execute(ctx, func(tx *ent.Tx) error {
-			row, err := candleStateRows(tx.State.Query(),
+			row, err := candleStateRows(
+				tx.State.Query(),
 				state.StatusEQ(state.StatusABANDONED),
 				state.TimestampLTE(boundary),
-			).Order(state.ByTimestamp()).FirstForUpdateSkipLocked(ctx)
+			).
+				Order(state.ByTimestamp()).
+				FirstForUpdateSkipLocked(ctx)
+
 			if err != nil {
 				return err
 			}
 			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row)}).Trace("branch: resetting_abandoned_candle")
-			_, err = tx.State.UpdateOneID(row.ID).
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "state_id": row.ID, "retry_count": row.RetryCount}).Debug("candle/backfill: abandoned reset row vars")
+			_, err = tx.State.
+				UpdateOneID(row.ID).
 				SetPreviousStatus(state.PreviousStatusABANDONED).
 				SetStatus(state.StatusPENDING).
 				SetRetryCount(0).
 				SetUpdatedAt(time.Now().UTC()).
 				Save(ctx)
+
 			return err
 		})
 		if err != nil {
@@ -314,11 +338,10 @@ func resetCandleAbandonedRows(ctx context.Context, d *dal.DAL, boundary time.Tim
 				break
 			}
 			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First+UpdateOneID.Save", "err": true}).Trace("after query")
-			logrus.WithError(err).Error("candle abandoned reset")
+			ilogger.T(ctx).WithError(err).Error("candle abandoned reset")
 			break
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.First+UpdateOneID.Save", "err": false}).Trace("after query")
-
 		ilogger.T(ctx).WithField("fn", "resetCandleAbandonedRows").Trace("loop: iteration end")
 	}
 }

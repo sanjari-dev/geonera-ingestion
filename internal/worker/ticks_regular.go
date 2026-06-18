@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
-	"time"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
@@ -25,7 +25,7 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runT0Phase", "target": target.Format(time.RFC3339)}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "runT0Phase").Trace("fn_exit")
 
-	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T0: start")
+	ilogger.T(ctx).WithField("target", target.Format(time.RFC3339)).Info("ticks/T0: start")
 
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runT0Phase", "target": target.Format(time.RFC3339)}).Trace("before call: ensureT0TickTasks")
 	ensureT0TickTasks(ctx, d, target)
@@ -35,7 +35,7 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	runIngestionLoop(ctx, d, &target)
 	ilogger.T(ctx).WithField("fn", "runT0Phase").Trace("after call: runIngestionLoop")
 
-	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T0: done")
+	ilogger.T(ctx).WithField("target", target.Format(time.RFC3339)).Info("ticks/T0: done")
 }
 
 // ensureT0TickTasks inserts a PENDING TICK row at target for every instrument
@@ -59,19 +59,22 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 			return fmt.Errorf("query instruments: %w", err)
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "Instrument.Query.All", "count": len(instruments)}).Trace("after query")
-		logrus.WithFields(logrus.Fields{"count": len(instruments), "target": target.Format(time.RFC3339)}).Info("ticks/T0: seeding PENDING tasks")
+		ilogger.T(ctx).WithFields(logrus.Fields{"count": len(instruments), "target": target.Format(time.RFC3339)}).Info("ticks/T0: seeding PENDING tasks")
 		insertedAt := time.Now().UTC()
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument_count": len(instruments), "target": target.Format(time.RFC3339), "inserted_at": insertedAt}).Debug("ticks/T0: seed loop vars")
 		for _, inst := range instruments {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("loop: T0 seed iteration start")
 			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "instrument": inst.Name}).Trace("before query")
 			if err := insertStatePendingOnConflictDoNothing(ctx, tx, inst.ID, state.JobTypeTICK, target, insertedAt); err != nil {
 				ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "err": true}).Trace("after query")
 				return fmt.Errorf("ensure T0 task %s at %s: %w", inst.Name, target, err)
 			}
 			ilogger.T(ctx).WithFields(logrus.Fields{"query": "ExecContext", "instrument": inst.Name, "err": false}).Trace("after query")
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst.Name}).Trace("loop: T0 seed iteration end")
 		}
 		return nil
 	}); err != nil {
-		logrus.WithError(err).WithField("target", target.Format(time.RFC3339)).Error("ticks/T0: ensure tasks error")
+		ilogger.T(ctx).WithError(err).WithField("target", target.Format(time.RFC3339)).Error("ticks/T0: ensure tasks error")
 	}
 }
 
@@ -85,13 +88,13 @@ func runT1Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runT1Phase", "target": target.Format(time.RFC3339)}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "runT1Phase").Trace("fn_exit")
 
-	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T1: start")
+	ilogger.T(ctx).WithField("target", target.Format(time.RFC3339)).Info("ticks/T1: start")
 
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runT1Phase", "target": target.Format(time.RFC3339)}).Trace("before call: runRecoveryLoop")
 	runRecoveryLoop(ctx, d, target)
 	ilogger.T(ctx).WithField("fn", "runT1Phase").Trace("after call: runRecoveryLoop")
 
-	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T1: done")
+	ilogger.T(ctx).WithField("target", target.Format(time.RFC3339)).Info("ticks/T1: done")
 }
 
 // ── T-2: two-hours-ago physical validation ────────────────────────────────────
@@ -104,7 +107,7 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runT2Phase", "target": target.Format(time.RFC3339)}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "runT2Phase").Trace("fn_exit")
 
-	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T2: start")
+	ilogger.T(ctx).WithField("target", target.Format(time.RFC3339)).Info("ticks/T2: start")
 	// T-2 Regular: claims COMPLETED + NOT_FOUND, re-downloads BI5 for cross-validation.
 	// COMPLETED → re-download matches → CONFIRMED; NOT_FOUND → streak+1, at ≥3 → CONFIRMED.
 	// IsPause=false enforced, consistent with T-0 and T-1.
@@ -112,7 +115,7 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	runValidationLoop(ctx, d, &target)
 	ilogger.T(ctx).WithField("fn", "runT2Phase").Trace("after call: runValidationLoop")
 
-	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T2: done")
+	ilogger.T(ctx).WithField("target", target.Format(time.RFC3339)).Info("ticks/T2: done")
 }
 
 // runIngestionLoop claims PENDING TICK rows one at a time for the given hour
@@ -138,11 +141,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked"}).Trace("before query")
 		claimed, err := claimStateAsProcessed(ctx, d, func(q *ent.StateQuery) *ent.StateQuery {
-			query := tickActiveStateRows(q,
-				state.StatusEQ(state.StatusPENDING),
-			).
-				WithInstrument().
-				Order(state.ByTimestamp())
+			query := tickActiveStateRows(q, state.StatusEQ(state.StatusPENDING)).WithInstrument().Order(state.ByTimestamp())
 			if timestamp != nil {
 				query = query.Where(state.TimestampEQ(*timestamp))
 			}
@@ -154,13 +153,22 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 				break
 			}
 			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "err": true}).Trace("after query")
-			logrus.WithError(err).Error("ticks/T0: ingestion claim error")
+			ilogger.T(ctx).WithError(err).Error("ticks/T0: ingestion claim error")
+			break
+		}
+		if claimed == nil {
 			break
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "found": true, "instrument": instrName(claimed)}).Trace("after query")
+		ilogger.T(ctx).WithFields(logrus.Fields{
+			"state_id":    claimed.ID,
+			"ts":          claimed.Timestamp.Format(time.RFC3339),
+			"retry_count": claimed.RetryCount,
+			"streak":      claimed.NotFoundStreak,
+		}).Debug("ticks/T0: claimed vars")
 
 		count++
-		logrus.WithFields(logrus.Fields{
+		ilogger.T(ctx).WithFields(logrus.Fields{
 			"instrument": instrName(claimed),
 			"ts":         claimed.Timestamp.Format(time.RFC3339),
 			"state_id":   claimed.ID,
@@ -181,7 +189,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	loopWg.Wait()
 	ilogger.T(ctx).WithField("fn", "runIngestionLoop").Trace("after loopWg.Wait")
 	if timestamp != nil {
-		logrus.WithFields(logrus.Fields{"rows": count, "target": timestamp.Format(time.RFC3339)}).Info("ticks/T0: ingestion loop complete")
+		ilogger.T(ctx).WithFields(logrus.Fields{"rows": count, "target": timestamp.Format(time.RFC3339)}).Info("ticks/T0: ingestion loop complete")
 	}
 }
 
@@ -227,13 +235,23 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 				break
 			}
 			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "err": true}).Trace("after query")
-			logrus.WithError(err).WithField("target", target.Format(time.RFC3339)).Error("ticks/T1: recovery claim error")
+			ilogger.T(ctx).WithError(err).WithField("target", target.Format(time.RFC3339)).Error("ticks/T1: recovery claim error")
+			break
+		}
+		if claimed == nil {
 			break
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "found": true, "instrument": instrName(claimed)}).Trace("after query")
+		ilogger.T(ctx).WithFields(logrus.Fields{
+			"state_id":    claimed.ID,
+			"ts":          claimed.Timestamp.Format(time.RFC3339),
+			"retry_count": claimed.RetryCount,
+			"streak":      claimed.NotFoundStreak,
+			"prev_status": prevStatusStr(claimed.PreviousStatus),
+		}).Debug("ticks/T1: claimed vars")
 
 		count++
-		logrus.WithFields(logrus.Fields{
+		ilogger.T(ctx).WithFields(logrus.Fields{
 			"instrument":  instrName(claimed),
 			"ts":          claimed.Timestamp.Format(time.RFC3339),
 			"state_id":    claimed.ID,
@@ -255,7 +273,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 	ilogger.T(ctx).WithField("fn", "runRecoveryLoop").Trace("before loopWg.Wait")
 	loopWg.Wait()
 	ilogger.T(ctx).WithField("fn", "runRecoveryLoop").Trace("after loopWg.Wait")
-	logrus.WithFields(logrus.Fields{"rows": count, "target": target.Format(time.RFC3339)}).Info("ticks/T1: recovery loop complete")
+	ilogger.T(ctx).WithFields(logrus.Fields{"rows": count, "target": target.Format(time.RFC3339)}).Info("ticks/T1: recovery loop complete")
 }
 
 // runValidationLoop claims COMPLETED and NOT_FOUND rows for the given hour
@@ -304,13 +322,18 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 				break
 			}
 			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "err": true}).Trace("after query")
-			logrus.WithError(err).Error("ticks/T2: validation claim error")
+			ilogger.T(ctx).WithError(err).Error("ticks/T2: validation claim error")
 			break
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "found": true, "instrument": instrName(claimed)}).Trace("after query")
+		ilogger.T(ctx).WithFields(logrus.Fields{
+			"state_id": claimed.ID, "ts": claimed.Timestamp.Format(time.RFC3339),
+			"retry_count": claimed.RetryCount, "streak": claimed.NotFoundStreak,
+			"preclaim_prev": prevStatusStr(preclaimPrev),
+		}).Debug("ticks/T2: claimed vars")
 
 		count++
-		logrus.WithFields(logrus.Fields{
+		ilogger.T(ctx).WithFields(logrus.Fields{
 			"instrument":  instrName(claimed),
 			"ts":          claimed.Timestamp.Format(time.RFC3339),
 			"state_id":    claimed.ID,
@@ -332,7 +355,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	loopWg.Wait()
 	ilogger.T(ctx).WithField("fn", "runValidationLoop").Trace("after loopWg.Wait")
 	if timestamp != nil {
-		logrus.WithFields(logrus.Fields{"rows": count, "target": timestamp.Format(time.RFC3339)}).Info("ticks/T2: validation loop complete")
+		ilogger.T(ctx).WithFields(logrus.Fields{"rows": count, "target": timestamp.Format(time.RFC3339)}).Info("ticks/T2: validation loop complete")
 	}
 }
 
@@ -348,11 +371,15 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 	}
 	inst := instrName(row)
 	ts := row.Timestamp.Format(time.RFC3339)
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"state_id": row.ID, "instrument": inst, "ts": ts,
+		"retry_count": row.RetryCount, "streak": row.NotFoundStreak, "prev": prevStatusStr(prev),
+	}).Debug("ticks/T1: recovery vars")
 	switch *prev {
 	case state.PreviousStatusPROCESSED, state.PreviousStatusPENDING:
 		// Stuck PROCESSED or stale PENDING → reset to PENDING for the next T-0 run.
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "prev": *prev}).Trace("branch: T1_zombie_reset_pending")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": *prev}).Info("ticks/T1: zombie → PENDING")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": *prev}).Info("ticks/T1: zombie → PENDING")
 		ilogger.T(ctx).WithField("fn", "executeRecoveryAction").Trace("before call: resetStateToPending")
 		resetStateToPending(ctx, d, row)
 		ilogger.T(ctx).WithField("fn", "executeRecoveryAction").Trace("after call: resetStateToPending")
@@ -360,7 +387,7 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
 		// Increment RetryCount, decrement NotFoundStreak (floor 0), always → PENDING.
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "prev": *prev, "retry_count": row.RetryCount}).Trace("branch: T1_retry_reset")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": *prev, "retry_count": row.RetryCount}).Info("ticks/T1: retry → PENDING")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": *prev, "retry_count": row.RetryCount}).Info("ticks/T1: retry → PENDING")
 		ilogger.T(ctx).WithField("fn", "executeRecoveryAction").Trace("before call: handleRetryReset")
 		handleRetryReset(ctx, d, row)
 		ilogger.T(ctx).WithField("fn", "executeRecoveryAction").Trace("after call: handleRetryReset")
@@ -368,7 +395,7 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 	case state.PreviousStatusNOT_FOUND:
 		// Re-check API: data → PENDING+streak=0; still 404 → Zero-Row+NOT_FOUND.
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "streak": row.NotFoundStreak}).Trace("branch: T1_not_found_recheck")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": row.NotFoundStreak}).Info("ticks/T1: recheck")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": row.NotFoundStreak}).Info("ticks/T1: recheck")
 		ilogger.T(ctx).WithField("fn", "executeRecoveryAction").Trace("before call: executeNotFoundRecheck")
 		executeNotFoundRecheck(ctx, d, row, true)
 		ilogger.T(ctx).WithField("fn", "executeRecoveryAction").Trace("after call: executeNotFoundRecheck")

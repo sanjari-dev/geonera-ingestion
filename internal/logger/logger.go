@@ -7,15 +7,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// L is the global structured logger. All packages use the logrus global
-// functions (logrus.Infof, logrus.Errorf, logrus.Fatalf, etc.) which delegate here.
-var L = logrus.StandardLogger()
-
 func init() {
-	logrus.SetFormatter(&logrus.JSONFormatter{
-		TimestampFormat: time.RFC3339,
-	})
-	level := logrus.InfoLevel
+	logrus.SetFormatter(&logrus.JSONFormatter{TimestampFormat: time.RFC3339})
+	level := logrus.TraceLevel
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		if parsed, err := logrus.ParseLevel(v); err == nil {
 			level = parsed

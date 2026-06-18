@@ -21,12 +21,15 @@ func NewEntClient(ctx context.Context) (*ent.Client, *sql.DB, error) {
 	if dsn == "" {
 		return nil, nil, fmt.Errorf("DATABASE_URL is not set")
 	}
-
 	if err := ping(ctx, dsn); err != nil {
 		return nil, nil, err
 	}
 
-	return openEnt(dsn)
+	client, db, err := openEnt(dsn)
+	if err != nil {
+		return nil, nil, err
+	}
+	return client, db, nil
 }
 
 // openEnt opens an ent.Client for the given DSN without pinging (caller already pinged).

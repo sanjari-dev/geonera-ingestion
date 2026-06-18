@@ -43,7 +43,7 @@ type downloadRequest struct {
 var regularDownloadQueue = make(chan downloadRequest, dukascopyBurst)
 
 // backfillDownloadQueue carries requests from the Backfill master-claim batch.
-// Initialized in startDownloadWorkers (after env is read) so its capacity always
+// Initialized in startDownloadWorkers (after env is read), so its capacity always
 // matches backfillMasterClaimLimit, ensuring a full batch never blocks on submission.
 var backfillDownloadQueue chan downloadRequest
 
@@ -74,14 +74,18 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 
 	// Enqueue the request. If ctx is canceled before a worker picks it up,
 	// return immediately without consuming a rate-gate token.
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"queue": queueName, "queue_len": len(queue), "queue_cap": cap(queue),
+		"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"),
+	}).Debug("ticks/download: enqueue vars")
 	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "queue": queueName}).Trace("before channel: enqueue")
 	select {
 	case queue <- req:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "queue": queueName}).Trace("after channel: enqueued")
-		logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"), "queue": queueName}).Info("ticks/download: queued")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"), "queue": queueName}).Info("ticks/download: queued")
 	case <-ctx.Done():
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "queue": queueName}).Trace("branch: enqueue_ctx_canceled")
-		logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"), "queue": queueName}).WithError(ctx.Err()).Warn("ticks/download: enqueue canceled")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"), "queue": queueName}).WithError(ctx.Err()).Warn("ticks/download: enqueue canceled")
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
 
@@ -94,7 +98,7 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 		return result
 	case <-ctx.Done():
 		ilogger.T(ctx).WithField("instrument", instrName(row)).Trace("branch: wait_ctx_canceled")
-		logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z")}).WithError(ctx.Err()).Warn("ticks/download: wait canceled")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z")}).WithError(ctx.Err()).Warn("ticks/download: wait canceled")
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
 }
@@ -108,7 +112,7 @@ func startDownloadWorkers() {
 	for i := 0; i < dukascopyBurst; i++ {
 		go runDownloadWorker()
 	}
-	logrus.WithFields(logrus.Fields{"workers": dukascopyBurst, "max_rps": dukascopyMaxRPS, "backfill_queue_cap": backfillMasterClaimLimit}).Info("worker: download workers started (regular queue prioritised over backfill)")
+	ilogger.T(context.Background()).WithFields(logrus.Fields{"workers": dukascopyBurst, "max_rps": dukascopyMaxRPS, "backfill_queue_cap": backfillMasterClaimLimit}).Info("worker: download workers started (regular queue prioritised over backfill)")
 }
 
 // runDownloadWorker is the body of each download worker goroutine.
@@ -156,7 +160,7 @@ func processDownloadRequest(req downloadRequest) {
 	select {
 	case <-req.ctx.Done():
 		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("branch: discard_pre_rate_gate")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).WithError(req.ctx.Err()).Warn("ticks/download: discard pre-rate-gate")
+		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).WithError(req.ctx.Err()).Warn("ticks/download: discard pre-rate-gate")
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	default:
@@ -168,10 +172,10 @@ func processDownloadRequest(req downloadRequest) {
 	select {
 	case <-tickDownloadRateGate:
 		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("after channel: rate-gate acquired")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/download: rate-gate acquired")
+		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/download: rate-gate acquired")
 	case <-req.ctx.Done():
 		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("branch: discard_at_rate_gate")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).WithError(req.ctx.Err()).Warn("ticks/download: discard at rate-gate")
+		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).WithError(req.ctx.Err()).Warn("ticks/download: discard at rate-gate")
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	}
@@ -188,7 +192,7 @@ func processDownloadRequest(req downloadRequest) {
 		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("after channel: result delivered")
 	case <-req.ctx.Done():
 		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("branch: result_discarded_caller_canceled")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Warn("ticks/download: result discarded caller-canceled")
+		ilogger.T(req.ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Warn("ticks/download: result discarded caller-canceled")
 	}
 }
 
@@ -201,7 +205,7 @@ func doDownload(ctx context.Context, row *ent.State) DownloadResult {
 	defer ilogger.T(ctx).WithField("fn", "doDownload").Trace("fn_exit")
 
 	start := time.Now()
-	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/download: fetching")
+	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/download: fetching")
 
 	ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("before call: downloadBI5")
 	data, err := downloadBI5(ctx, row)
@@ -209,33 +213,33 @@ func doDownload(ctx context.Context, row *ent.State) DownloadResult {
 
 	if err == nil {
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "bytes": len(data)}).Trace("branch: download_ok")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(data), "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/download: OK")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(data), "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/download: OK")
 		return DownloadResult{Status: DownloadOK, Data: data}
 	}
 	switch {
 	case isNotFoundError(err):
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("branch: not_found")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/download: NOT_FOUND HTTP 404")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/download: NOT_FOUND HTTP 404")
 		return DownloadResult{Status: DownloadNotFound, Err: err}
 	case isRateLimitedError(err):
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("branch: rate_limited")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Warn("ticks/download: RATE_LIMITED HTTP 429")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Warn("ticks/download: RATE_LIMITED HTTP 429")
 		return DownloadResult{Status: DownloadRateLimited, Err: err}
 	default:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst}).Trace("branch: download_error")
 		var httpErr *dukascopy.HTTPError
 		if errors.As(err, &httpErr) {
-			logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond), "url": httpClass(httpErr.StatusCode)}).Error("ticks/download: ERROR")
+			ilogger.T(ctx).WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond), "url": httpClass(httpErr.StatusCode)}).Error("ticks/download: ERROR")
 		} else {
 			// Network error, timeout, or context cancellation — no HTTP status code.
-			logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Error("ticks/download: ERROR")
+			ilogger.T(ctx).WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Error("ticks/download: ERROR")
 		}
 		return DownloadResult{Status: DownloadError, Err: err}
 	}
 }
 
 // httpClass returns the HTTP status code class label for log output.
-// e.g. 503 → "HTTP 503 (5xx)", 403 → "HTTP 403 (4xx)", 301 → "HTTP 301 (3xx)".
+// e.g., 503 → "HTTP 503 (5xx)", 403 → "HTTP 403 (4xx)", 301 → "HTTP 301 (3xx)".
 func httpClass(code int) string {
 	return fmt.Sprintf("HTTP %d (%dxx)", code, code/100)
 }

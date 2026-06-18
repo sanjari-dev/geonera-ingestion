@@ -72,7 +72,7 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackfillMasterLoop", "boundary": boundary.Format(time.RFC3339)}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "runBackfillMasterLoop").Trace("fn_exit")
 
-	logrus.WithFields(logrus.Fields{"boundary": boundary.Format(time.RFC3339), "claim_limit": backfillMasterClaimLimit}).Info("ticks/backfill: start")
+	ilogger.T(ctx).WithFields(logrus.Fields{"boundary": boundary.Format(time.RFC3339), "claim_limit": backfillMasterClaimLimit}).Info("ticks/backfill: start")
 
 	// Claim up to backfillMasterClaimLimit rows once and dispatch in parallel.
 	// ABANDONED rows are sorted last, so they are only reached when no other
@@ -81,7 +81,7 @@ func runBackfillMasterLoop(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) 
 	runBackfillMasterClaim(ctx, d)
 	ilogger.T(ctx).WithField("fn", "runBackfillMasterLoop").Trace("after call: runBackfillMasterClaim")
 
-	logrus.WithField("boundary", boundary.Format(time.RFC3339)).Info("ticks/backfill: done")
+	ilogger.T(ctx).WithField("boundary", boundary.Format(time.RFC3339)).Info("ticks/backfill: done")
 }
 
 // runBackfillMasterClaim implements the "Master Bulk-Claim" strategy: claim up
@@ -97,20 +97,23 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 
 	boundary := backfillTimeBoundary()
 
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"boundary": boundary.Format(time.RFC3339), "claim_limit": backfillMasterClaimLimit,
+	}).Debug("ticks/backfill: claim params")
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackfillMasterClaim", "boundary": boundary.Format(time.RFC3339)}).Trace("before call: claimBackfillMasterBatch")
 	batch, err := claimBackfillMasterBatch(ctx, d, boundary)
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "runBackfillMasterClaim", "err": err != nil}).Trace("after call: claimBackfillMasterBatch")
 	if err != nil {
 		if ent.IsNotFound(err) {
-			logrus.WithField("boundary", boundary.Format(time.RFC3339)).Info("ticks/backfill: no rows to process")
+			ilogger.T(ctx).WithField("boundary", boundary.Format(time.RFC3339)).Info("ticks/backfill: no rows to process")
 		} else {
-			logrus.WithError(err).WithField("boundary", boundary.Format(time.RFC3339)).Error("ticks/backfill: master-claim error")
+			ilogger.T(ctx).WithError(err).WithField("boundary", boundary.Format(time.RFC3339)).Error("ticks/backfill: master-claim error")
 		}
 		return
 	}
 	if len(batch) == 0 {
 		ilogger.T(ctx).WithField("fn", "runBackfillMasterClaim").Trace("branch: empty_batch")
-		logrus.WithField("boundary", boundary.Format(time.RFC3339)).Info("ticks/backfill: empty batch")
+		ilogger.T(ctx).WithField("boundary", boundary.Format(time.RFC3339)).Info("ticks/backfill: empty batch")
 		return
 	}
 
@@ -119,7 +122,7 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 	for _, item := range batch {
 		layerCounts[item.layer]++
 	}
-	logrus.WithFields(logrus.Fields{
+	ilogger.T(ctx).WithFields(logrus.Fields{
 		"batch_size": len(batch),
 		"ingestion":  layerCounts[backfillLayerIngestion],
 		"retry":      layerCounts[backfillLayerRetryReset],
@@ -142,7 +145,7 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 	ilogger.T(ctx).WithField("fn", "runBackfillMasterClaim").Trace("before batchWg.Wait")
 	batchWg.Wait()
 	ilogger.T(ctx).WithField("fn", "runBackfillMasterClaim").Trace("after batchWg.Wait")
-	logrus.WithField("rows", len(batch)).Info("ticks/backfill: batch complete")
+	ilogger.T(ctx).WithField("rows", len(batch)).Info("ticks/backfill: batch complete")
 }
 
 // claimBackfillMasterBatch performs the single master claim: it locks up to
@@ -195,11 +198,15 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 			return e
 		}
 		ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.Query.ManyForUpdateSkipLocked", "count": len(rows)}).Trace("after query")
+		ilogger.T(ctx).WithFields(logrus.Fields{
+			"boundary": boundary.Format(time.RFC3339), "rows_returned": len(rows), "claim_limit": backfillMasterClaimLimit,
+		}).Debug("ticks/backfill: query result")
 		if len(rows) == 0 {
 			return &ent.NotFoundError{}
 		}
 
 		for _, row := range rows {
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "status": row.Status, "ts": row.Timestamp.Format(time.RFC3339)}).Trace("loop: backfill claim row start")
 			preclaimPrev := row.PreviousStatus
 			originalStatus := row.Status
 
@@ -218,14 +225,14 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 				// State.md §2.B, PROCESSED zombies go straight back to PENDING
 				// with no counter-mutation — resolved entirely at claim time.
 				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "status": "PROCESSED"}).Trace("branch: claim_routing_zombie")
-				logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Info("ticks/backfill: claim zombie → PENDING")
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Info("ticks/backfill: claim zombie → PENDING")
 				newPrev, newStatus, layer = state.PreviousStatusPROCESSED, state.StatusPENDING, backfillLayerNone
 
 			case state.StatusFAILED:
 				if row.RetryCount > 5 {
 					// Retry budget exhausted — retire to ABANDONED at claim time.
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: claim_routing_failed_abandoned")
-					logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339), "retry_count": row.RetryCount}).Info("ticks/backfill: claim FAILED→ABANDONED (budget exhausted)")
+					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339), "retry_count": row.RetryCount}).Info("ticks/backfill: claim FAILED→ABANDONED (budget exhausted)")
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusABANDONED, backfillLayerNone
 				} else {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: claim_routing_failed_retry")
@@ -235,7 +242,7 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 			case state.StatusBROKEN:
 				if row.RetryCount > 5 {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: claim_routing_broken_abandoned")
-					logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339), "retry_count": row.RetryCount}).Info("ticks/backfill: claim BROKEN→ABANDONED (budget exhausted)")
+					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339), "retry_count": row.RetryCount}).Info("ticks/backfill: claim BROKEN→ABANDONED (budget exhausted)")
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusABANDONED, backfillLayerNone
 				} else {
 					ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "retry_count": row.RetryCount}).Trace("branch: claim_routing_broken_retry")
@@ -264,7 +271,7 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 				// are exhausted (status-priority sort puts them last). Reset with
 				// RetryCount=0 so they get a clean ingestion cycle.
 				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row)}).Trace("branch: claim_routing_abandoned_reset")
-				logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Info("ticks/backfill: claim ABANDONED→PENDING (retry count reset)")
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format(time.RFC3339)}).Info("ticks/backfill: claim ABANDONED→PENDING (retry count reset)")
 				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "instrument": instrName(row)}).Trace("before query")
 				updated, ue := tx.State.UpdateOneID(row.ID).
 					SetPreviousStatus(state.PreviousStatusABANDONED).
@@ -283,30 +290,25 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 					preclaimPrev: preclaimPrev,
 					layer:        backfillLayerNone,
 				})
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(updated), "layer": backfillLayerNone, "new_status": state.StatusPENDING}).Trace("loop: backfill claim row end (abandoned reset)")
 				continue
 
 			default:
+				ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(row), "status": row.Status}).Trace("loop: backfill claim row skip (default)")
 				continue
 			}
 
-			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "instrument": instrName(row), "new_status": newStatus}).Trace("before query")
-			updated, ue := tx.State.UpdateOneID(row.ID).
-				SetPreviousStatus(newPrev).
-				SetStatus(newStatus).
-				SetUpdatedAt(time.Now().UTC()).
-				Save(ctx)
+			updated, ue := applyStateClaimUpdate(ctx, tx, row, newPrev, newStatus, layer)
 			if ue != nil {
-				ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": true}).Trace("after query")
 				return ue
 			}
-			ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false, "layer": layer}).Trace("after query")
-			updated.Edges = row.Edges
 
 			routed = append(routed, backfillRoutedRow{
 				row:          updated,
 				preclaimPrev: preclaimPrev,
 				layer:        layer,
 			})
+			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(updated), "layer": layer, "new_status": newStatus}).Trace("loop: backfill claim row end")
 		}
 		return nil
 	})
@@ -325,28 +327,33 @@ func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRou
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "dispatchBackfillRoutedRow", "instrument": inst, "layer": item.layer}).Trace("fn_entry")
 	defer ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("fn_exit")
 
+	ilogger.T(ctx).WithFields(logrus.Fields{
+		"state_id": item.row.ID, "ts": ts,
+		"retry_count": item.row.RetryCount, "streak": item.row.NotFoundStreak,
+		"prev_status": prevStatusStr(item.preclaimPrev), "layer": item.layer,
+	}).Debug("ticks/backfill: dispatch row vars")
 	switch item.layer {
 	case backfillLayerIngestion:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: dispatch_ingestion")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/backfill: dispatch ingestion")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/backfill: dispatch ingestion")
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeIngestionETL")
 		executeIngestionETL(ctx, d, item.row, handleNotFoundIncrement, false)
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeIngestionETL")
 	case backfillLayerRetryReset:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "retry_count": item.row.RetryCount}).Trace("branch: dispatch_retry_reset")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "retry_count": item.row.RetryCount}).Info("ticks/backfill: dispatch retry_reset")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "retry_count": item.row.RetryCount}).Info("ticks/backfill: dispatch retry_reset")
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: handleRetryReset")
 		handleRetryReset(ctx, d, item.row)
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: handleRetryReset")
 	case backfillLayerT2Action:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": prevStatusStr(item.preclaimPrev), "streak": item.row.NotFoundStreak}).Trace("branch: dispatch_t2_action")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": prevStatusStr(item.preclaimPrev), "streak": item.row.NotFoundStreak}).Info("ticks/backfill: dispatch t2_action")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": prevStatusStr(item.preclaimPrev), "streak": item.row.NotFoundStreak}).Info("ticks/backfill: dispatch t2_action")
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeT2Action")
 		executeT2Action(ctx, d, item.row, item.preclaimPrev, false)
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeT2Action")
 	case backfillLayerNotFoundRecheck:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": item.row.NotFoundStreak}).Trace("branch: dispatch_nf_recheck")
-		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": item.row.NotFoundStreak}).Info("ticks/backfill: dispatch nf_recheck")
+		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": item.row.NotFoundStreak}).Info("ticks/backfill: dispatch nf_recheck")
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeNotFoundRecheck")
 		executeNotFoundRecheck(ctx, d, item.row, false)
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeNotFoundRecheck")

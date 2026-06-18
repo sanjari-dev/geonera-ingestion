@@ -22,7 +22,7 @@ var ErrNotFound = errors.New("dukascopy: 404 not found")
 var ErrTooManyRequests = errors.New("dukascopy: 429 too many requests")
 
 // HTTPError is returned for any HTTP response whose status code is not
-// handled by a named sentinel (i.e. not 200, 404, or 429).
+// handled by a named sentinel (i.e., not 200, 404, or 429).
 // It carries the raw status code so callers can log or route by code class
 // (3xx redirect, 4xx client error, 5xx server error) without string-parsing.
 type HTTPError struct {

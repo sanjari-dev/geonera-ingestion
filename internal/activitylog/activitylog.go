@@ -48,12 +48,7 @@ func (l *Logger) Record(ctx context.Context, src TriggerSrc, jobName string, met
 	metaJSON, _ := json.Marshal(meta)
 	now := time.Now().UTC()
 
-	_, err := l.db.ExecContext(context.Background(),
-		`INSERT INTO ingestion.job_activity_logs
-		     (id, trigger_src, job_name, triggered_at, trace_id, meta)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		id, string(src), jobName, now, traceID, metaJSON,
-	)
+	_, err := l.db.ExecContext(ctx, `INSERT INTO ingestion.job_activity_logs (id, trigger_src, job_name, triggered_at, trace_id, meta) VALUES ($1, $2, $3, $4, $5, $6)`, id, string(src), jobName, now, traceID, metaJSON)
 	if err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{"trigger_src": src, "job_name": jobName}).Error("activitylog: record")
 	}
@@ -68,10 +63,7 @@ const retentionDays = 7
 // retentionDays. Safe to call repeatedly — it is a no-op when nothing qualifies.
 // Logged only when at least one row is deleted.
 func (l *Logger) Purge(ctx context.Context) {
-	result, err := l.db.ExecContext(ctx, `
-		DELETE FROM ingestion.job_activity_logs
-		WHERE triggered_at < NOW() - ($1 || ' days')::INTERVAL
-	`, retentionDays)
+	result, err := l.db.ExecContext(ctx, `DELETE FROM ingestion.job_activity_logs WHERE triggered_at < NOW() - ($1 || ' days')::INTERVAL`, retentionDays)
 	if err != nil {
 		logrus.WithError(err).Error("activitylog: purge")
 		return
@@ -85,12 +77,7 @@ func (l *Logger) Purge(ctx context.Context) {
 // finished (finished_at = NOW(), duration_ms left NULL to signal interrupted).
 // Called once at service startup to clean up entries left open by a previous crash.
 func (l *Logger) CloseOrphans(ctx context.Context) {
-	result, err := l.db.ExecContext(ctx, `
-		UPDATE ingestion.job_activity_logs
-		SET    finished_at = NOW()
-		WHERE  finished_at IS NULL
-		  AND  triggered_at < NOW() - INTERVAL '5 minutes'
-	`)
+	result, err := l.db.ExecContext(ctx, `UPDATE ingestion.job_activity_logs SET finished_at = NOW() WHERE finished_at IS NULL AND triggered_at < NOW() - INTERVAL '5 minutes'`)
 	if err != nil {
 		logrus.WithError(err).Error("activitylog: close orphans")
 		return
@@ -118,13 +105,7 @@ func (l *Logger) Cancel(id uuid.UUID) {
 // clock skew between the INSERT goroutine and this call.
 func (l *Logger) Complete(id uuid.UUID) {
 	go func() {
-		_, err := l.db.ExecContext(context.Background(),
-			`UPDATE ingestion.job_activity_logs
-			 SET finished_at = now(),
-			     duration_ms  = (EXTRACT(EPOCH FROM (now() - triggered_at)) * 1000)::BIGINT
-			 WHERE id = $1`,
-			id,
-		)
+		_, err := l.db.ExecContext(context.Background(), `UPDATE ingestion.job_activity_logs SET finished_at = now(), duration_ms = (EXTRACT(EPOCH FROM (now() - triggered_at)) * 1000)::BIGINT WHERE id = $1`, id)
 		if err != nil {
 			logrus.WithError(err).WithField("state_id", id).Error("activitylog: complete")
 		}
@@ -180,10 +161,7 @@ func (l *Logger) List(ctx context.Context, jobName, triggerSrc string, limit, of
 		return ListResult{}, err
 	}
 	defer func(rows *sql.Rows) {
-		err := rows.Close()
-		if err != nil {
-			// ignore
-		}
+		_ = rows.Close()
 	}(rows)
 
 	entries := make([]Entry, 0)

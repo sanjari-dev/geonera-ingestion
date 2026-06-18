@@ -41,9 +41,7 @@ type Config struct {
 func New(cfg Config) (*Client, error) {
 	ac, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("auto"),
-		awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
-		),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("r2: load config: %w", err)
@@ -86,10 +84,7 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("r2 get %q: %w", key, err)
 	}
 	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			// ignore
-		}
+		_ = Body.Close()
 	}(out.Body)
 
 	data, err := io.ReadAll(out.Body)

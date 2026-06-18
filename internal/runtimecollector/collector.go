@@ -59,10 +59,10 @@ func PrometheusText() string {
 	s := Get()
 	var b strings.Builder
 	g := func(name, help string, v float64) {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n%s %.6g\n", name, help, name, name, v)
+		_, _ = fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s gauge\n%s %.6g\n", name, help, name, name, v)
 	}
 	c := func(name, help string, v float64) {
-		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s counter\n%s %.6g\n", name, help, name, name, v)
+		_, _ = fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s counter\n%s %.6g\n", name, help, name, name, v)
 	}
 	g("ingestion_cpu_percent", "CPU utilization percentage (0-100; -1 = first sample pending).", s.CPUPercent)
 	g("ingestion_heap_alloc_bytes", "Live heap object bytes.", s.HeapAllocMB*1024*1024)

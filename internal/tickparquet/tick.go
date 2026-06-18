@@ -143,10 +143,7 @@ func ReadAll(data []byte) ([]Row, error) {
 	encoded := make([]parquetRow, n)
 	r := parquet.NewGenericReader[parquetRow](f)
 	defer func(r *parquet.GenericReader[parquetRow]) {
-		err := r.Close()
-		if err != nil {
-			// ignore
-		}
+		_ = r.Close()
 	}(r)
 	got, err := r.Read(encoded)
 	if err != nil && err != io.EOF {
@@ -163,17 +160,14 @@ func ReadAll(data []byte) ([]Row, error) {
 func checkSchema(s *parquet.Schema) error {
 	fields := s.Fields()
 	if len(fields) != len(expectedCols) {
-		return fmt.Errorf("tickparquet validate: schema has %d column(s), expected %d",
-			len(fields), len(expectedCols))
+		return fmt.Errorf("tickparquet validate: schema has %d column(s), expected %d", len(fields), len(expectedCols))
 	}
 	for i, f := range fields {
 		if f.Name() != expectedCols[i] {
-			return fmt.Errorf("tickparquet validate: column[%d] name %q != expected %q",
-				i, f.Name(), expectedCols[i])
+			return fmt.Errorf("tickparquet validate: column[%d] name %q != expected %q", i, f.Name(), expectedCols[i])
 		}
 		if expectedLogicalTypes[i] != "" && !strings.Contains(f.String(), expectedLogicalTypes[i]) {
-			return fmt.Errorf("tickparquet validate: column[%d] %q logical type %q missing from %q",
-				i, f.Name(), expectedLogicalTypes[i], f.String())
+			return fmt.Errorf("tickparquet validate: column[%d] %q logical type %q missing from %q", i, f.Name(), expectedLogicalTypes[i], f.String())
 		}
 	}
 	return nil
@@ -184,10 +178,7 @@ func checkSchema(s *parquet.Schema) error {
 func checkBoundary(f *parquet.File, hourStart time.Time) error {
 	r := parquet.NewGenericReader[parquetRow](f)
 	defer func(r *parquet.GenericReader[parquetRow]) {
-		err := r.Close()
-		if err != nil {
-			// ignore
-		}
+		_ = r.Close()
 	}(r)
 
 	rows := make([]parquetRow, f.NumRows())
@@ -204,12 +195,10 @@ func checkBoundary(f *parquet.File, hourStart time.Time) error {
 	last := time.UnixMicro(rows[n-1].Timestamp).UTC()
 
 	if first.Before(hourStart) || !first.Before(hourEnd) {
-		return fmt.Errorf("tick parquet validate: first tick %s outside window [%s, %s)",
-			first.Format(time.RFC3339), hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
+		return fmt.Errorf("tick parquet validate: first tick %s outside window [%s, %s)", first.Format(time.RFC3339), hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
 	}
 	if last.Before(hourStart) || !last.Before(hourEnd) {
-		return fmt.Errorf("tick parquet validate: last tick %s outside window [%s, %s)",
-			last.Format(time.RFC3339), hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
+		return fmt.Errorf("tick parquet validate: last tick %s outside window [%s, %s)", last.Format(time.RFC3339), hourStart.Format(time.RFC3339), hourEnd.Format(time.RFC3339))
 	}
 	return nil
 }

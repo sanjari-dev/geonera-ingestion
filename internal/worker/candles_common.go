@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 
 	"github.com/sirupsen/logrus"
-	"sync"
 
 	"github.com/sanjari-dev/geonera-ingestion/ent"
 	"github.com/sanjari-dev/geonera-ingestion/ent/instrument"
@@ -44,7 +44,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL, onStar
 		wg.Add(1)
 		go runCandleBackfill(ctx, d, &wg)
 	default:
-		logrus.WithField("mode", mode).Warn("candles: unknown mode")
+		ilogger.T(ctx).WithField("mode", mode).Warn("candles: unknown mode")
 	}
 	ilogger.T(ctx).WithField("fn", "RunCandleParentHandler").Trace("before wg.Wait")
 	wg.Wait()
@@ -87,6 +87,9 @@ func readCandleParquetFromR2(ctx context.Context, row *ent.State) ([]byte, error
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "readCandleParquetFromR2", "key": key, "err": err != nil}).Trace("after r2 read")
 	if errors.Is(err, r2.ErrNotFound) {
 		return nil, fmt.Errorf("readCandleParquetFromR2: key not found: %s", key)
+	}
+	if err == nil {
+		ilogger.T(ctx).WithFields(logrus.Fields{"key": key, "bytes": len(data)}).Debug("candle/r2: read vars")
 	}
 	return data, err
 }

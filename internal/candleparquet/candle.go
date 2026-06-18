@@ -165,17 +165,14 @@ func Validate(data []byte, dayStart time.Time) error {
 func checkSchema(s *parquet.Schema) error {
 	fields := s.Fields()
 	if len(fields) != len(expectedCols) {
-		return fmt.Errorf("candle parquet validate: schema has %d column(s), expected %d",
-			len(fields), len(expectedCols))
+		return fmt.Errorf("candle parquet validate: schema has %d column(s), expected %d", len(fields), len(expectedCols))
 	}
 	for i, f := range fields {
 		if f.Name() != expectedCols[i] {
-			return fmt.Errorf("candle parquet validate: column[%d] name %q != expected %q",
-				i, f.Name(), expectedCols[i])
+			return fmt.Errorf("candle parquet validate: column[%d] name %q != expected %q", i, f.Name(), expectedCols[i])
 		}
 		if expectedLogicalTypes[i] != "" && !strings.Contains(f.String(), expectedLogicalTypes[i]) {
-			return fmt.Errorf("candle parquet validate: column[%d] %q logical type %q missing from %q",
-				i, f.Name(), expectedLogicalTypes[i], f.String())
+			return fmt.Errorf("candle parquet validate: column[%d] %q logical type %q missing from %q", i, f.Name(), expectedLogicalTypes[i], f.String())
 		}
 	}
 	return nil
@@ -188,10 +185,7 @@ func checkRows(f *parquet.File, dayStart time.Time) error {
 
 	r := parquet.NewGenericReader[parquetRow](f)
 	defer func(r *parquet.GenericReader[parquetRow]) {
-		err := r.Close()
-		if err != nil {
-			// ignore
-		}
+		_ = r.Close()
 	}(r)
 
 	rows := make([]parquetRow, f.NumRows())
@@ -208,8 +202,7 @@ func checkRows(f *parquet.File, dayStart time.Time) error {
 	for _, row := range rows[:n] {
 		ts := time.UnixMicro(row.Timestamp).UTC()
 		if ts.Before(dayStart) || !ts.Before(dayEnd) {
-			return fmt.Errorf("candle parquet validate: timestamp %s outside window [%s, %s)",
-				ts.Format(time.RFC3339), dayStart.Format(time.RFC3339), dayEnd.Format(time.RFC3339))
+			return fmt.Errorf("candle parquet validate: timestamp %s outside window [%s, %s)", ts.Format(time.RFC3339), dayStart.Format(time.RFC3339), dayEnd.Format(time.RFC3339))
 		}
 		seen[row.Timeframe] = struct{}{}
 	}
