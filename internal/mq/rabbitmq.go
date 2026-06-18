@@ -62,11 +62,11 @@ func (c *Client) Close() error {
 const stateChangedExchange = "events.ingestion"
 
 // PublishEvent publishes a fire-and-forget signal on the fanout exchange
-// "events.ingestion". The body carries the event type but consumers treat
+// "events.ingestion". The body carries the event type, but consumers treat
 // any arriving message as a "dirty" signal and re-query the database
 // themselves — so the body is informational only.
 //
-// Errors are logged and swallowed. A missed publish delays a dashboard
+// Errors are logged and swallowed. Missed publishing delays a dashboard
 // refresh by at most one 60-second fallback cycle on the subscriber side.
 func (c *Client) PublishEvent(eventType string) {
 	ch, err := c.channel()
@@ -74,7 +74,9 @@ func (c *Client) PublishEvent(eventType string) {
 		logrus.WithError(err).Error("mq: PublishEvent: open channel")
 		return
 	}
-	defer ch.Close()
+	defer func(ch *amqp.Channel) {
+		_ = ch.Close()
+	}(ch)
 
 	if err := ch.ExchangeDeclare(
 		stateChangedExchange,

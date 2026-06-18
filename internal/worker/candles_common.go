@@ -38,7 +38,7 @@ func RunCandleParentHandler(ctx context.Context, mode string, d *dal.DAL, onStar
 		wg.Add(1)
 		go runCandleBackfill(ctx, d, &wg)
 	default:
-		logrus.Warnf("candles: unknown mode %q", mode)
+		logrus.WithField("mode", mode).Warn("candles: unknown mode")
 	}
 	wg.Wait()
 	return true

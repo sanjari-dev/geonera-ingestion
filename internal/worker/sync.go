@@ -148,13 +148,17 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		}
 		return nil
 	}); err != nil {
-		logrus.WithError(err).Errorf("sync: task %s count/reset", task.ID)
+		logrus.WithError(err).WithField("state_id", task.ID).Error("sync: task count/reset")
 		return
 	}
 
 	if actualCount < 24 {
-		logrus.Infof("sync: task %s instrument=%s date=%s hours_count=%d — reset to PENDING",
-			task.ID, task.InstrumentID, task.TargetDate.Format(time.DateOnly), actualCount)
+		logrus.WithFields(logrus.Fields{
+			"state_id":   task.ID,
+			"instrument": task.InstrumentID,
+			"date":       task.TargetDate.Format(time.DateOnly),
+			"rows":       actualCount,
+		}).Info("sync: task reset to PENDING")
 		return
 	}
 
@@ -184,10 +188,14 @@ func processSyncTaskWorker(ctx context.Context, d *dal.DAL, task *ent.SyncTask) 
 		}
 		return nil
 	}); err != nil {
-		logrus.WithError(err).Errorf("sync: task %s finalize", task.ID)
+		logrus.WithError(err).WithField("state_id", task.ID).Error("sync: task finalize")
 		return
 	}
 
-	logrus.Infof("sync: task %s complete — candle instrument=%s date=%s resolved (count=%d)",
-		task.ID, task.InstrumentID, task.TargetDate.Format(time.DateOnly), actualCount)
+	logrus.WithFields(logrus.Fields{
+		"state_id":   task.ID,
+		"instrument": task.InstrumentID,
+		"date":       task.TargetDate.Format(time.DateOnly),
+		"rows":       actualCount,
+	}).Info("sync: task complete — candle resolved")
 }

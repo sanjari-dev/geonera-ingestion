@@ -27,7 +27,7 @@ import (
 func main() {
 	// Load variables from .env. If the file is absent (production), OS environment is used.
 	if err := godotenv.Load(); err != nil {
-		logrus.Warnf("warning: .env not loaded (%v), relying on OS environment", err)
+		logrus.WithError(err).Warn("warning: .env not loaded, relying on OS environment")
 	}
 
 	ctx := context.Background()
@@ -35,11 +35,11 @@ func main() {
 	// ── Database ─────────────────────────────────────────────────────────────
 	dbClient, sqlDB, err := database.NewEntClient(ctx)
 	if err != nil {
-		logrus.Fatalf("database: %v", err)
+		logrus.WithError(err).Fatal("database: init failed")
 	}
 	defer func() {
 		if err := dbClient.Close(); err != nil {
-			logrus.Errorf("database close: %v", err)
+			logrus.WithError(err).Error("database close")
 		}
 	}()
 
@@ -56,7 +56,7 @@ func main() {
 		SecretAccessKey: os.Getenv("R2_SECRET_ACCESS_KEY"),
 	})
 	if err != nil {
-		logrus.Fatalf("r2 client: %v", err)
+		logrus.WithError(err).Fatal("r2 client: init failed")
 	}
 
 	// ── Dukascopy HTTP client ─────────────────────────────────────────────────
@@ -67,14 +67,14 @@ func main() {
 
 	// ── Database: run pending schema migrations ───────────────────────────────
 	if err := database.RunMigrations(ctx); err != nil {
-		logrus.Fatalf("database migrate: %v", err)
+		logrus.WithError(err).Fatal("database migrate: failed")
 	}
 
 	// ── Activity Logger ───────────────────────────────────────────────────────
 	logDSN := os.Getenv("DATABASE_URL")
 	logDB, err := sql.Open("postgres", logDSN)
 	if err != nil {
-		logrus.Fatalf("activity log db: %v", err)
+		logrus.WithError(err).Fatal("activity log db: init failed")
 	}
 	defer func() { _ = logDB.Close() }()
 	logDB.SetMaxIdleConns(3)
@@ -86,16 +86,16 @@ func main() {
 	// ── RabbitMQ ──────────────────────────────────────────────────────────────
 	mqClient, err := mq.NewClient()
 	if err != nil {
-		logrus.Fatalf("rabbitmq: %v", err)
+		logrus.WithError(err).Fatal("rabbitmq: init failed")
 	}
 	defer func() {
 		if err := mqClient.Close(); err != nil {
-			logrus.Errorf("rabbitmq close: %v", err)
+			logrus.WithError(err).Error("rabbitmq close")
 		}
 	}()
 
 	if err := mq.SetupConsumers(mqClient, appDAL, activityLogger); err != nil {
-		logrus.Fatalf("mq consumers: %v", err)
+		logrus.WithError(err).Fatal("mq consumers: setup failed")
 	}
 
 	// ── Fiber ─────────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ func main() {
 	})
 
 	// Prometheus metrics — scraped by Prometheus at /metrics.
-	// No auth required so the scraper does not need X-Ingestion-Secret.
+	// No auth required, so the scraper does not need X-Ingestion-Secret.
 	app.Get("/metrics", func(c *fiber.Ctx) error {
 		c.Set(fiber.HeaderContentType, "text/plain; version=0.0.4; charset=utf-8")
 		return c.SendString(runtimecollector.PrometheusText())
@@ -145,8 +145,8 @@ func main() {
 		port = "3000"
 	}
 
-	logrus.Infof("server starting on :%s", port)
+	logrus.WithField("port", port).Info("server starting")
 	if err := app.Listen(":" + port); err != nil {
-		logrus.Fatalf("server error: %v", err)
+		logrus.WithError(err).Fatal("server error")
 	}
 }

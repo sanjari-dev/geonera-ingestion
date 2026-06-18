@@ -55,7 +55,7 @@ func (l *Logger) Record(ctx context.Context, src TriggerSrc, jobName string, met
 		id, string(src), jobName, now, traceID, metaJSON,
 	)
 	if err != nil {
-		logrus.WithError(err).Errorf("activitylog: record %s/%s", src, jobName)
+		logrus.WithError(err).WithFields(logrus.Fields{"trigger_src": src, "job_name": jobName}).Error("activitylog: record")
 	}
 	return id
 }
@@ -77,7 +77,7 @@ func (l *Logger) Purge(ctx context.Context) {
 		return
 	}
 	if n, _ := result.RowsAffected(); n > 0 {
-		logrus.Infof("activitylog: purged %d entries older than %d days", n, retentionDays)
+		logrus.WithFields(logrus.Fields{"rows": n, "retention_days": retentionDays}).Info("activitylog: purged entries")
 	}
 }
 
@@ -97,7 +97,7 @@ func (l *Logger) CloseOrphans(ctx context.Context) {
 	}
 	n, _ := result.RowsAffected()
 	if n > 0 {
-		logrus.Infof("activitylog: closed %d orphaned entries from previous run", n)
+		logrus.WithField("rows", n).Info("activitylog: closed orphaned entries from previous run")
 	}
 }
 
@@ -126,7 +126,7 @@ func (l *Logger) Complete(id uuid.UUID) {
 			id,
 		)
 		if err != nil {
-			logrus.WithError(err).Errorf("activitylog: complete %s", id)
+			logrus.WithError(err).WithField("state_id", id).Error("activitylog: complete")
 		}
 	}()
 }

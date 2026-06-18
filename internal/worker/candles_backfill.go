@@ -42,7 +42,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "runCandleBackfill")
 
 	boundary := backfillCandleBoundary()
-	logrus.Infof("candle/backfill: start boundary=%s claim_limit=%d", boundary.Format(time.DateOnly), candleBackfillClaimLimit)
+	logrus.WithFields(logrus.Fields{"boundary": boundary.Format(time.DateOnly), "claim_limit": candleBackfillClaimLimit}).Info("candle/backfill: start")
 
 	batch, err := claimCandleBackfillBatch(ctx, d, boundary)
 	if err != nil {
@@ -51,19 +51,19 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	}
 
 	if len(batch) == 0 {
-		logrus.Infof("candle/backfill: no rows to process boundary=%s", boundary.Format(time.DateOnly))
+		logrus.WithField("boundary", boundary.Format(time.DateOnly)).Info("candle/backfill: no rows to process")
 	} else {
 		layerCounts := map[candleBackfillLayer]int{}
 		for _, item := range batch {
 			layerCounts[item.layer]++
 		}
-		logrus.Infof("candle/backfill: claimed %d row(s) aggregate=%d reset=%d validation=%d none=%d",
-			len(batch),
-			layerCounts[candleLayerAggregate],
-			layerCounts[candleLayerReset],
-			layerCounts[candleLayerValidation],
-			layerCounts[candleLayerNone],
-		)
+		logrus.WithFields(logrus.Fields{
+			"batch_size":  len(batch),
+			"aggregate":   layerCounts[candleLayerAggregate],
+			"reset":       layerCounts[candleLayerReset],
+			"validation":  layerCounts[candleLayerValidation],
+			"none":        layerCounts[candleLayerNone],
+		}).Info("candle/backfill: claimed rows")
 	}
 
 	var batchWg sync.WaitGroup
@@ -81,7 +81,7 @@ func runCandleBackfill(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	if len(batch) == 0 {
 		resetCandleAbandonedRows(ctx, d, boundary)
 	}
-	logrus.Infof("candle/backfill: done boundary=%s rows=%d", boundary.Format(time.DateOnly), len(batch))
+	logrus.WithFields(logrus.Fields{"boundary": boundary.Format(time.DateOnly), "rows": len(batch)}).Info("candle/backfill: done")
 }
 
 // ── Backfill helpers ──────────────────────────────────────────────────────────
@@ -136,14 +136,12 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 
 			case state.StatusPROCESSED:
 				// Zombie: resolved at claim time, no goroutine dispatched.
-				logrus.Infof("candle/backfill: claim zombie instrument=%s date=%s → PENDING",
-					instrName(row), row.Timestamp.Format(time.DateOnly))
+				logrus.WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly)}).Info("candle/backfill: claim zombie → PENDING")
 				newPrev, newStatus, layer = state.PreviousStatusPROCESSED, state.StatusPENDING, candleLayerNone
 
 			case state.StatusFAILED:
 				if row.RetryCount > candleMaxRetryCount {
-					logrus.Infof("candle/backfill: claim FAILED→ABANDONED instrument=%s date=%s retry_count=%d",
-						instrName(row), row.Timestamp.Format(time.DateOnly), row.RetryCount)
+					logrus.WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "retry_count": row.RetryCount}).Info("candle/backfill: claim FAILED→ABANDONED")
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusABANDONED, candleLayerNone
 				} else {
 					newPrev, newStatus, layer = state.PreviousStatusFAILED, state.StatusPROCESSED, candleLayerReset
@@ -151,8 +149,7 @@ func claimCandleBackfillBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 
 			case state.StatusBROKEN:
 				if row.RetryCount > candleMaxRetryCount {
-					logrus.Infof("candle/backfill: claim BROKEN→ABANDONED instrument=%s date=%s retry_count=%d",
-						instrName(row), row.Timestamp.Format(time.DateOnly), row.RetryCount)
+					logrus.WithFields(logrus.Fields{"instrument": instrName(row), "date": row.Timestamp.Format(time.DateOnly), "retry_count": row.RetryCount}).Info("candle/backfill: claim BROKEN→ABANDONED")
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusABANDONED, candleLayerNone
 				} else {
 					newPrev, newStatus, layer = state.PreviousStatusBROKEN, state.StatusPROCESSED, candleLayerReset
@@ -193,13 +190,13 @@ func dispatchCandleBackfillRow(ctx context.Context, d *dal.DAL, item candleRoute
 	date := item.row.Timestamp.Format(time.DateOnly)
 	switch item.layer {
 	case candleLayerAggregate:
-		logrus.Infof("candle/backfill: dispatch aggregate instrument=%s date=%s", inst, date)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "date": date}).Info("candle/backfill: dispatch aggregate")
 		executeCandleAggregation(ctx, d, item.row)
 	case candleLayerReset:
-		logrus.Infof("candle/backfill: dispatch reset instrument=%s date=%s retry_count=%d", inst, date, item.row.RetryCount)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "date": date, "retry_count": item.row.RetryCount}).Info("candle/backfill: dispatch reset")
 		executeCandleRetryReset(ctx, d, item.row)
 	case candleLayerValidation:
-		logrus.Infof("candle/backfill: dispatch validation instrument=%s date=%s", inst, date)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "date": date}).Info("candle/backfill: dispatch validation")
 		executeCandleValidation(ctx, d, item.row)
 	case candleLayerNone:
 		// Already fully resolved inside the claim transaction.

@@ -93,7 +93,7 @@ func RunMaintenanceHandler(ctx context.Context, d *dal.DAL, onStarted func()) bo
 		return true
 	}
 
-	logrus.Infof("maintenance: %d instrument(s) to process (parallel, limit %d)", len(instruments), maintenanceParallelLimit)
+	logrus.WithFields(logrus.Fields{"count": len(instruments), "parallel_limit": maintenanceParallelLimit}).Info("maintenance: instruments to process")
 
 	sem := make(chan struct{}, maintenanceParallelLimit)
 	var wg sync.WaitGroup
@@ -139,7 +139,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		}
 
 		if empty {
-			logrus.Infof("maintenance %s: starting Group 1 (bootstrap)", inst.Name)
+			logrus.WithField("instrument", inst.Name).Info("maintenance: starting Group 1 (bootstrap)")
 			runBootstrap(ctx, d, inst)
 			return nil
 		}
@@ -151,7 +151,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		// leave IsPause untouched for this cycle.
 		// managePauseFlag is called after wg.Wait() so it sees the final
 		// state of all four phases before deciding the correct IsPause value.
-		logrus.Infof("maintenance %s: starting Group 2 (A+B+C+D)", inst.Name)
+		logrus.WithField("instrument", inst.Name).Info("maintenance: starting Group 2 (A+B+C+D)")
 
 		var pauseOnce sync.Once
 		setPause := func() {
@@ -174,7 +174,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		wg.Wait()
 
 		managePauseFlag(ctx, d, inst)
-		logrus.Infof("maintenance %s: Group 2 complete", inst.Name)
+		logrus.WithField("instrument", inst.Name).Info("maintenance: Group 2 complete")
 		return nil
 	})
 	if err != nil {
@@ -182,7 +182,7 @@ func runMaintenanceForInstrument(ctx context.Context, d *dal.DAL, inst *ent.Inst
 		return
 	}
 	if !locked {
-		logrus.Infof("maintenance %s: skipped — lock held by concurrent worker", inst.Name)
+		logrus.WithField("instrument", inst.Name).Info("maintenance: skipped — lock held by concurrent worker")
 	}
 }
 
@@ -221,7 +221,7 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 
 	// Log after IsPause is committed — if the DB write above fails and is retried
 	// on the next maintenance cycle, this line will not appear twice in the logs.
-	logrus.Infof("maintenance bootstrap %s: seeding from %s", inst.Name, inst.StartDate.UTC().Format(time.RFC3339))
+	logrus.WithFields(logrus.Fields{"instrument": inst.Name, "from": inst.StartDate.UTC().Format(time.RFC3339)}).Info("maintenance bootstrap: seeding")
 
 	now := time.Now().UTC()
 	for _, jobType := range []state.JobType{state.JobTypeTICK, state.JobTypeCANDLE} {
@@ -236,7 +236,7 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		for ts := startNorm; !ts.After(nowNorm); ts = ts.Add(interval) {
 			candidates = append(candidates, ts)
 		}
-		logrus.Infof("maintenance bootstrap %s: seeding %d %s slots", inst.Name, len(candidates), jobType)
+		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "slots": len(candidates), "job_type": jobType}).Info("maintenance bootstrap: seeding slots")
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("bootstrap %s", inst.Name))
 	}
 
@@ -247,7 +247,7 @@ func runBootstrap(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 		logrus.WithError(err).Errorf("maintenance bootstrap %s: set IsPause=false", inst.Name)
 		return
 	}
-	logrus.Infof("maintenance bootstrap %s: complete", inst.Name)
+	logrus.WithField("instrument", inst.Name).Info("maintenance bootstrap: complete")
 }
 
 // ── GROUP 2A — FORWARD SEEDING ────────────────────────────────────────────────
@@ -286,7 +286,7 @@ func runForwardSeeding(ctx context.Context, d *dal.DAL, inst *ent.Instrument, se
 			continue
 		}
 		setPause()
-		logrus.Infof("forward seeding %s %s: inserting %d new rows", inst.Name, jobType, len(candidates))
+		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Info("forward seeding: inserting new rows")
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("forward-seeding %s %s", inst.Name, jobType))
 	}
 }
@@ -328,7 +328,7 @@ func runBackwardGapFill(ctx context.Context, d *dal.DAL, inst *ent.Instrument, s
 			continue
 		}
 		setPause()
-		logrus.Infof("backward gap fill %s %s: filling %d rows toward StartDate", inst.Name, jobType, len(candidates))
+		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "job_type": jobType, "rows": len(candidates)}).Info("backward gap fill: filling rows toward StartDate")
 		insertBatched(ctx, d, inst.ID, jobType, candidates, fmt.Sprintf("backward-gap-fill %s %s", inst.Name, jobType))
 	}
 }
@@ -361,11 +361,12 @@ func managePauseFlag(ctx context.Context, d *dal.DAL, inst *ent.Instrument) {
 	}); err != nil {
 		logrus.WithError(err).Errorf("manage pause %s: set IsPause=%v", inst.Name, shouldPause)
 	} else {
-		logrus.Infof("manage pause %s: IsPause=%v (MIN=%s StartDate=%s)",
-			inst.Name, shouldPause,
-			minTS.Format(time.RFC3339),
-			normalizeTS(inst.StartDate.UTC(), state.JobTypeTICK).Format(time.RFC3339),
-		)
+		logrus.WithFields(logrus.Fields{
+			"instrument": inst.Name,
+			"is_pause":   shouldPause,
+			"min_ts":     minTS.Format(time.RFC3339),
+			"start_date": normalizeTS(inst.StartDate.UTC(), state.JobTypeTICK).Format(time.RFC3339),
+		}).Info("manage pause: IsPause updated")
 	}
 }
 
@@ -443,7 +444,7 @@ func runPruningPhase1Mark(ctx context.Context, d *dal.DAL, inst *ent.Instrument)
 		}
 	}
 	if totalMarked > 0 {
-		logrus.Infof("pruning phase1 %s: marked %d rows as soft-deleted", inst.Name, totalMarked)
+		logrus.WithFields(logrus.Fields{"instrument": inst.Name, "rows": totalMarked}).Info("pruning phase1: marked rows as soft-deleted")
 	}
 }
 
@@ -499,8 +500,7 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 	}
 
 	failed := len(allRows) - len(succeeded)
-	logrus.Infof("pruning phase2 %s: swept %d rows — succeeded=%d failed=%d",
-		inst.Name, len(allRows), len(succeeded), failed)
+	logrus.WithFields(logrus.Fields{"instrument": inst.Name, "total": len(allRows), "succeeded": len(succeeded), "failed": failed}).Info("pruning phase2: swept rows")
 
 	// ── Phase 3: DB Hard Delete (succeeded group only) ───────────────────────
 	if len(succeeded) == 0 {
@@ -523,7 +523,7 @@ func runPruningPhase2Sweep(ctx context.Context, d *dal.DAL, inst *ent.Instrument
 			totalDeleted += len(chunk)
 		}
 	}
-	logrus.Infof("pruning phase3 %s: hard-deleted %d rows", inst.Name, totalDeleted)
+	logrus.WithFields(logrus.Fields{"instrument": inst.Name, "rows": totalDeleted}).Info("pruning phase3: hard-deleted rows")
 }
 
 // ── GROUP 2D — CONSISTENCY CHECK ─────────────────────────────────────────────
@@ -584,8 +584,14 @@ func checkConsistencyForJobType(ctx context.Context, d *dal.DAL, inst *ent.Instr
 	}
 
 	setPause()
-	logrus.Infof("consistency check %s %s: expected=%d actual=%d — %d missing, filling in batches of %d",
-		inst.Name, jobType, expected, actual, expected-actual, consistencyBatchSize)
+	logrus.WithFields(logrus.Fields{
+		"instrument":   inst.Name,
+		"job_type":     jobType,
+		"expected":     expected,
+		"actual":       actual,
+		"missing":      expected - actual,
+		"batch_size":   consistencyBatchSize,
+	}).Info("consistency check: filling missing rows")
 
 	// Cursor-based scan: afterTS starts one step before minTS so the first
 	// batch includes minTS itself. Each iteration fetches up to consistencyBatchSize

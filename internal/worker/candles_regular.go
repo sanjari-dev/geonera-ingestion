@@ -121,8 +121,11 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 		}
 
 		count++
-		logrus.Infof("candle agg: claimed instrument=%s date=%s row_id=%s",
-			instrName(claimed), claimed.Timestamp.Format(time.DateOnly), claimed.ID)
+		logrus.WithFields(logrus.Fields{
+			"instrument": instrName(claimed),
+			"date":       claimed.Timestamp.Format(time.DateOnly),
+			"state_id":   claimed.ID,
+		}).Info("candle agg: claimed")
 
 		loopWg.Add(1)
 		go func(r *ent.State) {
@@ -132,7 +135,7 @@ func runCandleAggregationLoop(ctx context.Context, d *dal.DAL) {
 		}(claimed)
 	}
 	loopWg.Wait()
-	logrus.Infof("candle agg: loop complete rows=%d", count)
+	logrus.WithField("rows", count).Info("candle agg: loop complete")
 }
 
 // ── Aggregation pipeline ──────────────────────────────────────────────────────
@@ -156,9 +159,9 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 	instrName := row.Edges.Instrument.Name
 	dayStart := row.Timestamp.UTC() // CANDLE timestamp is already 00:00:00 UTC
 	start := time.Now()
-	logrus.Infof("candle agg: start instrument=%s date=%s row_id=%s", instrName, dayStart.Format(time.DateOnly), row.ID)
+	logrus.WithFields(logrus.Fields{"instrument": instrName, "date": dayStart.Format(time.DateOnly), "state_id": row.ID}).Info("candle agg: start")
 	defer func() {
-		logrus.Infof("candle agg: done instrument=%s date=%s elapsed=%s", instrName, dayStart.Format(time.DateOnly), time.Since(start).Round(time.Millisecond))
+		logrus.WithFields(logrus.Fields{"instrument": instrName, "date": dayStart.Format(time.DateOnly), "elapsed": time.Since(start).Round(time.Millisecond)}).Info("candle agg: done")
 	}()
 
 	// Step 1 — Query the 24 CONFIRMED TICK rows for this instrument and day.
@@ -208,7 +211,7 @@ func executeCandleAggregation(ctx context.Context, d *dal.DAL, row *ent.State) {
 					continue
 				}
 				// BROKEN Storage: file should exist but doesn't.
-				logrus.Infof("candle agg %s: NoSuchKey for tick %s (not deleted)", row.ID, tickState.ID)
+				logrus.WithFields(logrus.Fields{"state_id": row.ID, "tick_state_id": tickState.ID}).Info("candle agg: NoSuchKey for tick (not deleted)")
 				broken = true
 				break
 			}

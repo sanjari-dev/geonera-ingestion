@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 )
 
 // ErrNotFound is returned when Dukascopy responds with HTTP 404 (no data for
@@ -70,6 +71,7 @@ func (c *Client) FetchBI5(ctx context.Context, instrument string, ts time.Time) 
 		t.Hour(),
 	)
 
+	logrus.WithField("url", url).Trace("dukascopy: fetch")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dukascopy: build request: %w", err)

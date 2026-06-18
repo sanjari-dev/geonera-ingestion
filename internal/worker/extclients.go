@@ -46,11 +46,11 @@ func initBackfillConfig() {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
-		logrus.Warnf("worker: invalid BACKFILL_CLAIM_LIMIT=%q (must be a positive integer) — using default %d", v, backfillMasterClaimLimit)
+		logrus.WithFields(logrus.Fields{"value": v, "default": backfillMasterClaimLimit}).Warn("worker: invalid BACKFILL_CLAIM_LIMIT (must be a positive integer) — using default")
 		return
 	}
 	backfillMasterClaimLimit = n
-	logrus.Infof("worker: backfill claim limit set to %d (from BACKFILL_CLAIM_LIMIT)", n)
+	logrus.WithField("claim_limit", n).Info("worker: backfill claim limit set (from BACKFILL_CLAIM_LIMIT)")
 }
 
 // InitActivityLogger wires up the activity log logger so that RunMaintenanceHandler

@@ -72,11 +72,9 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	// return immediately without consuming a rate-gate token.
 	select {
 	case queue <- req:
-		logrus.Infof("ticks/download: queued instrument=%s ts=%s queue=%s",
-			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), queueName)
+		logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"), "queue": queueName}).Info("ticks/download: queued")
 	case <-ctx.Done():
-		logrus.Warnf("ticks/download: enqueue canceled instrument=%s ts=%s queue=%s err=%v",
-			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), queueName, ctx.Err())
+		logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z"), "queue": queueName}).WithError(ctx.Err()).Warn("ticks/download: enqueue canceled")
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
 
@@ -86,8 +84,7 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 	case result := <-resultCh:
 		return result
 	case <-ctx.Done():
-		logrus.Warnf("ticks/download: wait canceled instrument=%s ts=%s err=%v",
-			instrName(row), row.Timestamp.Format("2006-01-02T15:04Z"), ctx.Err())
+		logrus.WithFields(logrus.Fields{"instrument": instrName(row), "ts": row.Timestamp.Format("2006-01-02T15:04Z")}).WithError(ctx.Err()).Warn("ticks/download: wait canceled")
 		return DownloadResult{Status: DownloadError, Err: ctx.Err()}
 	}
 }
@@ -101,7 +98,7 @@ func startDownloadWorkers() {
 	for i := 0; i < dukascopyBurst; i++ {
 		go runDownloadWorker()
 	}
-	logrus.Infof("worker: %d download workers started (max %d req/s, backfill queue cap %d, regular queue prioritised over backfill)", dukascopyBurst, dukascopyMaxRPS, backfillMasterClaimLimit)
+	logrus.WithFields(logrus.Fields{"workers": dukascopyBurst, "max_rps": dukascopyMaxRPS, "backfill_queue_cap": backfillMasterClaimLimit}).Info("worker: download workers started (regular queue prioritised over backfill)")
 }
 
 // runDownloadWorker is the body of each download worker goroutine.
@@ -145,7 +142,7 @@ func processDownloadRequest(req downloadRequest) {
 	// Discard already-canceled requests so they don't consume rate tokens.
 	select {
 	case <-req.ctx.Done():
-		logrus.Warnf("ticks/download: discard pre-rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).WithError(req.ctx.Err()).Warn("ticks/download: discard pre-rate-gate")
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	default:
@@ -155,9 +152,9 @@ func processDownloadRequest(req downloadRequest) {
 	// Caps global throughput at dukascopyMaxRPS req/s.
 	select {
 	case <-tickDownloadRateGate:
-		logrus.Infof("ticks/download: rate-gate acquired instrument=%s ts=%s", inst, ts)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/download: rate-gate acquired")
 	case <-req.ctx.Done():
-		logrus.Warnf("ticks/download: discard at rate-gate instrument=%s ts=%s err=%v", inst, ts, req.ctx.Err())
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).WithError(req.ctx.Err()).Warn("ticks/download: discard at rate-gate")
 		req.resultCh <- DownloadResult{Status: DownloadError, Err: req.ctx.Err()}
 		return
 	}
@@ -169,7 +166,7 @@ func processDownloadRequest(req downloadRequest) {
 	select {
 	case req.resultCh <- result:
 	case <-req.ctx.Done():
-		logrus.Warnf("ticks/download: result discarded caller-canceled instrument=%s ts=%s", inst, ts)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Warn("ticks/download: result discarded caller-canceled")
 	}
 }
 
@@ -179,28 +176,27 @@ func doDownload(ctx context.Context, row *ent.State) DownloadResult {
 	inst := instrName(row)
 	ts := row.Timestamp.Format("2006-01-02T15:04Z")
 	start := time.Now()
-	logrus.Infof("ticks/download: fetching instrument=%s ts=%s", inst, ts)
+	logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/download: fetching")
 
 	data, err := downloadBI5(ctx, row)
 	if err == nil {
-		logrus.Infof("ticks/download: OK instrument=%s ts=%s bytes=%d elapsed=%s", inst, ts, len(data), time.Since(start).Round(time.Millisecond))
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "bytes": len(data), "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/download: OK")
 		return DownloadResult{Status: DownloadOK, Data: data}
 	}
 	switch {
 	case isNotFoundError(err):
-		logrus.Infof("ticks/download: NOT_FOUND HTTP 404 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Info("ticks/download: NOT_FOUND HTTP 404")
 		return DownloadResult{Status: DownloadNotFound, Err: err}
 	case isRateLimitedError(err):
-		logrus.Warnf("ticks/download: RATE_LIMITED HTTP 429 instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Warn("ticks/download: RATE_LIMITED HTTP 429")
 		return DownloadResult{Status: DownloadRateLimited, Err: err}
 	default:
 		var httpErr *dukascopy.HTTPError
 		if errors.As(err, &httpErr) {
-			logrus.WithError(err).Errorf("ticks/download: ERROR %s instrument=%s ts=%s elapsed=%s",
-				httpClass(httpErr.StatusCode), inst, ts, time.Since(start).Round(time.Millisecond))
+			logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond), "url": httpClass(httpErr.StatusCode)}).Error("ticks/download: ERROR")
 		} else {
 			// Network error, timeout, or context cancellation — no HTTP status code.
-			logrus.WithError(err).Errorf("ticks/download: ERROR instrument=%s ts=%s elapsed=%s", inst, ts, time.Since(start).Round(time.Millisecond))
+			logrus.WithError(err).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "elapsed": time.Since(start).Round(time.Millisecond)}).Error("ticks/download: ERROR")
 		}
 		return DownloadResult{Status: DownloadError, Err: err}
 	}

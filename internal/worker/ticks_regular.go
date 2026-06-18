@@ -21,12 +21,12 @@ func runT0Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T0")
 
 	target := time.Now().UTC().Truncate(time.Hour)
-	logrus.Infof("ticks/T0: start target=%s", target.Format(time.RFC3339))
+	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T0: start")
 
 	ensureT0TickTasks(ctx, d, target)
 	runIngestionLoop(ctx, d, &target)
 
-	logrus.Infof("ticks/T0: done target=%s", target.Format(time.RFC3339))
+	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T0: done")
 }
 
 // ensureT0TickTasks inserts a PENDING TICK row at target for every instrument
@@ -44,7 +44,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 		if err != nil {
 			return fmt.Errorf("query instruments: %w", err)
 		}
-		logrus.Infof("ticks/T0: seeding PENDING task(s) for %d instrument(s) at %s", len(instruments), target.Format(time.RFC3339))
+		logrus.WithFields(logrus.Fields{"count": len(instruments), "target": target.Format(time.RFC3339)}).Info("ticks/T0: seeding PENDING tasks")
 		insertedAt := time.Now().UTC()
 		for _, inst := range instruments {
 			if err := insertStatePendingOnConflictDoNothing(ctx, tx, inst.ID, state.JobTypeTICK, target, insertedAt); err != nil {
@@ -53,7 +53,7 @@ func ensureT0TickTasks(ctx context.Context, d *dal.DAL, target time.Time) {
 		}
 		return nil
 	}); err != nil {
-		logrus.WithError(err).Errorf("ticks/T0: ensure tasks error target=%s", target.Format(time.RFC3339))
+		logrus.WithError(err).WithField("target", target.Format(time.RFC3339)).Error("ticks/T0: ensure tasks error")
 	}
 }
 
@@ -64,9 +64,9 @@ func runT1Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T1")
 
 	target := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	logrus.Infof("ticks/T1: start target=%s", target.Format(time.RFC3339))
+	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T1: start")
 	runRecoveryLoop(ctx, d, target)
-	logrus.Infof("ticks/T1: done target=%s", target.Format(time.RFC3339))
+	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T1: done")
 }
 
 // ── T-2: two-hours-ago physical validation ────────────────────────────────────
@@ -76,12 +76,12 @@ func runT2Phase(ctx context.Context, d *dal.DAL, wg *sync.WaitGroup) {
 	defer recoverGoroutine(ctx, "ticks/T2")
 
 	target := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
-	logrus.Infof("ticks/T2: start target=%s", target.Format(time.RFC3339))
+	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T2: start")
 	// T-2 Regular: claims COMPLETED + NOT_FOUND, re-downloads BI5 for cross-validation.
 	// COMPLETED → re-download matches → CONFIRMED; NOT_FOUND → streak+1, at ≥3 → CONFIRMED.
 	// IsPause=false enforced, consistent with T-0 and T-1.
 	runValidationLoop(ctx, d, &target)
-	logrus.Infof("ticks/T2: done target=%s", target.Format(time.RFC3339))
+	logrus.WithField("target", target.Format(time.RFC3339)).Info("ticks/T2: done")
 }
 
 // runIngestionLoop claims PENDING TICK rows one at a time for the given hour
@@ -120,8 +120,11 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		}
 
 		count++
-		logrus.Infof("ticks/T0: claimed instrument=%s ts=%s state_id=%s",
-			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID)
+		logrus.WithFields(logrus.Fields{
+			"instrument": instrName(claimed),
+			"ts":         claimed.Timestamp.Format(time.RFC3339),
+			"state_id":   claimed.ID,
+		}).Info("ticks/T0: claimed")
 
 		loopWg.Add(1)
 		go func(r *ent.State) {
@@ -132,7 +135,7 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	}
 	loopWg.Wait()
 	if timestamp != nil {
-		logrus.Infof("ticks/T0: ingestion loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
+		logrus.WithFields(logrus.Fields{"rows": count, "target": timestamp.Format(time.RFC3339)}).Info("ticks/T0: ingestion loop complete")
 	}
 }
 
@@ -170,13 +173,17 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 			if ent.IsNotFound(err) {
 				break
 			}
-			logrus.WithError(err).Errorf("ticks/T1: recovery claim error target=%s", target.Format(time.RFC3339))
+			logrus.WithError(err).WithField("target", target.Format(time.RFC3339)).Error("ticks/T1: recovery claim error")
 			break
 		}
 
 		count++
-		logrus.Infof("ticks/T1: claimed instrument=%s ts=%s state_id=%s prev_status=%s",
-			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID, prevStatusStr(claimed.PreviousStatus))
+		logrus.WithFields(logrus.Fields{
+			"instrument":  instrName(claimed),
+			"ts":          claimed.Timestamp.Format(time.RFC3339),
+			"state_id":    claimed.ID,
+			"prev_status": prevStatusStr(claimed.PreviousStatus),
+		}).Info("ticks/T1: claimed")
 
 		prevStatus := claimed.PreviousStatus
 		loopWg.Add(1)
@@ -187,7 +194,7 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 		}(claimed, prevStatus)
 	}
 	loopWg.Wait()
-	logrus.Infof("ticks/T1: recovery loop complete rows=%d target=%s", count, target.Format(time.RFC3339))
+	logrus.WithFields(logrus.Fields{"rows": count, "target": target.Format(time.RFC3339)}).Info("ticks/T1: recovery loop complete")
 }
 
 // runValidationLoop claims COMPLETED and NOT_FOUND rows for the given hour
@@ -233,8 +240,12 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		}
 
 		count++
-		logrus.Infof("ticks/T2: claimed instrument=%s ts=%s state_id=%s preclaim_prev=%s",
-			instrName(claimed), claimed.Timestamp.Format(time.RFC3339), claimed.ID, prevStatusStr(preclaimPrev))
+		logrus.WithFields(logrus.Fields{
+			"instrument":  instrName(claimed),
+			"ts":          claimed.Timestamp.Format(time.RFC3339),
+			"state_id":    claimed.ID,
+			"prev_status": prevStatusStr(preclaimPrev),
+		}).Info("ticks/T2: claimed")
 
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
@@ -245,7 +256,7 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 	}
 	loopWg.Wait()
 	if timestamp != nil {
-		logrus.Infof("ticks/T2: validation loop complete rows=%d target=%s", count, timestamp.Format(time.RFC3339))
+		logrus.WithFields(logrus.Fields{"rows": count, "target": timestamp.Format(time.RFC3339)}).Info("ticks/T2: validation loop complete")
 	}
 }
 
@@ -260,17 +271,17 @@ func executeRecoveryAction(ctx context.Context, d *dal.DAL, row *ent.State, prev
 	switch *prev {
 	case state.PreviousStatusPROCESSED, state.PreviousStatusPENDING:
 		// Stuck PROCESSED or stale PENDING → reset to PENDING for the next T-0 run.
-		logrus.Infof("ticks/T1: zombie instrument=%s ts=%s prev_status=%s → PENDING", inst, ts, *prev)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": *prev}).Info("ticks/T1: zombie → PENDING")
 		resetStateToPending(ctx, d, row)
 
 	case state.PreviousStatusFAILED, state.PreviousStatusBROKEN:
 		// Increment RetryCount, decrement NotFoundStreak (floor 0), always → PENDING.
-		logrus.Infof("ticks/T1: retry instrument=%s ts=%s prev_status=%s retry_count=%d → PENDING", inst, ts, *prev, row.RetryCount)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": *prev, "retry_count": row.RetryCount}).Info("ticks/T1: retry → PENDING")
 		handleRetryReset(ctx, d, row)
 
 	case state.PreviousStatusNOT_FOUND:
 		// Re-check API: data → PENDING+streak=0; still 404 → Zero-Row+NOT_FOUND.
-		logrus.Infof("ticks/T1: recheck instrument=%s ts=%s streak=%d", inst, ts, row.NotFoundStreak)
+		logrus.WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": row.NotFoundStreak}).Info("ticks/T1: recheck")
 		executeNotFoundRecheck(ctx, d, row, true)
 	}
 }

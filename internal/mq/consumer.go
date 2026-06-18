@@ -114,10 +114,10 @@ func consumeLoop(c *Client, queue string, handler func(ctx context.Context, onSt
 	for {
 		err := runConsumer(c, queue, handler, logger, onComplete)
 		if err != nil {
-			logrus.WithError(err).Errorf("mq: consumer %q error — retrying in %s", queue, backoff)
+			logrus.WithError(err).WithFields(logrus.Fields{"queue": queue, "backoff": backoff}).Error("mq: consumer error — retrying")
 		} else {
 			// Channel closed cleanly (broker-side shutdown); reset back-off.
-			logrus.Infof("mq: consumer %q channel closed — reconnecting", queue)
+			logrus.WithField("queue", queue).Info("mq: consumer channel closed — reconnecting")
 			backoff = time.Second
 		}
 		time.Sleep(backoff)
@@ -163,7 +163,7 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 	// Watch for channel-level errors (e.g., broker-forced close) alongside messages.
 	chClose := ch.NotifyClose(make(chan *amqp.Error, 1))
 
-	logrus.Infof("mq: consumer %q ready", queue)
+	logrus.WithField("queue", queue).Info("mq: consumer ready")
 	for {
 		select {
 		case msg, ok := <-msgs:
@@ -172,6 +172,7 @@ func runConsumer(c *Client, queue string, handler func(ctx context.Context, onSt
 				return nil
 			}
 
+			logrus.WithFields(logrus.Fields{"queue": queue, "delivery_tag": msg.DeliveryTag}).Debug("mq: message received")
 			ctx := context.Background()
 
 			// Ack immediately so the broker can deliver the next message.

@@ -198,6 +198,6 @@ func applyMigration(ctx context.Context, db *sql.DB, m schemaMigration) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	logrus.Infof("database: migration v%d applied — %s", m.version, m.desc)
+	logrus.WithFields(logrus.Fields{"version": m.version, "desc": m.desc}).Info("database: migration applied")
 	return nil
 }
