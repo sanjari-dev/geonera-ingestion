@@ -921,6 +921,7 @@ type StateMutation struct {
 	addnot_found_streak    *int
 	is_deleted             *bool
 	updated_at             *time.Time
+	trace_id               *string
 	clearedFields          map[string]struct{}
 	instrument             *uuid.UUID
 	clearedinstrument      bool
@@ -1502,6 +1503,55 @@ func (m *StateMutation) ResetUpdatedAt() {
 	m.updated_at = nil
 }
 
+// SetTraceID sets the "trace_id" field.
+func (m *StateMutation) SetTraceID(s string) {
+	m.trace_id = &s
+}
+
+// TraceID returns the value of the "trace_id" field in the mutation.
+func (m *StateMutation) TraceID() (r string, exists bool) {
+	v := m.trace_id
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldTraceID returns the old "trace_id" field's value of the State entity.
+// If the State object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *StateMutation) OldTraceID(ctx context.Context) (v *string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldTraceID is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldTraceID requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldTraceID: %w", err)
+	}
+	return oldValue.TraceID, nil
+}
+
+// ClearTraceID clears the value of the "trace_id" field.
+func (m *StateMutation) ClearTraceID() {
+	m.trace_id = nil
+	m.clearedFields[state.FieldTraceID] = struct{}{}
+}
+
+// TraceIDCleared returns if the "trace_id" field was cleared in this mutation.
+func (m *StateMutation) TraceIDCleared() bool {
+	_, ok := m.clearedFields[state.FieldTraceID]
+	return ok
+}
+
+// ResetTraceID resets all changes to the "trace_id" field.
+func (m *StateMutation) ResetTraceID() {
+	m.trace_id = nil
+	delete(m.clearedFields, state.FieldTraceID)
+}
+
 // ClearInstrument clears the "instrument" edge to the Instrument entity.
 func (m *StateMutation) ClearInstrument() {
 	m.clearedinstrument = true
@@ -1563,7 +1613,7 @@ func (m *StateMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *StateMutation) Fields() []string {
-	fields := make([]string, 0, 11)
+	fields := make([]string, 0, 12)
 	if m.instrument != nil {
 		fields = append(fields, state.FieldInstrumentID)
 	}
@@ -1597,6 +1647,9 @@ func (m *StateMutation) Fields() []string {
 	if m.updated_at != nil {
 		fields = append(fields, state.FieldUpdatedAt)
 	}
+	if m.trace_id != nil {
+		fields = append(fields, state.FieldTraceID)
+	}
 	return fields
 }
 
@@ -1627,6 +1680,8 @@ func (m *StateMutation) Field(name string) (ent.Value, bool) {
 		return m.IsDeleted()
 	case state.FieldUpdatedAt:
 		return m.UpdatedAt()
+	case state.FieldTraceID:
+		return m.TraceID()
 	}
 	return nil, false
 }
@@ -1658,6 +1713,8 @@ func (m *StateMutation) OldField(ctx context.Context, name string) (ent.Value, e
 		return m.OldIsDeleted(ctx)
 	case state.FieldUpdatedAt:
 		return m.OldUpdatedAt(ctx)
+	case state.FieldTraceID:
+		return m.OldTraceID(ctx)
 	}
 	return nil, fmt.Errorf("unknown State field %s", name)
 }
@@ -1744,6 +1801,13 @@ func (m *StateMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetUpdatedAt(v)
 		return nil
+	case state.FieldTraceID:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetTraceID(v)
+		return nil
 	}
 	return fmt.Errorf("unknown State field %s", name)
 }
@@ -1816,6 +1880,9 @@ func (m *StateMutation) ClearedFields() []string {
 	if m.FieldCleared(state.FieldPreviousStatus) {
 		fields = append(fields, state.FieldPreviousStatus)
 	}
+	if m.FieldCleared(state.FieldTraceID) {
+		fields = append(fields, state.FieldTraceID)
+	}
 	return fields
 }
 
@@ -1832,6 +1899,9 @@ func (m *StateMutation) ClearField(name string) error {
 	switch name {
 	case state.FieldPreviousStatus:
 		m.ClearPreviousStatus()
+		return nil
+	case state.FieldTraceID:
+		m.ClearTraceID()
 		return nil
 	}
 	return fmt.Errorf("unknown State nullable field %s", name)
@@ -1873,6 +1943,9 @@ func (m *StateMutation) ResetField(name string) error {
 		return nil
 	case state.FieldUpdatedAt:
 		m.ResetUpdatedAt()
+		return nil
+	case state.FieldTraceID:
+		m.ResetTraceID()
 		return nil
 	}
 	return fmt.Errorf("unknown State field %s", name)
@@ -1960,6 +2033,8 @@ type SyncTaskMutation struct {
 	id                *uuid.UUID
 	target_date       *time.Time
 	status            *synctask.Status
+	hours_count       *int
+	addhours_count    *int
 	created_at        *time.Time
 	clearedFields     map[string]struct{}
 	instrument        *uuid.UUID
@@ -2181,6 +2256,62 @@ func (m *SyncTaskMutation) ResetStatus() {
 	m.status = nil
 }
 
+// SetHoursCount sets the "hours_count" field.
+func (m *SyncTaskMutation) SetHoursCount(i int) {
+	m.hours_count = &i
+	m.addhours_count = nil
+}
+
+// HoursCount returns the value of the "hours_count" field in the mutation.
+func (m *SyncTaskMutation) HoursCount() (r int, exists bool) {
+	v := m.hours_count
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldHoursCount returns the old "hours_count" field's value of the SyncTask entity.
+// If the SyncTask object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *SyncTaskMutation) OldHoursCount(ctx context.Context) (v int, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldHoursCount is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldHoursCount requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldHoursCount: %w", err)
+	}
+	return oldValue.HoursCount, nil
+}
+
+// AddHoursCount adds i to the "hours_count" field.
+func (m *SyncTaskMutation) AddHoursCount(i int) {
+	if m.addhours_count != nil {
+		*m.addhours_count += i
+	} else {
+		m.addhours_count = &i
+	}
+}
+
+// AddedHoursCount returns the value that was added to the "hours_count" field in this mutation.
+func (m *SyncTaskMutation) AddedHoursCount() (r int, exists bool) {
+	v := m.addhours_count
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetHoursCount resets all changes to the "hours_count" field.
+func (m *SyncTaskMutation) ResetHoursCount() {
+	m.hours_count = nil
+	m.addhours_count = nil
+}
+
 // SetCreatedAt sets the "created_at" field.
 func (m *SyncTaskMutation) SetCreatedAt(t time.Time) {
 	m.created_at = &t
@@ -2278,7 +2409,7 @@ func (m *SyncTaskMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *SyncTaskMutation) Fields() []string {
-	fields := make([]string, 0, 4)
+	fields := make([]string, 0, 5)
 	if m.instrument != nil {
 		fields = append(fields, synctask.FieldInstrumentID)
 	}
@@ -2287,6 +2418,9 @@ func (m *SyncTaskMutation) Fields() []string {
 	}
 	if m.status != nil {
 		fields = append(fields, synctask.FieldStatus)
+	}
+	if m.hours_count != nil {
+		fields = append(fields, synctask.FieldHoursCount)
 	}
 	if m.created_at != nil {
 		fields = append(fields, synctask.FieldCreatedAt)
@@ -2305,6 +2439,8 @@ func (m *SyncTaskMutation) Field(name string) (ent.Value, bool) {
 		return m.TargetDate()
 	case synctask.FieldStatus:
 		return m.Status()
+	case synctask.FieldHoursCount:
+		return m.HoursCount()
 	case synctask.FieldCreatedAt:
 		return m.CreatedAt()
 	}
@@ -2322,6 +2458,8 @@ func (m *SyncTaskMutation) OldField(ctx context.Context, name string) (ent.Value
 		return m.OldTargetDate(ctx)
 	case synctask.FieldStatus:
 		return m.OldStatus(ctx)
+	case synctask.FieldHoursCount:
+		return m.OldHoursCount(ctx)
 	case synctask.FieldCreatedAt:
 		return m.OldCreatedAt(ctx)
 	}
@@ -2354,6 +2492,13 @@ func (m *SyncTaskMutation) SetField(name string, value ent.Value) error {
 		}
 		m.SetStatus(v)
 		return nil
+	case synctask.FieldHoursCount:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetHoursCount(v)
+		return nil
 	case synctask.FieldCreatedAt:
 		v, ok := value.(time.Time)
 		if !ok {
@@ -2368,13 +2513,21 @@ func (m *SyncTaskMutation) SetField(name string, value ent.Value) error {
 // AddedFields returns all numeric fields that were incremented/decremented during
 // this mutation.
 func (m *SyncTaskMutation) AddedFields() []string {
-	return nil
+	var fields []string
+	if m.addhours_count != nil {
+		fields = append(fields, synctask.FieldHoursCount)
+	}
+	return fields
 }
 
 // AddedField returns the numeric value that was incremented/decremented on a field
 // with the given name. The second boolean return value indicates that this field
 // was not set, or was not defined in the schema.
 func (m *SyncTaskMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case synctask.FieldHoursCount:
+		return m.AddedHoursCount()
+	}
 	return nil, false
 }
 
@@ -2383,6 +2536,13 @@ func (m *SyncTaskMutation) AddedField(name string) (ent.Value, bool) {
 // type.
 func (m *SyncTaskMutation) AddField(name string, value ent.Value) error {
 	switch name {
+	case synctask.FieldHoursCount:
+		v, ok := value.(int)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddHoursCount(v)
+		return nil
 	}
 	return fmt.Errorf("unknown SyncTask numeric field %s", name)
 }
@@ -2418,6 +2578,9 @@ func (m *SyncTaskMutation) ResetField(name string) error {
 		return nil
 	case synctask.FieldStatus:
 		m.ResetStatus()
+		return nil
+	case synctask.FieldHoursCount:
+		m.ResetHoursCount()
 		return nil
 	case synctask.FieldCreatedAt:
 		m.ResetCreatedAt()

@@ -40,7 +40,7 @@ type downloadRequest struct {
 
 // regularDownloadQueue carries requests from T-0 / T-1 / T-2 Regular.
 // Workers always drain this queue before touching backfillDownloadQueue.
-var regularDownloadQueue = make(chan downloadRequest, dukascopyBurst)
+var regularDownloadQueue chan downloadRequest
 
 // backfillDownloadQueue carries requests from the Backfill master-claim batch.
 // Initialized in startDownloadWorkers (after env is read), so its capacity always
@@ -108,6 +108,7 @@ func RequestDownload(ctx context.Context, row *ent.State, highPriority bool) Dow
 // goroutines that drain both download queues with Regular priority.
 // Called once by InitDownloadRateLimiter at startup, after initBackfillConfig.
 func startDownloadWorkers() {
+	regularDownloadQueue = make(chan downloadRequest, dukascopyBurst)
 	backfillDownloadQueue = make(chan downloadRequest, backfillMasterClaimLimit)
 	for i := 0; i < dukascopyBurst; i++ {
 		go runDownloadWorker()

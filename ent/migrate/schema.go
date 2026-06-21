@@ -39,6 +39,7 @@ var (
 		{Name: "not_found_streak", Type: field.TypeInt, Default: 0},
 		{Name: "is_deleted", Type: field.TypeBool, Default: false},
 		{Name: "updated_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
+		{Name: "trace_id", Type: field.TypeString, Nullable: true},
 		{Name: "instrument_id", Type: field.TypeUUID},
 	}
 	// StatesTable holds the schema information for the "states" table.
@@ -49,7 +50,7 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "states_instruments_states",
-				Columns:    []*schema.Column{StatesColumns[11]},
+				Columns:    []*schema.Column{StatesColumns[12]},
 				RefColumns: []*schema.Column{InstrumentsColumns[0]},
 				OnDelete:   schema.NoAction,
 			},
@@ -58,7 +59,7 @@ var (
 			{
 				Name:    "state_instrument_id_timestamp_job_type",
 				Unique:  true,
-				Columns: []*schema.Column{StatesColumns[11], StatesColumns[2], StatesColumns[1]},
+				Columns: []*schema.Column{StatesColumns[12], StatesColumns[2], StatesColumns[1]},
 			},
 		},
 	}
@@ -67,6 +68,7 @@ var (
 		{Name: "id", Type: field.TypeUUID},
 		{Name: "target_date", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
 		{Name: "status", Type: field.TypeEnum, Enums: []string{"PENDING", "PROCESSED"}, Default: "PENDING", SchemaType: map[string]string{"postgres": "ingestion.sync_status_enum"}},
+		{Name: "hours_count", Type: field.TypeInt, Default: 0},
 		{Name: "created_at", Type: field.TypeTime, SchemaType: map[string]string{"postgres": "timestamptz"}},
 		{Name: "instrument_id", Type: field.TypeUUID},
 	}
@@ -78,7 +80,7 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "sync_tasks_instruments_sync_tasks",
-				Columns:    []*schema.Column{SyncTasksColumns[4]},
+				Columns:    []*schema.Column{SyncTasksColumns[5]},
 				RefColumns: []*schema.Column{InstrumentsColumns[0]},
 				OnDelete:   schema.NoAction,
 			},
@@ -87,7 +89,7 @@ var (
 			{
 				Name:    "synctask_instrument_id_target_date",
 				Unique:  true,
-				Columns: []*schema.Column{SyncTasksColumns[4], SyncTasksColumns[1]},
+				Columns: []*schema.Column{SyncTasksColumns[5], SyncTasksColumns[1]},
 			},
 		},
 	}

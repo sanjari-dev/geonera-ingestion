@@ -135,10 +135,9 @@ func runBackfillMasterClaim(ctx context.Context, d *dal.DAL) {
 	for _, item := range batch {
 		batchWg.Add(1)
 		go func(it backfillRoutedRow) {
-			defer batchWg.Done()
 			defer recoverGoroutine(ctx, "ticks/backfill-master-row")
 			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(it.row), "layer": it.layer}).Trace("goroutine: backfill-master-row start")
-			dispatchBackfillRoutedRow(ctx, d, it)
+			dispatchBackfillRoutedRow(ctx, d, it, batchWg.Done)
 			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(it.row)}).Trace("goroutine: backfill-master-row done")
 		}(item)
 	}
@@ -321,7 +320,7 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 // dispatchBackfillRoutedRow runs the handler selected for a row at master-claim
 // time. Rows resolved entirely inside the claim transaction (backfillLayerNone)
 // require no further action here.
-func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRoutedRow) {
+func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRoutedRow, done func()) {
 	inst := instrName(item.row)
 	ts := item.row.Timestamp.Format(time.RFC3339)
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "dispatchBackfillRoutedRow", "instrument": inst, "layer": item.layer}).Trace("fn_entry")
@@ -336,10 +335,11 @@ func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRou
 	case backfillLayerIngestion:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: dispatch_ingestion")
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Info("ticks/backfill: dispatch ingestion")
-		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeIngestionETL")
-		executeIngestionETL(ctx, d, item.row, handleNotFoundIncrement, false)
-		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeIngestionETL")
+		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeIngestionDownload")
+		executeIngestionDownload(ctx, d, item.row, handleNotFoundIncrement, false, done)
+		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeIngestionDownload")
 	case backfillLayerRetryReset:
+		defer done()
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "retry_count": item.row.RetryCount}).Trace("branch: dispatch_retry_reset")
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "retry_count": item.row.RetryCount}).Info("ticks/backfill: dispatch retry_reset")
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: handleRetryReset")
@@ -348,16 +348,18 @@ func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRou
 	case backfillLayerT2Action:
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": prevStatusStr(item.preclaimPrev), "streak": item.row.NotFoundStreak}).Trace("branch: dispatch_t2_action")
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "prev_status": prevStatusStr(item.preclaimPrev), "streak": item.row.NotFoundStreak}).Info("ticks/backfill: dispatch t2_action")
-		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeT2Action")
-		executeT2Action(ctx, d, item.row, item.preclaimPrev, false)
-		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeT2Action")
+		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeT2Download")
+		executeT2Download(ctx, d, item.row, item.preclaimPrev, false, done)
+		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeT2Download")
 	case backfillLayerNotFoundRecheck:
+		defer done()
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": item.row.NotFoundStreak}).Trace("branch: dispatch_nf_recheck")
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts, "streak": item.row.NotFoundStreak}).Info("ticks/backfill: dispatch nf_recheck")
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("before call: executeNotFoundRecheck")
 		executeNotFoundRecheck(ctx, d, item.row, false)
 		ilogger.T(ctx).WithField("fn", "dispatchBackfillRoutedRow").Trace("after call: executeNotFoundRecheck")
 	case backfillLayerNone:
+		defer done()
 		ilogger.T(ctx).WithFields(logrus.Fields{"instrument": inst, "ts": ts}).Trace("branch: dispatch_none_already_resolved")
 		// Already fully resolved inside the claim transaction (zombie/ABANDONED reset).
 	}

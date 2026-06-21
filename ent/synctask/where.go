@@ -67,6 +67,11 @@ func TargetDate(v time.Time) predicate.SyncTask {
 	return predicate.SyncTask(sql.FieldEQ(FieldTargetDate, v))
 }
 
+// HoursCount applies equality check predicate on the "hours_count" field. It's identical to HoursCountEQ.
+func HoursCount(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldEQ(FieldHoursCount, v))
+}
+
 // CreatedAt applies equality check predicate on the "created_at" field. It's identical to CreatedAtEQ.
 func CreatedAt(v time.Time) predicate.SyncTask {
 	return predicate.SyncTask(sql.FieldEQ(FieldCreatedAt, v))
@@ -150,6 +155,46 @@ func StatusIn(vs ...Status) predicate.SyncTask {
 // StatusNotIn applies the NotIn predicate on the "status" field.
 func StatusNotIn(vs ...Status) predicate.SyncTask {
 	return predicate.SyncTask(sql.FieldNotIn(FieldStatus, vs...))
+}
+
+// HoursCountEQ applies the EQ predicate on the "hours_count" field.
+func HoursCountEQ(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldEQ(FieldHoursCount, v))
+}
+
+// HoursCountNEQ applies the NEQ predicate on the "hours_count" field.
+func HoursCountNEQ(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldNEQ(FieldHoursCount, v))
+}
+
+// HoursCountIn applies the In predicate on the "hours_count" field.
+func HoursCountIn(vs ...int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldIn(FieldHoursCount, vs...))
+}
+
+// HoursCountNotIn applies the NotIn predicate on the "hours_count" field.
+func HoursCountNotIn(vs ...int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldNotIn(FieldHoursCount, vs...))
+}
+
+// HoursCountGT applies the GT predicate on the "hours_count" field.
+func HoursCountGT(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldGT(FieldHoursCount, v))
+}
+
+// HoursCountGTE applies the GTE predicate on the "hours_count" field.
+func HoursCountGTE(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldGTE(FieldHoursCount, v))
+}
+
+// HoursCountLT applies the LT predicate on the "hours_count" field.
+func HoursCountLT(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldLT(FieldHoursCount, v))
+}
+
+// HoursCountLTE applies the LTE predicate on the "hours_count" field.
+func HoursCountLTE(v int) predicate.SyncTask {
+	return predicate.SyncTask(sql.FieldLTE(FieldHoursCount, v))
 }
 
 // CreatedAtEQ applies the EQ predicate on the "created_at" field.

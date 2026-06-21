@@ -60,6 +60,8 @@ func ValidColumn(column string) bool {
 }
 
 var (
+	// DefaultHoursCount holds the default value on creation for the "hours_count" field.
+	DefaultHoursCount int
 	// DefaultCreatedAt holds the default value on creation for the "created_at" field.
 	DefaultCreatedAt func() time.Time
 	// DefaultID holds the default value on creation for the "id" field.
@@ -113,6 +115,11 @@ func ByTargetDate(opts ...sql.OrderTermOption) OrderOption {
 // ByStatus orders the results by the status field.
 func ByStatus(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldStatus, opts...).ToFunc()
+}
+
+// ByHoursCount orders the results by the hours_count field.
+func ByHoursCount(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldHoursCount, opts...).ToFunc()
 }
 
 // ByCreatedAt orders the results by the created_at field.

@@ -25,7 +25,7 @@ type SyncTask struct {
 	TargetDate time.Time `json:"target_date,omitempty"`
 	// Status holds the value of the "status" field.
 	Status synctask.Status `json:"status,omitempty"`
-	// HoursCount holds the last computed count of CONFIRMED TICK rows for this instrument/date window.
+	// HoursCount holds the value of the "hours_count" field.
 	HoursCount int `json:"hours_count,omitempty"`
 	// CreatedAt holds the value of the "created_at" field.
 	CreatedAt time.Time `json:"created_at,omitempty"`
@@ -60,14 +60,14 @@ func (*SyncTask) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case synctask.FieldHoursCount:
+			values[i] = new(sql.NullInt64)
 		case synctask.FieldStatus:
 			values[i] = new(sql.NullString)
 		case synctask.FieldTargetDate, synctask.FieldCreatedAt:
 			values[i] = new(sql.NullTime)
 		case synctask.FieldID, synctask.FieldInstrumentID:
 			values[i] = new(uuid.UUID)
-		case synctask.FieldHoursCount:
-			values[i] = new(sql.NullInt64)
 		default:
 			values[i] = new(sql.UnknownType)
 		}

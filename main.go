@@ -63,7 +63,7 @@ func main() {
 	dukClient := dukascopy.NewClient()
 
 	// ── Wire external clients into worker package ─────────────────────────────
-	worker.InitClients(r2Client, dukClient)
+	worker.InitClients(r2Client, dukClient, appDAL)
 
 	// ── Database: run pending schema migrations ───────────────────────────────
 	if err := database.RunMigrations(ctx); err != nil {

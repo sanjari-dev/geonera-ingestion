@@ -73,6 +73,27 @@ func (_u *SyncTaskUpdate) SetNillableStatus(v *synctask.Status) *SyncTaskUpdate 
 	return _u
 }
 
+// SetHoursCount sets the "hours_count" field.
+func (_u *SyncTaskUpdate) SetHoursCount(v int) *SyncTaskUpdate {
+	_u.mutation.ResetHoursCount()
+	_u.mutation.SetHoursCount(v)
+	return _u
+}
+
+// SetNillableHoursCount sets the "hours_count" field if the given value is not nil.
+func (_u *SyncTaskUpdate) SetNillableHoursCount(v *int) *SyncTaskUpdate {
+	if v != nil {
+		_u.SetHoursCount(*v)
+	}
+	return _u
+}
+
+// AddHoursCount adds value to the "hours_count" field.
+func (_u *SyncTaskUpdate) AddHoursCount(v int) *SyncTaskUpdate {
+	_u.mutation.AddHoursCount(v)
+	return _u
+}
+
 // SetInstrument sets the "instrument" edge to the Instrument entity.
 func (_u *SyncTaskUpdate) SetInstrument(v *Instrument) *SyncTaskUpdate {
 	return _u.SetInstrumentID(v.ID)
@@ -146,6 +167,12 @@ func (_u *SyncTaskUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(synctask.FieldStatus, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.HoursCount(); ok {
+		_spec.SetField(synctask.FieldHoursCount, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedHoursCount(); ok {
+		_spec.AddField(synctask.FieldHoursCount, field.TypeInt, value)
 	}
 	if _u.mutation.InstrumentCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -239,6 +266,27 @@ func (_u *SyncTaskUpdateOne) SetNillableStatus(v *synctask.Status) *SyncTaskUpda
 	if v != nil {
 		_u.SetStatus(*v)
 	}
+	return _u
+}
+
+// SetHoursCount sets the "hours_count" field.
+func (_u *SyncTaskUpdateOne) SetHoursCount(v int) *SyncTaskUpdateOne {
+	_u.mutation.ResetHoursCount()
+	_u.mutation.SetHoursCount(v)
+	return _u
+}
+
+// SetNillableHoursCount sets the "hours_count" field if the given value is not nil.
+func (_u *SyncTaskUpdateOne) SetNillableHoursCount(v *int) *SyncTaskUpdateOne {
+	if v != nil {
+		_u.SetHoursCount(*v)
+	}
+	return _u
+}
+
+// AddHoursCount adds value to the "hours_count" field.
+func (_u *SyncTaskUpdateOne) AddHoursCount(v int) *SyncTaskUpdateOne {
+	_u.mutation.AddHoursCount(v)
 	return _u
 }
 
@@ -345,6 +393,12 @@ func (_u *SyncTaskUpdateOne) sqlSave(ctx context.Context) (_node *SyncTask, err 
 	}
 	if value, ok := _u.mutation.Status(); ok {
 		_spec.SetField(synctask.FieldStatus, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.HoursCount(); ok {
+		_spec.SetField(synctask.FieldHoursCount, field.TypeInt, value)
+	}
+	if value, ok := _u.mutation.AddedHoursCount(); ok {
+		_spec.AddField(synctask.FieldHoursCount, field.TypeInt, value)
 	}
 	if _u.mutation.InstrumentCleared() {
 		edge := &sqlgraph.EdgeSpec{

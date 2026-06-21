@@ -5,6 +5,7 @@ package state
 import (
 	"fmt"
 
+	"entgo.io/ent"
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqlgraph"
 	"github.com/google/uuid"
@@ -37,6 +38,8 @@ const (
 	FieldIsDeleted = "is_deleted"
 	// FieldUpdatedAt holds the string denoting the updated_at field in the database.
 	FieldUpdatedAt = "updated_at"
+	// FieldTraceID holds the string denoting the trace_id field in the database.
+	FieldTraceID = "trace_id"
 	// EdgeInstrument holds the string denoting the instrument edge name in mutations.
 	EdgeInstrument = "instrument"
 	// Table holds the table name of the state in the database.
@@ -64,6 +67,7 @@ var Columns = []string{
 	FieldNotFoundStreak,
 	FieldIsDeleted,
 	FieldUpdatedAt,
+	FieldTraceID,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -76,7 +80,13 @@ func ValidColumn(column string) bool {
 	return false
 }
 
+// Note that the variables below are initialized by the runtime
+// package on the initialization of the application. Therefore,
+// it should be imported in the main as follows:
+//
+//	import _ "github.com/sanjari-dev/geonera-ingestion/ent/runtime"
 var (
+	Hooks [1]ent.Hook
 	// DefaultIsHoliday holds the default value on creation for the "is_holiday" field.
 	DefaultIsHoliday bool
 	// DefaultResolvedTickCount holds the default value on creation for the "resolved_tick_count" field.
@@ -233,6 +243,11 @@ func ByIsDeleted(opts ...sql.OrderTermOption) OrderOption {
 // ByUpdatedAt orders the results by the updated_at field.
 func ByUpdatedAt(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldUpdatedAt, opts...).ToFunc()
+}
+
+// ByTraceID orders the results by the trace_id field.
+func ByTraceID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldTraceID, opts...).ToFunc()
 }
 
 // ByInstrumentField orders the results by instrument field.

@@ -197,6 +197,9 @@ CREATE TABLE IF NOT EXISTS ingestion.states (
     -- Timestamp of the last status transition. Maintained by the application, not a trigger.
     updated_at          TIMESTAMPTZ                 NOT NULL,
 
+    -- The trace ID from Logrus correlating to the execution that last mutated this state.
+    trace_id            TEXT,
+
     CONSTRAINT states_pkey PRIMARY KEY (id),
 
     CONSTRAINT states_instrument_id_fkey
@@ -229,6 +232,7 @@ COMMENT ON COLUMN ingestion.states.not_found_streak    IS 'Consecutive NOT_FOUND
 COMMENT ON COLUMN ingestion.states.retry_count         IS 'Cumulative retry count. State transitions to ABANDONED at 5 or above.';
 COMMENT ON COLUMN ingestion.states.is_deleted          IS 'Soft-delete mark for the Mark phase of 2-Phase Commit pruning.';
 COMMENT ON COLUMN ingestion.states.updated_at          IS 'Timestamp of the last status transition, maintained by the application.';
+COMMENT ON COLUMN ingestion.states.trace_id            IS 'The trace ID from Logrus correlating to the execution that last mutated this state.';
 
 
 -- =============================================================================

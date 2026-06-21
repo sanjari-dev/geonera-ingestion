@@ -48,6 +48,20 @@ func (_c *SyncTaskCreate) SetNillableStatus(v *synctask.Status) *SyncTaskCreate 
 	return _c
 }
 
+// SetHoursCount sets the "hours_count" field.
+func (_c *SyncTaskCreate) SetHoursCount(v int) *SyncTaskCreate {
+	_c.mutation.SetHoursCount(v)
+	return _c
+}
+
+// SetNillableHoursCount sets the "hours_count" field if the given value is not nil.
+func (_c *SyncTaskCreate) SetNillableHoursCount(v *int) *SyncTaskCreate {
+	if v != nil {
+		_c.SetHoursCount(*v)
+	}
+	return _c
+}
+
 // SetCreatedAt sets the "created_at" field.
 func (_c *SyncTaskCreate) SetCreatedAt(v time.Time) *SyncTaskCreate {
 	_c.mutation.SetCreatedAt(v)
@@ -120,6 +134,10 @@ func (_c *SyncTaskCreate) defaults() {
 		v := synctask.DefaultStatus
 		_c.mutation.SetStatus(v)
 	}
+	if _, ok := _c.mutation.HoursCount(); !ok {
+		v := synctask.DefaultHoursCount
+		_c.mutation.SetHoursCount(v)
+	}
 	if _, ok := _c.mutation.CreatedAt(); !ok {
 		v := synctask.DefaultCreatedAt()
 		_c.mutation.SetCreatedAt(v)
@@ -145,6 +163,9 @@ func (_c *SyncTaskCreate) check() error {
 		if err := synctask.StatusValidator(v); err != nil {
 			return &ValidationError{Name: "status", err: fmt.Errorf(`ent: validator failed for field "SyncTask.status": %w`, err)}
 		}
+	}
+	if _, ok := _c.mutation.HoursCount(); !ok {
+		return &ValidationError{Name: "hours_count", err: errors.New(`ent: missing required field "SyncTask.hours_count"`)}
 	}
 	if _, ok := _c.mutation.CreatedAt(); !ok {
 		return &ValidationError{Name: "created_at", err: errors.New(`ent: missing required field "SyncTask.created_at"`)}
@@ -195,6 +216,10 @@ func (_c *SyncTaskCreate) createSpec() (*SyncTask, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.Status(); ok {
 		_spec.SetField(synctask.FieldStatus, field.TypeEnum, value)
 		_node.Status = value
+	}
+	if value, ok := _c.mutation.HoursCount(); ok {
+		_spec.SetField(synctask.FieldHoursCount, field.TypeInt, value)
+		_node.HoursCount = value
 	}
 	if value, ok := _c.mutation.CreatedAt(); ok {
 		_spec.SetField(synctask.FieldCreatedAt, field.TypeTime, value)

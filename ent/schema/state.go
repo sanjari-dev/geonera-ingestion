@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"context"
 	"entgo.io/ent"
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/entsql"
@@ -9,6 +10,7 @@ import (
 	"entgo.io/ent/schema/field"
 	"entgo.io/ent/schema/index"
 	"github.com/google/uuid"
+	"github.com/sanjari-dev/geonera-ingestion/internal/logger"
 )
 
 // State holds the schema definition for the State entity.
@@ -76,6 +78,23 @@ func (State) Fields() []ent.Field {
 			SchemaType(map[string]string{
 				dialect.Postgres: "timestamptz",
 			}),
+		field.String("trace_id").
+			Optional().
+			Nillable(),
+	}
+}
+
+// Hooks of the State.
+func (State) Hooks() []ent.Hook {
+	return []ent.Hook{
+		func(next ent.Mutator) ent.Mutator {
+			return ent.MutateFunc(func(ctx context.Context, m ent.Mutation) (ent.Value, error) {
+				if traceID := logger.TraceIDFromContext(ctx); traceID != "" {
+					_ = m.SetField("trace_id", traceID)
+				}
+				return next.Mutate(ctx, m)
+			})
+		},
 	}
 }
 

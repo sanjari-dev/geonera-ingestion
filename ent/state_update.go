@@ -212,6 +212,26 @@ func (_u *StateUpdate) SetNillableUpdatedAt(v *time.Time) *StateUpdate {
 	return _u
 }
 
+// SetTraceID sets the "trace_id" field.
+func (_u *StateUpdate) SetTraceID(v string) *StateUpdate {
+	_u.mutation.SetTraceID(v)
+	return _u
+}
+
+// SetNillableTraceID sets the "trace_id" field if the given value is not nil.
+func (_u *StateUpdate) SetNillableTraceID(v *string) *StateUpdate {
+	if v != nil {
+		_u.SetTraceID(*v)
+	}
+	return _u
+}
+
+// ClearTraceID clears the value of the "trace_id" field.
+func (_u *StateUpdate) ClearTraceID() *StateUpdate {
+	_u.mutation.ClearTraceID()
+	return _u
+}
+
 // SetInstrument sets the "instrument" edge to the Instrument entity.
 func (_u *StateUpdate) SetInstrument(v *Instrument) *StateUpdate {
 	return _u.SetInstrumentID(v.ID)
@@ -331,6 +351,12 @@ func (_u *StateUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(state.FieldUpdatedAt, field.TypeTime, value)
+	}
+	if value, ok := _u.mutation.TraceID(); ok {
+		_spec.SetField(state.FieldTraceID, field.TypeString, value)
+	}
+	if _u.mutation.TraceIDCleared() {
+		_spec.ClearField(state.FieldTraceID, field.TypeString)
 	}
 	if _u.mutation.InstrumentCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -566,6 +592,26 @@ func (_u *StateUpdateOne) SetNillableUpdatedAt(v *time.Time) *StateUpdateOne {
 	return _u
 }
 
+// SetTraceID sets the "trace_id" field.
+func (_u *StateUpdateOne) SetTraceID(v string) *StateUpdateOne {
+	_u.mutation.SetTraceID(v)
+	return _u
+}
+
+// SetNillableTraceID sets the "trace_id" field if the given value is not nil.
+func (_u *StateUpdateOne) SetNillableTraceID(v *string) *StateUpdateOne {
+	if v != nil {
+		_u.SetTraceID(*v)
+	}
+	return _u
+}
+
+// ClearTraceID clears the value of the "trace_id" field.
+func (_u *StateUpdateOne) ClearTraceID() *StateUpdateOne {
+	_u.mutation.ClearTraceID()
+	return _u
+}
+
 // SetInstrument sets the "instrument" edge to the Instrument entity.
 func (_u *StateUpdateOne) SetInstrument(v *Instrument) *StateUpdateOne {
 	return _u.SetInstrumentID(v.ID)
@@ -715,6 +761,12 @@ func (_u *StateUpdateOne) sqlSave(ctx context.Context) (_node *State, err error)
 	}
 	if value, ok := _u.mutation.UpdatedAt(); ok {
 		_spec.SetField(state.FieldUpdatedAt, field.TypeTime, value)
+	}
+	if value, ok := _u.mutation.TraceID(); ok {
+		_spec.SetField(state.FieldTraceID, field.TypeString, value)
+	}
+	if _u.mutation.TraceIDCleared() {
+		_spec.ClearField(state.FieldTraceID, field.TypeString)
 	}
 	if _u.mutation.InstrumentCleared() {
 		edge := &sqlgraph.EdgeSpec{

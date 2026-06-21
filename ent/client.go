@@ -534,7 +534,8 @@ func (c *StateClient) QueryInstrument(_m *State) *InstrumentQuery {
 
 // Hooks returns the client hooks.
 func (c *StateClient) Hooks() []Hook {
-	return c.hooks.State
+	hooks := c.hooks.State
+	return append(hooks[:len(hooks):len(hooks)], state.Hooks[:]...)
 }
 
 // Interceptors returns the client interceptors.

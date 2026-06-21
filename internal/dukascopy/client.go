@@ -41,13 +41,13 @@ type Client struct {
 	http *http.Client
 }
 
-// NewClient returns a Dukascopy Client with a 5-second per-request timeout.
+// NewClient returns a Dukascopy Client with a 30-second per-request timeout.
 // BI5 files are small (typically 10–200 KB); a slow response signals a server
-// problem, not a large payload — fail fast and let the retry pipeline handle it.
+// problem, not a large payload — but we use a 30-second timeout to handle high latency.
 func NewClient() *Client {
 	return &Client{
 		http: &http.Client{
-			Timeout:   5 * time.Second,
+			Timeout:   30 * time.Second,
 			Transport: http.DefaultTransport,
 		},
 	}
@@ -76,7 +76,7 @@ func (c *Client) FetchBI5(ctx context.Context, instrument string, ts time.Time) 
 	if err != nil {
 		return nil, fmt.Errorf("dukascopy: build request: %w", err)
 	}
-	req.Header.Set("User-Agent", "geonera-ingestion/1.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

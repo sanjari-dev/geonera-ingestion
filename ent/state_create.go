@@ -136,6 +136,20 @@ func (_c *StateCreate) SetUpdatedAt(v time.Time) *StateCreate {
 	return _c
 }
 
+// SetTraceID sets the "trace_id" field.
+func (_c *StateCreate) SetTraceID(v string) *StateCreate {
+	_c.mutation.SetTraceID(v)
+	return _c
+}
+
+// SetNillableTraceID sets the "trace_id" field if the given value is not nil.
+func (_c *StateCreate) SetNillableTraceID(v *string) *StateCreate {
+	if v != nil {
+		_c.SetTraceID(*v)
+	}
+	return _c
+}
+
 // SetID sets the "id" field.
 func (_c *StateCreate) SetID(v uuid.UUID) *StateCreate {
 	_c.mutation.SetID(v)
@@ -162,7 +176,9 @@ func (_c *StateCreate) Mutation() *StateMutation {
 
 // Save creates the State in the database.
 func (_c *StateCreate) Save(ctx context.Context) (*State, error) {
-	_c.defaults()
+	if err := _c.defaults(); err != nil {
+		return nil, err
+	}
 	return withHooks(ctx, _c.sqlSave, _c.mutation, _c.hooks)
 }
 
@@ -189,7 +205,7 @@ func (_c *StateCreate) ExecX(ctx context.Context) {
 }
 
 // defaults sets the default values of the builder before save.
-func (_c *StateCreate) defaults() {
+func (_c *StateCreate) defaults() error {
 	if _, ok := _c.mutation.IsHoliday(); !ok {
 		v := state.DefaultIsHoliday
 		_c.mutation.SetIsHoliday(v)
@@ -211,9 +227,13 @@ func (_c *StateCreate) defaults() {
 		_c.mutation.SetIsDeleted(v)
 	}
 	if _, ok := _c.mutation.ID(); !ok {
+		if state.DefaultID == nil {
+			return fmt.Errorf("ent: uninitialized state.DefaultID (forgotten import ent/runtime?)")
+		}
 		v := state.DefaultID()
 		_c.mutation.SetID(v)
 	}
+	return nil
 }
 
 // check runs all checks and user-defined validators on the builder.
@@ -341,6 +361,10 @@ func (_c *StateCreate) createSpec() (*State, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.UpdatedAt(); ok {
 		_spec.SetField(state.FieldUpdatedAt, field.TypeTime, value)
 		_node.UpdatedAt = value
+	}
+	if value, ok := _c.mutation.TraceID(); ok {
+		_spec.SetField(state.FieldTraceID, field.TypeString, value)
+		_node.TraceID = &value
 	}
 	if nodes := _c.mutation.InstrumentIDs(); len(nodes) > 0 {
 		edge := &sqlgraph.EdgeSpec{

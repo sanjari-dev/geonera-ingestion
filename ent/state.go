@@ -41,6 +41,8 @@ type State struct {
 	IsDeleted bool `json:"is_deleted,omitempty"`
 	// UpdatedAt holds the value of the "updated_at" field.
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	// TraceID holds the value of the "trace_id" field.
+	TraceID *string `json:"trace_id,omitempty"`
 	// Edges holds the relations/edges for other nodes in the graph.
 	// The values are being populated by the StateQuery when eager-loading is set.
 	Edges        StateEdges `json:"edges"`
@@ -76,7 +78,7 @@ func (*State) scanValues(columns []string) ([]any, error) {
 			values[i] = new(sql.NullBool)
 		case state.FieldResolvedTickCount, state.FieldRetryCount, state.FieldNotFoundStreak:
 			values[i] = new(sql.NullInt64)
-		case state.FieldJobType, state.FieldStatus, state.FieldPreviousStatus:
+		case state.FieldJobType, state.FieldStatus, state.FieldPreviousStatus, state.FieldTraceID:
 			values[i] = new(sql.NullString)
 		case state.FieldTimestamp, state.FieldUpdatedAt:
 			values[i] = new(sql.NullTime)
@@ -170,6 +172,13 @@ func (_m *State) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.UpdatedAt = value.Time
 			}
+		case state.FieldTraceID:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field trace_id", values[i])
+			} else if value.Valid {
+				_m.TraceID = new(string)
+				*_m.TraceID = value.String
+			}
 		default:
 			_m.selectValues.Set(columns[i], values[i])
 		}
@@ -245,6 +254,11 @@ func (_m *State) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("updated_at=")
 	builder.WriteString(_m.UpdatedAt.Format(time.ANSIC))
+	builder.WriteString(", ")
+	if v := _m.TraceID; v != nil {
+		builder.WriteString("trace_id=")
+		builder.WriteString(*v)
+	}
 	builder.WriteByte(')')
 	return builder.String()
 }

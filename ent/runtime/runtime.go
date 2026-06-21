@@ -49,6 +49,8 @@ func init() {
 	instrumentDescID := instrumentFields[0].Descriptor()
 	// instrument.DefaultID holds the default value on creation for the id field.
 	instrument.DefaultID = instrumentDescID.Default.(func() uuid.UUID)
+	stateHooks := schema.State{}.Hooks()
+	state.Hooks[0] = stateHooks[0]
 	stateFields := schema.State{}.Fields()
 	_ = stateFields
 	// stateDescIsHoliday is the schema descriptor for is_holiday field.
@@ -77,6 +79,10 @@ func init() {
 	state.DefaultID = stateDescID.Default.(func() uuid.UUID)
 	synctaskFields := schema.SyncTask{}.Fields()
 	_ = synctaskFields
+	// synctaskDescHoursCount is the schema descriptor for hours_count field.
+	synctaskDescHoursCount := synctaskFields[4].Descriptor()
+	// synctask.DefaultHoursCount holds the default value on creation for the hours_count field.
+	synctask.DefaultHoursCount = synctaskDescHoursCount.Default.(int)
 	// synctaskDescCreatedAt is the schema descriptor for created_at field.
 	synctaskDescCreatedAt := synctaskFields[5].Descriptor()
 	// synctask.DefaultCreatedAt holds the default value on creation for the created_at field.
