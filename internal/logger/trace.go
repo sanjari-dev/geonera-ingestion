@@ -35,7 +35,7 @@ func StateIDFromContext(ctx context.Context) string {
 	return id
 }
 
-// T returns a logrus Entry pre-populated with the trace_id and state_id from ctx.
+// T returns a logrus Entry pre-populated with the trace_id and state_id from ctx (via registered hook).
 // All Trace-level calls should go through T(ctx).Trace(...) so every log
 // line is automatically correlated to its originating request.
 //
@@ -44,12 +44,5 @@ func StateIDFromContext(ctx context.Context) string {
 //	logger.T(ctx).WithField("fn", "executeIngestionETL").Trace("fn_entry")
 //	logger.T(ctx).WithFields(logrus.Fields{"query": "State.First", "err": err}).Trace("after query")
 func T(ctx context.Context) *logrus.Entry {
-	entry := logrus.NewEntry(logrus.StandardLogger())
-	if traceID := TraceIDFromContext(ctx); traceID != "" {
-		entry = entry.WithField("trace_id", traceID)
-	}
-	if stateID := StateIDFromContext(ctx); stateID != "" {
-		entry = entry.WithField("state_id", stateID)
-	}
-	return entry
+	return logrus.StandardLogger().WithContext(ctx)
 }

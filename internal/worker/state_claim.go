@@ -30,6 +30,17 @@ func applyStateClaimUpdate(ctx context.Context, tx *ent.Tx, row *ent.State, newP
 	}
 	ilogger.T(ctx).WithFields(logrus.Fields{"query": "State.UpdateOneID.Save", "err": false, "layer": layer}).Trace("after query")
 	updated.Edges = row.Edges
+
+	if newStatus == state.StatusFAILED || newStatus == state.StatusABANDONED || newStatus == state.StatusBROKEN {
+		ilogger.T(ctx).WithFields(logrus.Fields{
+			"status":          newStatus,
+			"state_id":        row.ID,
+			"job_type":        row.JobType,
+			"previous_status": newPrev,
+			"message":         "claim state update",
+		}).Info("state_transition")
+	}
+
 	return updated, nil
 }
 
