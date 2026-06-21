@@ -7,6 +7,7 @@ import (
 )
 
 type traceKey struct{}
+type stateKey struct{}
 
 // WithTraceID stores a traceId into the context. Call this once per incoming
 // request (MQ message or HTTP request) so every downstream operation carries
@@ -22,7 +23,19 @@ func TraceIDFromContext(ctx context.Context) string {
 	return id
 }
 
-// T returns a logrus Entry pre-populated with the trace_id from ctx.
+// WithStateID stores a stateId into the context.
+func WithStateID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, stateKey{}, id)
+}
+
+// StateIDFromContext retrieves the stateId stored by WithStateID.
+// Returns an empty string if no stateId has been set.
+func StateIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(stateKey{}).(string)
+	return id
+}
+
+// T returns a logrus Entry pre-populated with the trace_id and state_id from ctx.
 // All Trace-level calls should go through T(ctx).Trace(...) so every log
 // line is automatically correlated to its originating request.
 //
@@ -31,5 +44,12 @@ func TraceIDFromContext(ctx context.Context) string {
 //	logger.T(ctx).WithField("fn", "executeIngestionETL").Trace("fn_entry")
 //	logger.T(ctx).WithFields(logrus.Fields{"query": "State.First", "err": err}).Trace("after query")
 func T(ctx context.Context) *logrus.Entry {
-	return logrus.WithField("trace_id", TraceIDFromContext(ctx))
+	entry := logrus.NewEntry(logrus.StandardLogger())
+	if traceID := TraceIDFromContext(ctx); traceID != "" {
+		entry = entry.WithField("trace_id", traceID)
+	}
+	if stateID := StateIDFromContext(ctx); stateID != "" {
+		entry = entry.WithField("state_id", stateID)
+	}
+	return entry
 }

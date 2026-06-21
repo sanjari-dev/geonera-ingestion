@@ -321,6 +321,7 @@ func claimBackfillMasterBatch(ctx context.Context, d *dal.DAL, boundary time.Tim
 // time. Rows resolved entirely inside the claim transaction (backfillLayerNone)
 // require no further action here.
 func dispatchBackfillRoutedRow(ctx context.Context, d *dal.DAL, item backfillRoutedRow, done func()) {
+	ctx = ilogger.WithStateID(ctx, item.row.ID.String())
 	inst := instrName(item.row)
 	ts := item.row.Timestamp.Format(time.RFC3339)
 	ilogger.T(ctx).WithFields(logrus.Fields{"fn": "dispatchBackfillRoutedRow", "instrument": inst, "layer": item.layer}).Trace("fn_entry")

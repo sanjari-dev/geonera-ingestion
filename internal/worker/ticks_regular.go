@@ -177,9 +177,10 @@ func runIngestionLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		loopWg.Add(1)
 		go func(r *ent.State) {
 			defer recoverGoroutine(ctx, "ticks/ingestion-row")
-			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r), "ts": r.Timestamp.Format(time.RFC3339)}).Trace("goroutine: ingestion-row start")
-			executeIngestionDownload(ctx, d, r, handleNotFoundSimple, true, loopWg.Done)
-			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: ingestion-row done")
+			rowCtx := ilogger.WithStateID(ctx, r.ID.String())
+			ilogger.T(rowCtx).WithFields(logrus.Fields{"instrument": instrName(r), "ts": r.Timestamp.Format(time.RFC3339)}).Trace("goroutine: ingestion-row start")
+			executeIngestionDownload(rowCtx, d, r, handleNotFoundSimple, true, loopWg.Done)
+			ilogger.T(rowCtx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: ingestion-row done")
 		}(claimed)
 
 		ilogger.T(ctx).WithField("fn", "runIngestionLoop").Trace("loop: iteration end")
@@ -262,9 +263,10 @@ func runRecoveryLoop(ctx context.Context, d *dal.DAL, target time.Time) {
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer loopWg.Done()
 			defer recoverGoroutine(ctx, "ticks/recovery-row")
-			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r), "ts": r.Timestamp.Format(time.RFC3339)}).Trace("goroutine: recovery-row start")
-			executeRecoveryAction(ctx, d, r, prev)
-			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: recovery-row done")
+			rowCtx := ilogger.WithStateID(ctx, r.ID.String())
+			ilogger.T(rowCtx).WithFields(logrus.Fields{"instrument": instrName(r), "ts": r.Timestamp.Format(time.RFC3339)}).Trace("goroutine: recovery-row start")
+			executeRecoveryAction(rowCtx, d, r, prev)
+			ilogger.T(rowCtx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: recovery-row done")
 		}(claimed, prevStatus)
 
 		ilogger.T(ctx).WithField("fn", "runRecoveryLoop").Trace("loop: iteration end")
@@ -342,9 +344,10 @@ func runValidationLoop(ctx context.Context, d *dal.DAL, timestamp *time.Time) {
 		loopWg.Add(1)
 		go func(r *ent.State, prev *state.PreviousStatus) {
 			defer recoverGoroutine(ctx, "ticks/validation-row")
-			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r), "ts": r.Timestamp.Format(time.RFC3339)}).Trace("goroutine: validation-row start")
-			executeT2Download(ctx, d, r, prev, true, loopWg.Done)
-			ilogger.T(ctx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: validation-row done")
+			rowCtx := ilogger.WithStateID(ctx, r.ID.String())
+			ilogger.T(rowCtx).WithFields(logrus.Fields{"instrument": instrName(r), "ts": r.Timestamp.Format(time.RFC3339)}).Trace("goroutine: validation-row start")
+			executeT2Download(rowCtx, d, r, prev, true, loopWg.Done)
+			ilogger.T(rowCtx).WithFields(logrus.Fields{"instrument": instrName(r)}).Trace("goroutine: validation-row done")
 		}(claimed, preclaimPrev)
 
 		ilogger.T(ctx).WithField("fn", "runValidationLoop").Trace("loop: iteration end")

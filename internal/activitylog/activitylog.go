@@ -9,6 +9,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/google/uuid"
+	"github.com/sanjari-dev/geonera-ingestion/internal/logger"
 )
 
 // TriggerSrc identifies what initiated the job.
@@ -44,7 +45,7 @@ func New(db *sql.DB) *Logger { return &Logger{db: db} }
 // same row — the row is guaranteed to exist before the job handler even starts.
 func (l *Logger) Record(ctx context.Context, src TriggerSrc, jobName string, meta map[string]any) uuid.UUID {
 	id := uuid.New()
-	traceID := ""
+	traceID := logger.TraceIDFromContext(ctx)
 	metaJSON, _ := json.Marshal(meta)
 	now := time.Now().UTC()
 
